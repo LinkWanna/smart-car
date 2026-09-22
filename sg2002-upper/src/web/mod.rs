@@ -1,14 +1,19 @@
 //! 网页遥控：HTTP + WebSocket + MJPEG 预览（不含 TLS）。
 //!
 //! 用一台手机/电脑连上小车的 AP（`scripts/init_ap.sh`，默认 `192.168.4.1`），
-//! 浏览器打开页面即可遥控，驾驶手感与 `tools/play.py` 一致。分层：
+//! 浏览器打开页面即可遥控；也支持**自动模式**（视觉伺服），由页面按钮切换。
+//! 分层：
 //!
 //! - [`teleop`]：纯控制律（W/S 油门斜坡、A/D 转向、低速原地旋转、输入看门狗），
 //!   只输出 [`teleop::Output`]，不碰链路；
-//! - [`video`]：MJPG 采集线程 + 最新帧广播；
-//! - [`server`]：基于 `rouille`（HTTP + WebSocket）与 `serde_json` 的路由、
-//!   会话、控制节拍与状态推送；
+//! - [`video`]：MJPG 采集线程 + 最新帧广播（只有画面，`webctl` 用）；
+//! - `server.rs`：基于 `rouille`（HTTP + WebSocket）与 `serde_json` 的路由、
+//!   会话、控制节拍（手动/自动仲裁）与状态推送；
 //! - `driver.rs`：把 [`DriveTarget`] 落到 [`crate::control::Car`] 上。
+//!
+//! 整合入口（`smartcar`）的预览来自 [`crate::vision::VisionStream`]：
+//! 相机按模型需要的 YUYV422 打开，网页拿到的 JPEG 与检测框**同帧**；
+//! 网页层只依赖 [`crate::preview::PreviewSource`] 抽象。
 //!
 //! # 接口
 //!
@@ -19,14 +24,16 @@
 //! | `GET /api/frame.jpg` | 摄像头快照（无预览时 503） |
 //! | `GET /api/input?keys=wasd` | 按键快照（curl 调试用） |
 //! | `GET /api/action?action=stop\|brake\|init\|reset` | 动作按钮 |
-//! | `GET /api/events` | WebSocket：按键/动作（文本 JSON）+ 状态/JPEG（推送） |
+//! | `GET /api/mode?set=auto\|manual` | 输入模式（自动需要视觉就绪） |
+//! | `GET /api/events` | WebSocket：按键/动作/模式（文本 JSON）+ 状态/JPEG/视觉（推送） |
 //!
 //! # 安全
 //!
 //! 浏览器每 100ms 发一次完整按键快照（变化时立即发），服务端
 //! [`TeleopConfig::input_timeout`](teleop::TeleopConfig::input_timeout) 收不到就
-//! 松开所有键；WebSocket 断开时只清理该客户端的按键；控制线程退出前滑行停车，
-//! [`Car`](crate::control::Car) 自己的看门狗与 `Drop` 再兜底一层。
+//! 松开所有键；WebSocket 断开时只清理该客户端的按键；模式切换、控制线程退出前
+//! 都会滑行停车，[`Car`](crate::control::Car) 自己的看门狗与 `Drop` 再兜底一层；
+//! 自动模式下视觉观测过期（>500ms）按“看不到”处理并滑行。
 
 use std::time::Duration;
 
@@ -38,7 +45,7 @@ pub mod video;
 mod driver;
 mod server;
 
-pub use server::{Server, WebConfig};
+pub use server::{Mode, Server, WebConfig};
 pub use teleop::{Action, Keys, Output, Teleop, TeleopConfig};
 pub use video::{CameraStream, VideoStatus};
 

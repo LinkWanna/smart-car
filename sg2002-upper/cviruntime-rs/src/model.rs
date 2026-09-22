@@ -18,7 +18,6 @@ pub struct Model {
 }
 
 impl Model {
-    /// 从文件加载（板端路径如 /akars_tennis/model/...）
     pub fn from_file(path: &str) -> Result<Self, Error> {
         #[cfg(not(target_arch = "riscv64"))]
         {

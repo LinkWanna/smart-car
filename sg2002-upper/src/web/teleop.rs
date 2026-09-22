@@ -271,6 +271,17 @@ impl Teleop {
         }
     }
 
+    /// 清空输入状态（手动/自动模式切换用）：松开所有键、解除锁存、油门与转向归零。
+    pub fn reset_inputs(&mut self) {
+        self.keys = Keys::NONE;
+        self.keys_at = None;
+        self.key_owner = 0;
+        self.throttle = 0.0;
+        self.steer = 0.0;
+        self.latch = None;
+        self.last_cmd = None;
+    }
+
     /// 动作按钮：立即改变输出并锁存（Stop/Init 除外）。
     pub fn action(&mut self, action: Action) -> Output {
         self.keys = Keys::NONE;
@@ -608,6 +619,21 @@ mod tests {
         // Init 后恢复
         assert_eq!(teleop.action(Action::Init), Output::Init);
         assert_eq!(run_silent(&mut teleop, &mut now, 0.1), Output::Coast);
+    }
+
+    #[test]
+    fn reset_inputs_clears_keys_and_latch() {
+        let mut teleop = Teleop::new(TeleopConfig::default());
+        let mut now = Instant::now();
+        teleop.set_keys(Keys::parse("w"), 1, now);
+        run_held(&mut teleop, &mut now, 0.5);
+        assert_eq!(teleop.action(Action::Brake), Output::Brake);
+        assert!(teleop.latched());
+
+        teleop.reset_inputs();
+        assert!(!teleop.latched());
+        assert!(!teleop.keys().any());
+        assert_eq!(teleop.tick(now), Output::Coast);
     }
 
     #[test]

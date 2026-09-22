@@ -28,7 +28,42 @@ use serde_json::{Value, json};
 
 use super::DriveTarget;
 use super::teleop::{Action, Keys, Output, Teleop, TeleopConfig};
-use super::video::CameraStream;
+use crate::control::servo::{Action as ServoAction, ControlConfig, ControlLoop};
+use crate::preview::{PreviewSource, VisionSnapshot};
+
+/// 观测过期阈值：超过这个时间没有新帧，自动模式按“看不到”处理（滑行）。
+const AUTO_STALE: Duration = Duration::from_millis(500);
+
+/// 输入来源：手动遥控（网页按键）或自动视觉（追踪目标）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    Manual,
+    Auto,
+}
+
+impl Mode {
+    /// 解析模式名（`manual`/`auto`，也接受中文）。
+    pub fn parse(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "manual" | "手动" => Some(Self::Manual),
+            "auto" | "自动" => Some(Self::Auto),
+            _ => None,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Manual => "manual",
+            Self::Auto => "auto",
+        }
+    }
+}
+
+impl std::fmt::Display for Mode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
 
 /// 内嵌的网页（HTML + CSS + JS 单文件，零外部资源）。
 const INDEX_HTML: &str = include_str!("assets/index.html");
@@ -69,8 +104,16 @@ enum ClientMessage {
     Keys { keys: String },
     /// 动作按钮（`stop`/`brake`/`init`/`reset`）。
     Action { action: String },
+    /// 输入模式切换（`manual`/`auto`，只能由按钮触发）。
+    Mode { mode: String },
     /// 应用层 ping，回一条 pong。
     Ping,
+}
+
+/// 自动模式的最近一次输出（HUD 展示用）。
+struct AutoState {
+    action: String,
+    cmd: [i16; 2],
 }
 
 /// 所有连接共享的状态。
@@ -78,7 +121,14 @@ struct Shared {
     cfg: WebConfig,
     target: Arc<dyn DriveTarget>,
     teleop: Mutex<Teleop>,
-    camera: Option<Arc<CameraStream>>,
+    /// 预览/视觉源；`None` = 未启用预览。
+    preview: Option<Arc<dyn PreviewSource>>,
+    /// 当前输入模式（默认手动；自动需要按钮切换）。
+    mode: Mutex<Mode>,
+    /// 自动模式控制律参数。
+    servo_cfg: ControlConfig,
+    /// 自动模式最近一次输出（HUD）。
+    auto: Mutex<Option<AutoState>>,
     running: Arc<AtomicBool>,
     clients: AtomicU64,
     next_client_id: AtomicU64,
@@ -86,7 +136,30 @@ struct Shared {
 }
 
 impl Shared {
-    /// 控制节拍：推进遥控控制律并落地输出。
+    fn mode(&self) -> Mode {
+        *self.mode.lock().unwrap()
+    }
+
+    /// 切换输入模式；进入自动模式要求视觉/模型就绪。
+    ///
+    /// 切换时立即滑行并把手动输入清干净（避免残留油门/锁存），控制线程会在
+    /// 下一拍发现模式变化并重置视觉伺服状态。
+    fn set_mode(&self, mode: Mode) -> Result<(), String> {
+        if mode == Mode::Auto {
+            match &self.preview {
+                Some(preview) if preview.auto_ready() => {}
+                Some(_) => return Err("视觉未就绪（模型/画面不可用），无法进入自动模式".into()),
+                None => return Err("未启用视觉，无法进入自动模式".into()),
+            }
+        }
+        *self.mode.lock().unwrap() = mode;
+        self.teleop.lock().unwrap().reset_inputs();
+        self.target.coast();
+        eprintln!("[web] 输入模式 → {}", mode);
+        Ok(())
+    }
+
+    /// 控制节拍：按当前模式推进手动遥控或视觉伺服，并落地输出。
     fn control_loop(self: &Arc<Self>) {
         let hz = {
             let teleop = self.teleop.lock().unwrap();
@@ -94,8 +167,21 @@ impl Shared {
         };
         let period = Duration::from_secs_f32(1.0 / hz);
         let mut next = Instant::now();
+        let mut servo = ControlLoop::new(self.servo_cfg);
+        let mut last_mode = self.mode();
         while self.running.load(Ordering::Relaxed) {
-            let out = self.teleop.lock().unwrap().tick(Instant::now());
+            let now = Instant::now();
+            let mode = self.mode();
+            if mode != last_mode {
+                // 模式刚变化：重置伺服状态（不沿用上次的搜索方向/保持），
+                // 手动输入也已在 set_mode 里清空。
+                servo = ControlLoop::new(self.servo_cfg);
+                last_mode = mode;
+            }
+            let out = match mode {
+                Mode::Manual => self.teleop.lock().unwrap().tick(now),
+                Mode::Auto => self.auto_output(&mut servo, now),
+            };
             apply(&*self.target, out);
             self.target.maybe_reinit();
             next += period;
@@ -108,6 +194,29 @@ impl Shared {
         }
         eprintln!("[web] 控制线程退出，滑行停车");
         self.target.coast();
+    }
+
+    /// 自动模式：取最新视觉观测（过期/不可用 → 滑行），推进视觉伺服。
+    fn auto_output(&self, servo: &mut ControlLoop, now: Instant) -> Output {
+        let snap: Option<Arc<VisionSnapshot>> = self
+            .preview
+            .as_ref()
+            .and_then(|preview| preview.latest_snapshot())
+            .filter(|snap| now.saturating_duration_since(snap.at) < AUTO_STALE);
+        let Some(snap) = snap else {
+            *self.auto.lock().unwrap() = Some(AutoState {
+                action: "等待视觉".to_string(),
+                cmd: [0, 0],
+            });
+            return Output::Coast;
+        };
+        let action = servo.step(&snap.observation, now);
+        let cmd = action.wheels().map_or([0, 0], |(l, r)| [l, r]);
+        *self.auto.lock().unwrap() = Some(AutoState {
+            action: action.to_string(),
+            cmd,
+        });
+        action_output(action)
     }
 
     /// 一帧状态（WebSocket 推送与 `GET /api/status` 共用）。
@@ -144,6 +253,9 @@ impl Shared {
                 "keys": hud.keys.to_string(),
                 "input_age_ms": input_age.map(|d| d.as_millis() as u64),
             },
+            "mode": self.mode().as_str(),
+            "auto_ready": self.preview.as_ref().is_some_and(|p| p.auto_ready()),
+            "auto": self.auto_value(),
             "counters": {
                 "acks": link.counters.acks,
                 "nacks": link.counters.nacks,
@@ -153,8 +265,20 @@ impl Shared {
             },
             "last_frame": link.last_frame,
             "camera": self.camera_value(),
+            "vision": self.vision_value(),
             "clients": self.clients.load(Ordering::Relaxed),
         })
+    }
+
+    /// 自动模式的最近一次输出（手动模式下为 null）。
+    fn auto_value(&self) -> Value {
+        if self.mode() != Mode::Auto {
+            return Value::Null;
+        }
+        match &*self.auto.lock().unwrap() {
+            Some(auto) => json!({ "action": auto.action, "cmd": auto.cmd }),
+            None => Value::Null,
+        }
     }
 
     /// 连接建立时的问候消息（带页面需要的固定参数）。
@@ -178,15 +302,17 @@ impl Shared {
             "input_timeout_ms": input_timeout_ms,
             "max_speed": max_speed,
             "max_reverse": max_reverse,
+            "mode": self.mode().as_str(),
+            "auto_ready": self.preview.as_ref().is_some_and(|p| p.auto_ready()),
             "camera": self.camera_value(),
         })
     }
 
     fn camera_value(&self) -> Value {
-        let Some(camera) = &self.camera else {
+        let Some(preview) = &self.preview else {
             return Value::Null;
         };
-        let st = camera.status();
+        let st = preview.camera_status();
         json!({
             "available": st.available,
             "device": st.device,
@@ -194,6 +320,26 @@ impl Shared {
             "frames": st.frames,
             "fps": st.fps,
             "age_ms": st.age_ms,
+            "error": st.error,
+        })
+    }
+
+    /// 视觉状态（模型/推理/编码耗时）；纯画面源为 null。
+    fn vision_value(&self) -> Value {
+        let Some(st) = self.preview.as_ref().and_then(|p| p.vision_status()) else {
+            return Value::Null;
+        };
+        json!({
+            "model_ok": st.model_ok,
+            "model": st.model,
+            "input": st.input,
+            "fps": st.fps,
+            "age_ms": st.age_ms,
+            "infer_ms": st.infer_ms,
+            "nms_ms": st.nms_ms,
+            "position_ms": st.position_ms,
+            "encode_ms": st.encode_ms,
+            "dets": st.dets,
             "error": st.error,
         })
     }
@@ -214,14 +360,17 @@ impl Server {
         cfg: WebConfig,
         teleop_cfg: TeleopConfig,
         target: Arc<dyn DriveTarget>,
-        camera: Option<Arc<CameraStream>>,
+        preview: Option<Arc<dyn PreviewSource>>,
         running: Arc<AtomicBool>,
     ) -> io::Result<Self> {
         let shared = Arc::new(Shared {
             cfg,
             target,
             teleop: Mutex::new(Teleop::new(teleop_cfg)),
-            camera,
+            preview,
+            mode: Mutex::new(Mode::Manual),
+            servo_cfg: ControlConfig::default(),
+            auto: Mutex::new(None),
             running: Arc::clone(&running),
             clients: AtomicU64::new(0),
             next_client_id: AtomicU64::new(0),
@@ -270,10 +419,23 @@ fn route(request: &Request, shared: &Arc<Shared>) -> Response {
     match path {
         "/" | "/index.html" => Response::html(INDEX_HTML).with_no_cache(),
         "/api/status" => Response::json(&shared.status_value()).with_no_cache(),
-        "/api/frame.jpg" => match shared.camera.as_ref().and_then(|c| c.latest()) {
-            Some(jpeg) => Response::from_data("image/jpeg", jpeg.to_vec()).with_no_cache(),
+        "/api/frame.jpg" => match shared.preview.as_ref().and_then(|p| p.latest()) {
+            Some(frame) => match frame.jpeg.clone() {
+                Some(jpeg) => Response::from_data("image/jpeg", jpeg.to_vec()).with_no_cache(),
+                None => Response::text("预览不可用\n").with_status_code(503),
+            },
             None => Response::text("预览不可用\n").with_status_code(503),
         },
+        "/api/mode" => {
+            let name = request.get_param("set").unwrap_or_default();
+            let Some(mode) = Mode::parse(&name) else {
+                return Response::text("用法: /api/mode?set=auto|manual\n").with_status_code(400);
+            };
+            match shared.set_mode(mode) {
+                Ok(()) => Response::json(&json!({ "ok": true, "mode": mode.as_str() })),
+                Err(e) => Response::text(format!("{e}\n")).with_status_code(409),
+            }
+        }
         "/api/input" => {
             let keys = Keys::parse(&request.get_param("keys").unwrap_or_default());
             shared
@@ -333,6 +495,47 @@ fn apply(target: &dyn DriveTarget, out: Output) {
     }
 }
 
+/// 视觉伺服的决策 → 链路输出。
+fn action_output(action: ServoAction) -> Output {
+    match action {
+        ServoAction::Brake => Output::Brake,
+        ServoAction::Track { .. } | ServoAction::Search { .. } => {
+            action.wheels().map_or(Output::Coast, |(left, right)| Output::Drive {
+                left,
+                right,
+            })
+        }
+    }
+}
+
+/// 一帧预览对应的视觉消息（`seq` 与紧随其后的 JPEG 严格同帧）。
+fn vision_frame_value(seq: u64, snap: &VisionSnapshot) -> Value {
+    let dets: Vec<Value> = snap
+        .dets
+        .iter()
+        .map(|d| {
+            json!({
+                "x1": d.x1, "y1": d.y1, "x2": d.x2, "y2": d.y2, "conf": d.confidence,
+            })
+        })
+        .collect();
+    let target = snap.target.as_ref().map(|t| {
+        json!({
+            "err_x": t.err_x,
+            "zone": t.zone,
+            "distance": t.distance,
+            "confidence": t.confidence,
+        })
+    });
+    json!({
+        "type": "vision",
+        "seq": seq,
+        "dets": dets,
+        "target": target,
+        "infer_ms": snap.timings.infer_ms,
+    })
+}
+
 /// WebSocket 会话：阻塞读客户端消息，收到消息后按节拍推送状态与预览帧。
 fn websocket_session(mut socket: Websocket, shared: Arc<Shared>) {
     let id = shared.next_client_id.fetch_add(1, Ordering::Relaxed) + 1;
@@ -358,11 +561,17 @@ fn websocket_session(mut socket: Websocket, shared: Arc<Shared>) {
         }
         if alive && now.saturating_duration_since(last_video) >= video_period {
             last_video = now;
-            if let Some(camera) = &shared.camera
-                && let Some((seq, jpeg)) = camera.frame_if_new(video_seq)
+            if let Some(preview) = &shared.preview
+                && let Some(frame) = preview.frame_if_new(video_seq)
             {
-                alive = socket.send_binary(&jpeg).is_ok();
-                video_seq = seq;
+                video_seq = frame.seq;
+                if let Some(jpeg) = &frame.jpeg {
+                    alive = socket.send_binary(jpeg).is_ok();
+                }
+                // 紧跟同帧的检测结果：页面据此画覆盖框（与画面严格对齐）
+                if alive && let Some(snap) = &frame.vision {
+                    alive = send_json(&mut socket, &vision_frame_value(frame.seq, snap));
+                }
             }
         }
         if !alive {
@@ -402,9 +611,22 @@ fn handle_message(text: &str, socket: &mut Websocket, shared: &Arc<Shared>, id: 
             let Some(action) = Action::parse(&action) else {
                 return send_json(socket, &json!({ "type": "error", "error": "未知动作" }));
             };
+            // 安全：自动模式下按“停止”先切回手动，否则下一拍伺服会立刻接管。
+            if action == Action::Stop && shared.mode() == Mode::Auto {
+                shared.set_mode(Mode::Manual).ok();
+            }
             let out = shared.teleop.lock().unwrap().action(action);
             apply(&*shared.target, out);
             true
+        }
+        ClientMessage::Mode { mode } => {
+            let Some(mode) = Mode::parse(&mode) else {
+                return send_json(socket, &json!({ "type": "error", "error": "未知模式" }));
+            };
+            match shared.set_mode(mode) {
+                Ok(()) => send_json(socket, &json!({ "type": "mode", "mode": mode.as_str() })),
+                Err(e) => send_json(socket, &json!({ "type": "error", "error": e })),
+            }
         }
         ClientMessage::Ping => send_json(socket, &json!({ "type": "pong" })),
     }
@@ -421,6 +643,8 @@ fn send_json(socket: &mut Websocket, value: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control::servo::{Distance, Observation};
+    use crate::preview::{CameraStatus, PreviewFrame, VisionStatus, VisionTimings};
     use crate::web::LinkSnapshot;
     use std::io::{Read, Write};
     use std::net::TcpStream;
@@ -440,6 +664,112 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|e| e.starts_with(prefix))
+        }
+
+        fn log_len(&self) -> usize {
+            self.log.lock().unwrap().len()
+        }
+
+        fn log_since(&self, from: usize) -> Vec<String> {
+            self.log.lock().unwrap()[from..].to_vec()
+        }
+    }
+
+    /// 可控的假视觉源：手动放「最新快照」来驱动自动模式。
+    #[derive(Default)]
+    struct FakeVision {
+        snap: Mutex<Option<Arc<VisionSnapshot>>>,
+    }
+
+    impl FakeVision {
+        /// 放一帧新鲜观测。
+        fn put(&self, err_x: f32, present: bool) {
+            *self.snap.lock().unwrap() = Some(Arc::new(VisionSnapshot {
+                seq: 1,
+                at: Instant::now(),
+                dets: Vec::new(),
+                observation: Observation {
+                    present,
+                    err_x,
+                    distance: Distance::Far,
+                    confidence: 0.9,
+                },
+                target: None,
+                timings: VisionTimings::default(),
+            }));
+        }
+
+        /// 把当前观测改成「很久以前」（模拟画面卡住/链路丢失）。
+        fn expire(&self) {
+            let mut guard = self.snap.lock().unwrap();
+            if let Some(snap) = guard.as_ref() {
+                let mut stale = (**snap).clone();
+                stale.at = Instant::now()
+                    .checked_sub(Duration::from_secs(2))
+                    .unwrap_or_else(Instant::now);
+                *guard = Some(Arc::new(stale));
+            }
+        }
+    }
+
+    impl PreviewSource for FakeVision {
+        fn frame_if_new(&self, after: u64) -> Option<Arc<PreviewFrame>> {
+            let snap = self.snap.lock().unwrap().clone()?;
+            (snap.seq > after).then(|| {
+                Arc::new(PreviewFrame {
+                    seq: snap.seq,
+                    jpeg: None,
+                    vision: Some(snap),
+                })
+            })
+        }
+
+        fn latest(&self) -> Option<Arc<PreviewFrame>> {
+            self.snap.lock().unwrap().clone().map(|snap| {
+                Arc::new(PreviewFrame {
+                    seq: snap.seq,
+                    jpeg: None,
+                    vision: Some(snap),
+                })
+            })
+        }
+
+        fn camera_status(&self) -> CameraStatus {
+            CameraStatus {
+                available: true,
+                device: "fake".to_string(),
+                format: "YUYV".to_string(),
+                frames: 1,
+                fps: 10.0,
+                age_ms: Some(0),
+                error: None,
+            }
+        }
+
+        fn vision_status(&self) -> Option<VisionStatus> {
+            let age_ms = self
+                .snap
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|snap| snap.at.elapsed().as_millis() as u64);
+            Some(VisionStatus {
+                model_ok: true,
+                model: "fake".to_string(),
+                input: "[1, 3, 480, 640]".to_string(),
+                fps: 10.0,
+                age_ms,
+                infer_ms: 30.0,
+                nms_ms: 1.0,
+                position_ms: 0.5,
+                encode_ms: 5.0,
+                dets: 1,
+                error: None,
+            })
+        }
+
+        fn latest_snapshot(&self) -> Option<Arc<VisionSnapshot>> {
+            self.snap.lock().unwrap().clone()
         }
     }
 
@@ -484,6 +814,14 @@ mod tests {
 
     impl TestServer {
         fn start(status_hz: f32, video_fps: f32) -> Self {
+            Self::start_with_video(status_hz, video_fps, None)
+        }
+
+        fn start_with_video(
+            status_hz: f32,
+            video_fps: f32,
+            preview: Option<Arc<dyn PreviewSource>>,
+        ) -> Self {
             let running = Arc::new(AtomicBool::new(true));
             let target = Arc::new(FakeTarget::default());
             let target_dyn: Arc<dyn DriveTarget> = target.clone();
@@ -496,7 +834,7 @@ mod tests {
                 },
                 TeleopConfig::default(),
                 target_dyn,
-                None,
+                preview,
                 Arc::clone(&running),
             )
             .expect("绑定端口失败");
@@ -533,6 +871,47 @@ mod tests {
         let mut response = String::new();
         stream.read_to_string(&mut response).unwrap();
         response
+    }
+
+    #[test]
+    fn mode_switch_arbitrates_manual_and_auto() {
+        let vision = Arc::new(FakeVision::default());
+        let server = TestServer::start_with_video(20.0, 10.0, Some(vision.clone()));
+
+        // 还没有观测 → 自动模式不可用（409）
+        let resp = http_get(server.addr, "/api/mode?set=auto");
+        assert!(resp.starts_with("HTTP/1.1 409"), "{resp}");
+
+        // 新鲜观测（目标在右侧、远距离）→ 切自动，伺服接管下发差速
+        let mark = server.target.log_len();
+        vision.put(0.5, true);
+        let resp = http_get(server.addr, "/api/mode?set=auto");
+        assert!(resp.contains("\"mode\":\"auto\""), "{resp}");
+        thread::sleep(Duration::from_millis(250));
+        assert!(
+            server
+                .target
+                .log_since(mark)
+                .iter()
+                .any(|e| e.starts_with("speeds")),
+            "自动模式应下发差速：{:?}",
+            server.target.log_since(mark)
+        );
+
+        // 观测过期 → 滑行（不盲目前进）
+        let mark = server.target.log_len();
+        vision.expire();
+        thread::sleep(Duration::from_millis(250));
+        assert!(
+            server.target.log_since(mark).iter().any(|e| e == "coast"),
+            "观测过期应滑行：{:?}",
+            server.target.log_since(mark)
+        );
+
+        // 切回手动 → 状态与实测一致
+        let resp = http_get(server.addr, "/api/mode?set=manual");
+        assert!(resp.contains("\"mode\":\"manual\""), "{resp}");
+        server.stop();
     }
 
     #[test]

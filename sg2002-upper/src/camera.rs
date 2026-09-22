@@ -67,6 +67,8 @@ pub struct Camera {
     h: u32,
     /// 驱动实际协商到的像素格式（如 `MJPG`）。
     fourcc: FourCC,
+    /// 打开的设备节点（USB 相机重新枚举后会变）。
+    device: String,
 }
 
 impl Camera {
@@ -95,7 +97,7 @@ impl Camera {
         let fd = v4l::v4l2::open(device, libc::O_RDWR).map_err(|e| {
             io::Error::new(e.kind(), format!("camera_init 失败: 打开 {device}: {e}"))
         })?;
-        match Self::setup(fd, fourcc) {
+        match Self::setup(fd, fourcc, device) {
             Ok(cam) => Ok(cam),
             Err(e) => {
                 v4l::v4l2::close(fd).ok();
@@ -105,13 +107,14 @@ impl Camera {
     }
 
     /// 在已打开的 fd 上完成配置；失败时由调用方关闭 fd。
-    fn setup(fd: RawFd, fourcc: FourCC) -> io::Result<Self> {
+    fn setup(fd: RawFd, fourcc: FourCC, device: &str) -> io::Result<Self> {
         let mut cam = Self {
             fd,
             bufs: Vec::new(),
             w: 640,
             h: 480,
             fourcc: FourCC::new(b"????"),
+            device: device.to_string(),
         };
         if let Err(e) = cam.configure(fourcc) {
             cam.unmap_all();
@@ -230,6 +233,11 @@ impl Camera {
         Ok(())
     }
 
+    /// 打开的设备节点。
+    pub fn device(&self) -> &str {
+        &self.device
+    }
+
     /// 驱动实际协商到的像素格式（如 `MJPG` / `YUYV`）。
     pub fn pixel_format(&self) -> String {
         self.fourcc.to_string()
@@ -325,8 +333,8 @@ impl std::fmt::Display for Camera {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Camera(/dev/video0, {}x{} {} via v4l)",
-            self.w, self.h, self.fourcc
+            "Camera({}, {}x{} {} via v4l)",
+            self.device, self.w, self.h, self.fourcc
         )
     }
 }

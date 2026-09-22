@@ -26,6 +26,7 @@ use std::time::Duration;
 
 use clap::Parser;
 use sg2002_upper::control::{Car, CarConfig};
+use sg2002_upper::preview::PreviewSource;
 use sg2002_upper::web::{CameraStream, DriveTarget, Server, TeleopConfig, WebConfig};
 
 /// 等待下位机 `Init` 应答的超时。
@@ -181,6 +182,10 @@ fn main() {
     if camera.is_none() {
         println!("  预览：已关闭（--no-camera）");
     }
+    // 网页只依赖 PreviewSource 抽象（MJPG 源没有视觉结果）
+    let preview: Option<Arc<dyn PreviewSource>> = camera
+        .as_ref()
+        .map(|camera| Arc::clone(camera) as Arc<dyn PreviewSource>);
 
     let control_hz = cli.control_hz;
     let target: Arc<dyn DriveTarget> = car.clone();
@@ -193,7 +198,7 @@ fn main() {
         },
         teleop,
         target,
-        camera.clone(),
+        preview,
         Arc::clone(&running),
     )
     .unwrap_or_else(|e| {

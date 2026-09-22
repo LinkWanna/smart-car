@@ -14,6 +14,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::camera::Camera;
+use crate::preview::{CameraStatus, PreviewFrame, PreviewSource, VisionStatus};
 
 /// 预览状态（HUD/调试用）。
 #[derive(Debug, Clone)]
@@ -171,6 +172,44 @@ impl CameraStream {
             }
             drop(handle); // 超时则 detach，不阻塞退出
         }
+    }
+}
+
+impl PreviewSource for CameraStream {
+    fn frame_if_new(&self, after: u64) -> Option<Arc<PreviewFrame>> {
+        let (seq, jpeg) = CameraStream::frame_if_new(self, after)?;
+        Some(Arc::new(PreviewFrame {
+            seq,
+            jpeg: Some(jpeg),
+            vision: None,
+        }))
+    }
+
+    fn latest(&self) -> Option<Arc<PreviewFrame>> {
+        CameraStream::latest(self).map(|jpeg| {
+            Arc::new(PreviewFrame {
+                seq: 0,
+                jpeg: Some(jpeg),
+                vision: None,
+            })
+        })
+    }
+
+    fn camera_status(&self) -> CameraStatus {
+        let st = CameraStream::status(self);
+        CameraStatus {
+            available: st.available,
+            device: st.device,
+            format: st.format,
+            frames: st.frames,
+            fps: st.fps,
+            age_ms: st.age_ms,
+            error: st.error,
+        }
+    }
+
+    fn vision_status(&self) -> Option<VisionStatus> {
+        None
     }
 }
 

@@ -1,5 +1,7 @@
 //! tpu.rs — 上层推理（NMS）+ 对 cviruntime-rs 的薄封装
 
+use std::io;
+
 use cviruntime_rs::Model;
 
 #[derive(Debug, Clone)]
@@ -155,16 +157,26 @@ pub struct TpuEngine {
 }
 
 impl TpuEngine {
+    /// 加载模型；失败返回 `io::Error`（不 panic，供网页/整合入口降级）。
+    pub fn try_new(model_path: &str) -> io::Result<Self> {
+        let model = Model::from_file(model_path)
+            .map_err(|e| io::Error::other(format!("TPU Model 加载失败: {e}")))?;
+        Ok(Self { inner: model })
+    }
+
     pub fn new(model_path: &str) -> Self {
-        let model =
-            Model::from_file(model_path).unwrap_or_else(|e| panic!("TPU Model 加载失败: {}", e));
-        Self { inner: model }
+        Self::try_new(model_path).unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// 前向推理；失败返回 `io::Error`（不 panic）。
+    pub fn try_infer(&self, data: &[u8]) -> io::Result<&[u8]> {
+        self.inner
+            .forward(data)
+            .map_err(|e| io::Error::other(format!("Forward 失败: {e}")))
     }
 
     pub fn infer(&self, data: &[u8]) -> &[u8] {
-        self.inner
-            .forward(data)
-            .unwrap_or_else(|e| panic!("Forward 失败: {}", e))
+        self.try_infer(data).unwrap_or_else(|e| panic!("{e}"))
     }
 
     pub fn in_shape(&self) -> &[i32] {
@@ -186,21 +198,37 @@ pub struct TpuInference {
 }
 
 impl TpuInference {
-    pub fn new(model_path: &str, conf_thresh: f32, iou_thresh: f32, labels: Vec<String>) -> Self {
-        let engine = TpuEngine::new(model_path);
-        Self {
-            engine,
+    /// 加载模型；失败返回 `io::Error`（供上层降级为「仅预览」）。
+    pub fn try_new(
+        model_path: &str,
+        conf_thresh: f32,
+        iou_thresh: f32,
+        labels: Vec<String>,
+    ) -> io::Result<Self> {
+        Ok(Self {
+            engine: TpuEngine::try_new(model_path)?,
             conf_thresh,
             iou_thresh,
             labels,
             last_tpu_ms: 0.0,
             last_nms_ms: 0.0,
-        }
+        })
     }
 
-    pub fn infer(&mut self, planar: &[u8]) -> Vec<Detection> {
+    pub fn new(model_path: &str, conf_thresh: f32, iou_thresh: f32, labels: Vec<String>) -> Self {
+        Self::try_new(model_path, conf_thresh, iou_thresh, labels)
+            .unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// 模型输入张量形状（如 `[1, 3, 480, 640]`）。
+    pub fn input_shape(&self) -> &[i32] {
+        self.engine.in_shape()
+    }
+
+    /// 推理；失败返回 `io::Error`（不 panic）。
+    pub fn try_infer(&mut self, planar: &[u8]) -> io::Result<Vec<Detection>> {
         let t0 = std::time::Instant::now();
-        let out_bytes = self.engine.infer(planar);
+        let out_bytes = self.engine.try_infer(planar)?;
         let tpu_ms = t0.elapsed().as_secs_f64() * 1000.0;
         self.last_tpu_ms = tpu_ms;
 
@@ -214,7 +242,8 @@ impl TpuInference {
         let nms_ms = t1.elapsed().as_secs_f64() * 1000.0;
         self.last_nms_ms = nms_ms;
 
-        dets.into_iter()
+        Ok(dets
+            .into_iter()
             .map(|d| Detection {
                 label: self
                     .labels
@@ -227,7 +256,12 @@ impl TpuInference {
                 x2: d.x2,
                 y2: d.y2,
             })
-            .collect()
+            .collect())
+    }
+
+    pub fn infer(&mut self, planar: &[u8]) -> Vec<Detection> {
+        self.try_infer(planar)
+            .unwrap_or_else(|e| panic!("{}", e))
     }
 
     pub fn last_timing(&self) -> (f64, f64) {

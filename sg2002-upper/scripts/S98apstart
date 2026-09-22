@@ -1,0 +1,39 @@
+#!/bin/sh
+# =============================================================================
+# S98apstart —— 开机启动 AP（部署: 复制到 /etc/init.d/ 并 chmod 755）
+#
+# 依赖 /etc/hostapd.conf 与 /etc/dnsmasq.ap.conf（由 init_ap.sh 生成）
+# =============================================================================
+
+AP_IFACE="${AP_IFACE:-wlan0}"          # AP 接口
+AP_IP="${AP_IP:-192.168.4.1}"
+NETMASK="${NETMASK:-255.255.255.0}"
+
+# 等 AP 接口就绪（轮询，最多 20s）
+i=0
+while [ $i -lt 40 ]; do
+    [ -d /sys/class/net/${AP_IFACE} ] && break
+    sleep 0.5
+    i=$((i+1))
+done
+
+# 只 terminate wlan0 的 wpa_supplicant（保护 capp 在 wlan1 上自举的那个）
+wpa_cli -p /var/run/wpa_supplicant -i ${AP_IFACE} terminate 2>/dev/null
+killall hostapd dnsmasq udhcpd 2>/dev/null
+sleep 1
+
+# dhcpcd 别管 AP 接口：AP 接口是静态地址（${AP_IP}），但 dhcpcd 会照样去要 DHCP
+# 地址，AP 模式下上游没有 DHCP 服务器 → 落一个 169.254.x 链路本地地址，接口上
+# 就有两个 IP（实测 wlan0: 192.168.4.1 + 169.254.79.27）。
+if ! grep -qE "^[[:space:]]*denyinterfaces.*\b${AP_IFACE}\b" /etc/dhcpcd.conf 2>/dev/null; then
+    echo "denyinterfaces ${AP_IFACE}" >> /etc/dhcpcd.conf
+fi
+
+# 起 AP 前把接口上的遗留地址清掉（dhcpcd 之前给的链路本地/DHCP 地址）——
+# 否则 AP 静态地址与它并存，接口上就有两个 IP。
+dhcpcd -k ${AP_IFACE} 2>/dev/null
+ip addr flush dev ${AP_IFACE} 2>/dev/null
+ifconfig ${AP_IFACE} ${AP_IP} netmask ${NETMASK} up
+dnsmasq --conf-file=/etc/dnsmasq.ap.conf --pid-file=/var/run/dnsmasq.ap.pid &
+hostapd -B /etc/hostapd.conf
+exit 0

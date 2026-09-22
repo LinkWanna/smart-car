@@ -1,0 +1,384 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>网球小车 · 网页遥控</title>
+<style>
+  :root {
+    --bg: #10141a;
+    --panel: #1a2029;
+    --panel2: #222b36;
+    --line: #2e3947;
+    --text: #e8eef6;
+    --muted: #8fa0b4;
+    --accent: #4da3ff;
+    --ok: #38d39f;
+    --warn: #ffb454;
+    --bad: #ff6b6b;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    background: var(--bg); color: var(--text);
+    font: 15px/1.45 -apple-system, "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+    -webkit-user-select: none; user-select: none; -webkit-tap-highlight-color: transparent;
+    display: flex; flex-direction: column;
+  }
+  header {
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    padding: 10px 14px; background: var(--panel); border-bottom: 1px solid var(--line);
+  }
+  header h1 { font-size: 16px; margin: 0 8px 0 0; font-weight: 600; }
+  .badges { display: flex; gap: 6px; flex-wrap: wrap; }
+  .badge {
+    font-size: 12px; padding: 3px 9px; border-radius: 999px;
+    background: var(--panel2); border: 1px solid var(--line); color: var(--muted);
+  }
+  .badge.ok { color: var(--ok); border-color: #1f5c48; }
+  .badge.warn { color: var(--warn); border-color: #6b4c1f; }
+  .badge.bad { color: var(--bad); border-color: #6b2626; }
+  main {
+    flex: 1; min-height: 0; display: grid; gap: 12px; padding: 12px;
+    grid-template-columns: minmax(0, 1fr) 340px; grid-template-rows: auto 1fr;
+    grid-template-areas: "video hud" "controls hud";
+  }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; }
+  .video-wrap { grid-area: video; position: relative; overflow: hidden; min-height: 220px; background: #000; }
+  #video { width: 100%; height: 100%; object-fit: contain; display: block; }
+  .video-hint {
+    position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+    color: var(--muted); font-size: 14px; text-align: center; padding: 16px;
+  }
+  .video-info {
+    position: absolute; right: 8px; bottom: 8px; font-size: 12px; color: var(--text);
+    background: rgba(0, 0, 0, .55); padding: 2px 8px; border-radius: 999px;
+  }
+  .controls { grid-area: controls; padding: 12px; display: flex; gap: 22px; align-items: center; justify-content: center; }
+  .pad { display: grid; gap: 8px; grid-template-columns: repeat(3, 68px); grid-template-rows: repeat(2, 68px); }
+  .key {
+    border: 1px solid var(--line); border-radius: 12px; background: var(--panel2); color: var(--text);
+    font-size: 22px; font-weight: 700; touch-action: none; cursor: pointer;
+  }
+  .key:active, .key.held { background: var(--accent); border-color: var(--accent); color: #06121f; }
+  .key.up { grid-column: 2; grid-row: 1; }
+  .key.left { grid-column: 1; grid-row: 2; }
+  .key.down { grid-column: 2; grid-row: 2; }
+  .key.right { grid-column: 3; grid-row: 2; }
+  .actions { display: flex; flex-direction: column; gap: 8px; }
+  .action {
+    min-width: 96px; height: 44px; border-radius: 10px; border: 1px solid var(--line);
+    background: var(--panel2); color: var(--text); font-size: 15px; touch-action: manipulation; cursor: pointer;
+  }
+  .action.stop { border-color: #7a3a3a; }
+  .action.brake { border-color: #7a6a2a; }
+  .action.init { border-color: #2a5a7a; }
+  .action:active { filter: brightness(1.4); }
+  .hud { grid-area: hud; padding: 12px 14px; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; }
+  .hud h2 { font-size: 13px; color: var(--muted); font-weight: 600; margin: 2px 0 0; }
+  .row { display: flex; justify-content: space-between; font-size: 13px; color: var(--muted); }
+  .row b { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
+  .bar { position: relative; height: 10px; border-radius: 999px; background: #0b0f14; border: 1px solid var(--line); overflow: hidden; }
+  .bar::after { content: ""; position: absolute; left: 50%; top: 0; bottom: 0; width: 1px; background: var(--line); }
+  .bar > i { position: absolute; top: 0; bottom: 0; width: 0; transition: width .08s linear; }
+  .bar .pos { left: 50%; background: var(--ok); }
+  .bar .neg { right: 50%; background: var(--warn); }
+  .flags { display: flex; gap: 6px; }
+  .flag { font-size: 11px; padding: 2px 8px; border-radius: 999px; background: var(--panel2); color: var(--muted); border: 1px solid var(--line); }
+  .flag.on { color: var(--accent); border-color: #24507a; }
+  .mono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 12px; color: var(--muted); word-break: break-all; }
+  footer { padding: 8px 14px; color: var(--muted); font-size: 12px; border-top: 1px solid var(--line); }
+  @media (max-width: 860px) {
+    main { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto auto 1fr; grid-template-areas: "video" "controls" "hud"; }
+    .video-wrap { min-height: 200px; }
+    .hud { overflow: visible; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>网球小车 · 网页遥控</h1>
+  <div class="badges">
+    <span id="b-ws" class="badge">连接中…</span>
+    <span id="b-link" class="badge">链路 --</span>
+    <span id="b-sys" class="badge">状态 --</span>
+  </div>
+</header>
+
+<main>
+  <section class="video-wrap panel">
+    <img id="video" alt="">
+    <div id="video-hint" class="video-hint">预览不可用</div>
+    <div id="video-info" class="video-info">0 fps</div>
+  </section>
+
+  <section class="controls panel">
+    <div class="pad">
+      <button class="key up" data-key="w">W</button>
+      <button class="key left" data-key="a">A</button>
+      <button class="key down" data-key="s">S</button>
+      <button class="key right" data-key="d">D</button>
+    </div>
+    <div class="actions">
+      <button class="action stop" data-action="stop">停止（滑行）</button>
+      <button class="action brake" data-action="brake">制动（保持）</button>
+      <button class="action init" data-action="init">初始化</button>
+    </div>
+  </section>
+
+  <section class="hud panel">
+    <h2>驾驶</h2>
+    <div class="row"><span>油门 <b id="h-throttle">+0.0</b></span><span>转向 <b id="h-steer">+0.00</b></span></div>
+    <div class="bar"><i id="bar-throttle-pos" class="pos"></i><i id="bar-throttle-neg" class="neg"></i></div>
+    <div class="bar"><i id="bar-steer-pos" class="pos"></i><i id="bar-steer-neg" class="neg"></i></div>
+    <div class="flags">
+      <span id="f-pivot" class="flag">原地转</span>
+      <span id="f-rev" class="flag">倒车</span>
+      <span id="f-brake" class="flag">刹车</span>
+      <span id="f-keys" class="flag">按键 --</span>
+    </div>
+    <div class="row"><span>轮命令 L/R</span><b id="h-cmd">0 / 0</b></div>
+
+    <h2>下位机</h2>
+    <div class="row"><span>实测转速 L/R</span><b id="h-rpm">-- / --</b></div>
+    <div class="row"><span>闭环</span><b id="h-dist">--</b></div>
+    <div class="row"><span>链路延迟</span><b id="h-age">--</b></div>
+    <div class="row"><span>运行时间</span><b id="h-uptime">--</b></div>
+    <div class="row"><span>计数 ACK/NACK/CRC/WD</span><b id="h-counters">--</b></div>
+    <div class="mono" id="h-last">--</div>
+
+    <h2>预览</h2>
+    <div class="row"><span>相机</span><b id="h-camera">--</b></div>
+    <div class="mono" id="h-camera-error" style="display:none"></div>
+  </section>
+</main>
+
+<footer>W/S 油门 · A/D 转向（低速原地旋转）· 空格制动 · 页面关闭/断网自动停车</footer>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const state = {
+  ws: null,
+  keys: new Set(),
+  maxSpeed: 55,
+  maxReverse: 40,
+  lastFrameAt: 0,
+  frames: 0,
+  reconnectMs: 500,
+  cameraOk: false,
+};
+
+/* ---------- 按键快照 ---------- */
+const KEY_ORDER = ["w", "s", "a", "d"];
+function keysString() {
+  return KEY_ORDER.filter((k) => state.keys.has(k)).join("");
+}
+function renderKeys() {
+  document.querySelectorAll("[data-key]").forEach((el) => {
+    el.classList.toggle("held", state.keys.has(el.dataset.key));
+  });
+  $("f-keys").textContent = "按键 " + (keysString() || "--");
+}
+function sendKeys() {
+  const ws = state.ws;
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: "keys", keys: keysString() }));
+  }
+}
+function setKey(key, down) {
+  if (down) state.keys.add(key); else state.keys.delete(key);
+  renderKeys();
+  sendKeys();
+}
+function clearKeys() {
+  if (state.keys.size === 0) return;
+  state.keys.clear();
+  renderKeys();
+  sendKeys();
+}
+function action(name) {
+  const ws = state.ws;
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    if (name === "stop" || name === "init") { state.keys.clear(); renderKeys(); }
+    ws.send(JSON.stringify({ type: "action", action: name }));
+  }
+}
+
+/* ---------- 键盘 / 触摸 ---------- */
+const KEYMAP = {
+  w: "w", W: "w", ArrowUp: "w",
+  s: "s", S: "s", ArrowDown: "s",
+  a: "a", A: "a", ArrowLeft: "a",
+  d: "d", D: "d", ArrowRight: "d",
+};
+window.addEventListener("keydown", (e) => {
+  if (e.repeat) { e.preventDefault(); return; }
+  if (e.key === " ") { e.preventDefault(); action("brake"); return; }
+  const key = KEYMAP[e.key];
+  if (!key) return;
+  e.preventDefault();
+  setKey(key, true);
+});
+window.addEventListener("keyup", (e) => {
+  const key = KEYMAP[e.key];
+  if (!key) return;
+  e.preventDefault();
+  setKey(key, false);
+});
+window.addEventListener("blur", clearKeys);
+document.addEventListener("visibilitychange", () => { if (document.hidden) clearKeys(); });
+
+document.querySelectorAll("[data-key]").forEach((el) => {
+  const key = el.dataset.key;
+  el.addEventListener("pointerdown", (e) => {
+    e.preventDefault();
+    el.setPointerCapture(e.pointerId);
+    setKey(key, true);
+  });
+  const release = (e) => { e.preventDefault(); setKey(key, false); };
+  el.addEventListener("pointerup", release);
+  el.addEventListener("pointercancel", release);
+  el.addEventListener("lostpointercapture", () => setKey(key, false));
+});
+document.querySelectorAll("[data-action]").forEach((el) => {
+  el.addEventListener("click", () => action(el.dataset.action));
+});
+
+/* 心跳：每 100ms 重发一份完整快照，服务端超时未收到就松开所有键。 */
+setInterval(sendKeys, 100);
+
+/* ---------- WebSocket ---------- */
+function connect() {
+  const proto = location.protocol === "https:" ? "wss:" : "ws:";
+  const ws = new WebSocket(proto + "//" + location.host + "/api/events");
+  ws.binaryType = "blob";
+  state.ws = ws;
+  ws.onopen = () => {
+    state.reconnectMs = 500;
+    badge("b-ws", "已连接", "ok");
+    sendKeys();
+  };
+  ws.onmessage = (ev) => {
+    if (typeof ev.data === "string") {
+      try { handleMessage(JSON.parse(ev.data)); } catch (_) { /* 忽略坏消息 */ }
+    } else {
+      handleFrame(ev.data);
+    }
+  };
+  ws.onclose = () => {
+    badge("b-ws", "重连中…", "warn");
+    badge("b-link", "链路 --", "");
+    badge("b-sys", "状态 --", "");
+    setTimeout(connect, state.reconnectMs);
+    state.reconnectMs = Math.min(state.reconnectMs * 1.5, 3000);
+  };
+  ws.onerror = () => ws.close();
+}
+
+function badge(id, text, cls) {
+  const el = $(id);
+  el.textContent = text;
+  el.className = "badge" + (cls ? " " + cls : "");
+}
+
+/* ---------- 状态渲染 ---------- */
+function handleMessage(msg) {
+  switch (msg.type) {
+    case "hello":
+      state.maxSpeed = msg.max_speed || 55;
+      state.maxReverse = msg.max_reverse || 40;
+      if (msg.camera && !msg.camera.available) showCameraError(msg.camera);
+      break;
+    case "status":
+      renderStatus(msg);
+      break;
+    case "error":
+      console.warn("server:", msg.error);
+      break;
+  }
+}
+
+function renderStatus(st) {
+  badge("b-link", st.link ? "链路 OK" : "链路丢失", st.link ? "ok" : "bad");
+  badge("b-sys", "状态 " + (st.sys || "--"), st.sys === "Running" ? "ok" : (st.sys ? "warn" : "bad"));
+
+  const thr = st.drive.throttle, steer = st.drive.steer;
+  $("h-throttle").textContent = (thr >= 0 ? "+" : "") + thr.toFixed(1);
+  $("h-steer").textContent = (steer >= 0 ? "+" : "") + steer.toFixed(2);
+  const thrPct = thr >= 0 ? (thr / state.maxSpeed) * 50 : (Math.abs(thr) / state.maxReverse) * 50;
+  $("bar-throttle-pos").style.width = (thr >= 0 ? Math.min(50, thrPct) : 0) + "%";
+  $("bar-throttle-neg").style.width = (thr < 0 ? Math.min(50, thrPct) : 0) + "%";
+  const steerPct = Math.min(50, Math.abs(steer) * 50);
+  $("bar-steer-pos").style.width = (steer >= 0 ? steerPct : 0) + "%";
+  $("bar-steer-neg").style.width = (steer < 0 ? steerPct : 0) + "%";
+  const flags = new Set(st.drive.flags || []);
+  $("f-pivot").classList.toggle("on", flags.has("PIVOT"));
+  $("f-rev").classList.toggle("on", flags.has("REV"));
+  $("f-brake").classList.toggle("on", flags.has("BRAKE"));
+  $("f-keys").textContent = "按键 " + (st.drive.keys || "--");
+  $("h-cmd").textContent = st.drive.cmd[0] + " / " + st.drive.cmd[1];
+
+  $("h-rpm").textContent = st.rpm[0] + " / " + st.rpm[1];
+  $("h-dist").textContent = st.dist.active
+    ? (st.dist.result === 1 ? "已到达" : "运行中")
+    : "空闲";
+  $("h-age").textContent = st.link_age_ms == null ? "--" : st.link_age_ms + " ms";
+  $("h-uptime").textContent = Math.round(st.uptime) + " s";
+  const c = st.counters;
+  $("h-counters").textContent = [c.acks, c.nacks, c.checksum_fails, c.watchdog_trips].join(" / ");
+  $("h-last").textContent = st.last_frame || "--";
+
+  if (st.camera && st.camera.available) {
+    state.cameraOk = true;
+    $("h-camera").textContent =
+      st.camera.format + " · " + st.camera.fps.toFixed(1) + " fps · " +
+      (st.camera.age_ms == null ? "--" : st.camera.age_ms + " ms");
+    $("h-camera-error").style.display = "none";
+  } else if (st.camera) {
+    showCameraError(st.camera);
+  } else {
+    state.cameraOk = false;
+    $("h-camera").textContent = "未启用";
+    $("video-hint").textContent = "未启用预览";
+    $("video-hint").style.display = "flex";
+  }
+}
+
+function showCameraError(cam) {
+  state.cameraOk = false;
+  $("h-camera").textContent = "不可用";
+  const el = $("h-camera-error");
+  el.textContent = cam.error || "预览不可用";
+  el.style.display = "block";
+  $("video-hint").textContent = cam.error || "预览不可用";
+  $("video-hint").style.display = "flex";
+}
+
+/* ---------- 视频帧 ---------- */
+function handleFrame(blob) {
+  const img = $("video");
+  const old = img.dataset.url;
+  const url = URL.createObjectURL(blob);
+  img.src = url;
+  img.dataset.url = url;
+  if (old) URL.revokeObjectURL(old);
+  state.lastFrameAt = performance.now();
+  state.frames++;
+  $("video-hint").style.display = "none";
+}
+
+setInterval(() => {
+  $("video-info").textContent = state.frames + " fps";
+  state.frames = 0;
+  if (state.cameraOk && performance.now() - state.lastFrameAt > 2000 && state.lastFrameAt > 0) {
+    $("video-hint").textContent = "预览无画面";
+    $("video-hint").style.display = "flex";
+  }
+}, 1000);
+
+renderKeys();
+connect();
+</script>
+</body>
+</html>

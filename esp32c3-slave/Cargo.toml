@@ -1,0 +1,56 @@
+[package]
+name = "esp32c3-smart-car"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["uart"]
+uart = []
+ble = ["dep:esp-alloc", "dep:esp-radio", "dep:trouble-host", "esp-rtos/esp-radio"]
+
+[dependencies]
+defmt = "1.1.1"
+
+# 上下位机共用的线协议（本仓库根目录 `protocol/`）；`defmt` feature 提供日志格式化。
+smart-car-protocol = { path = "../protocol", features = ["defmt"] }
+
+embassy-executor = { version = "0.10.0" }
+embassy-futures = "0.1"
+embassy-sync = "0.8"
+embassy-time = "0.5.1"
+critical-section = "1.2"
+portable-atomic = "1.11"
+esp-alloc = { version = "0.11.0", optional = true }
+esp-backtrace = { version = "0.20.0", features = [
+    "esp32c3",
+    "panic-handler",
+    "defmt",
+] }
+esp-bootloader-esp-idf = { version = "0.6.0", features = ["esp32c3"] }
+esp-hal = { version = "1.2.1", features = ["esp32c3", "unstable", "defmt"] }
+esp-println = { version = "0.18.0", default-features = false, features = [
+    "esp32c3",
+    "defmt-espflash",
+    "jtag-serial",
+    "colors",
+    "critical-section",
+] }
+esp-radio = { version = "1.0.0-beta.1", optional = true, features = [
+    "esp32c3",
+    "unstable",
+    "ble",
+    "defmt",
+] }
+esp-rtos = { version = "0.4.0", features = ["esp32c3", "embassy", "defmt"] }
+static_cell = "2.1.1"
+trouble-host = { version = "0.7.0", optional = true, features = [
+    "client-att-table-size-16",
+    "default-packet-pool-mtu-255",
+    "defmt",
+] }
+
+[profile.release]
+debug            = true
+debug-assertions = true
+lto              = "fat"
+codegen-units    = 1

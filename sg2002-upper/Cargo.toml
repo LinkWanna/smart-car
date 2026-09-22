@@ -1,0 +1,37 @@
+[package]
+name = "sg2002-upper"
+version = "0.1.0"
+edition = "2024"
+description = "SG2002 上位机：YOLO 网球检测 + 视觉伺服，经 UART 驱动 ESP32-C3 双电机小车"
+license = "MIT"
+
+[dependencies]
+libc = "0.2"
+v4l = "0.14.0"
+cviruntime-rs = { path = "cviruntime-rs" }
+rouille = "3.6.2"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+clap = { version = "4.6.7", features = ["derive"] }
+
+# 上下位机共用的线协议（仓库根目录 `protocol/`）：命令组帧与应答解析。
+smart-car-protocol = { path = "../protocol" }
+
+[[bin]]
+name = "pipeline"
+path = "src/bin/pipeline.rs"
+
+[[bin]]
+name = "carctl"
+path = "src/bin/carctl.rs"
+
+[[bin]]
+name = "webctl"
+path = "src/bin/webctl.rs"
+
+[profile.release]
+lto = true
+codegen-units = 1
+
+[dev-dependencies]
+tungstenite = "0.30.0"

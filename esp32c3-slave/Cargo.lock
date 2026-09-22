@@ -1141,7 +1141,7 @@ dependencies = [
  "esp-radio",
  "esp-rtos",
  "portable-atomic",
- "smart-car-protocol",
+ "protocol",
  "static_cell",
  "trouble-host",
 ]
@@ -1711,6 +1711,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "protocol"
+version = "0.1.0"
+dependencies = [
+ "defmt 1.1.1",
+]
+
+[[package]]
 name = "quote"
 version = "1.0.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1930,13 +1937,6 @@ name = "smallvec"
 version = "1.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba467056f1b547ed52077911161fc86985becbc60e8e1857c8a144dab0def891"
-
-[[package]]
-name = "smart-car-protocol"
-version = "0.1.0"
-dependencies = [
- "defmt 1.1.1",
-]
 
 [[package]]
 name = "somni-expr"

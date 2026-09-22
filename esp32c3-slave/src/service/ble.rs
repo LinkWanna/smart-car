@@ -17,7 +17,7 @@ use esp_hal::efuse::{self, InterfaceMacAddress};
 use esp_radio::ble::controller::BleConnector;
 use trouble_host::prelude::*;
 
-use crate::protocol::Frame;
+use protocol::Frame;
 
 /// Payload size that fits a notification at the minimum (23 byte) ATT MTU.
 pub const CHUNK: usize = 20;

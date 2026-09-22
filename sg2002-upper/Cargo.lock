@@ -924,6 +924,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "protocol"
+version = "0.1.0"
+
+[[package]]
 name = "quick-error"
 version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1138,10 +1142,10 @@ dependencies = [
  "clap",
  "cviruntime-rs",
  "libc",
+ "protocol",
  "rouille",
  "serde",
  "serde_json",
- "smart-car-protocol",
  "tungstenite",
  "v4l",
 ]
@@ -1186,10 +1190,6 @@ name = "smallvec"
 version = "1.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba467056f1b547ed52077911161fc86985becbc60e8e1857c8a144dab0def891"
-
-[[package]]
-name = "smart-car-protocol"
-version = "0.1.0"
 
 [[package]]
 name = "stable_deref_trait"

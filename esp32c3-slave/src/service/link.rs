@@ -11,12 +11,12 @@
 //! - BLE only drains while connected, so it stays best effort.
 
 use crate::drivers::motor::Pid;
-use crate::protocol::{ErrorCode, PidData, RequestType, Response, Status};
 #[cfg(feature = "ble")]
 use crate::service::ble;
 use crate::service::control::State;
 #[cfg(feature = "uart")]
 use crate::service::uart;
+use protocol::{ErrorCode, PidData, RequestType, Response, Status};
 
 /// Handle to the compiled-in command link: inbound byte stream and outbound
 /// frame queue. Cheap `Copy`; owns no peripheral.

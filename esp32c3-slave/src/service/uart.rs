@@ -17,7 +17,7 @@ use esp_hal::{
     uart::{Config as UartConfig, DataBits, Parity, StopBits, Uart, UartRx, UartTx},
 };
 
-use crate::protocol::Frame;
+use protocol::Frame;
 
 /// Frames queued for UART0 upload.
 pub static UART_TX: Channel<CriticalSectionRawMutex, Frame, 16> = Channel::new();

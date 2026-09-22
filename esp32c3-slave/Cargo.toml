@@ -10,9 +10,7 @@ ble = ["dep:esp-alloc", "dep:esp-radio", "dep:trouble-host", "esp-rtos/esp-radio
 
 [dependencies]
 defmt = "1.1.1"
-
-# 上下位机共用的线协议（本仓库根目录 `protocol/`）；`defmt` feature 提供日志格式化。
-smart-car-protocol = { path = "../protocol", features = ["defmt"] }
+protocol = { path = "../protocol", features = ["defmt"] }
 
 embassy-executor = { version = "0.10.0" }
 embassy-futures = "0.1"

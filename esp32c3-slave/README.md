@@ -23,7 +23,7 @@ LEDC 载波、TIMG/systimer 都由时钟树据此计算分频。
 ## 仓库结构
 
 ```
-../protocol/         # 上下位机共用的协议 crate（smart-car-protocol，no_std）
+../protocol/         # 上下位机共用的协议 crate（crate 名 protocol，no_std）
   src/frame.rs       # 帧编码 + 逐字节接收状态机
   src/request.rs     # 11 条命令负载的 decode/encode
   src/response.rs    # Ack/Nack/Status/PidData 的 decode/encode
@@ -52,8 +52,7 @@ tools/
 ```
 
 协议实现只有一份：固件和上位机（`sg2002-upper`）都依赖仓库根目录的
-`smart-car-protocol` crate，`src/main.rs` 里用
-`pub(crate) use smart_car_protocol as protocol;` 保留 `crate::protocol` 路径。
+`protocol` crate（`protocol/`），源码里直接 `use protocol::...`。
 
 分层：`command_task` 只往 `State` 里写意图（`MotorCmd::{Drive, Coast, Brake}`，
 以及 Move/Rotate 的闭环目标），`control_task` 独占电机、编码器记账和 LED，
@@ -89,7 +88,7 @@ NACK 原因：`WrongState` / `BadChecksum` / `InvalidParam` / `UnknownRequest`�
 负载长度是**精确值**：多一字节少一字节、未知请求、枚举/数值越界都会回 NACK；
 `LEN > 16` 的帧会被解析器丢弃并立即重同步。多字节整数一律**小端**（`struct "<"` /
 `to_le_bytes`）。字段级定义、校验规则与受理状态以仓库根目录的 `protocol/`
-（`smart-car-protocol` crate）为准——模块文档里就是完整协议表，固件与上位机
+（`protocol` crate）为准——模块文档里就是完整协议表，固件与上位机
 `sg2002-upper` 共用这一份实现；Python 侧镜像为 `tools/src/protocol.py`。
 
 ```bash

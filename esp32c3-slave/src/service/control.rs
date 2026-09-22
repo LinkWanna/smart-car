@@ -17,12 +17,12 @@ use static_cell::StaticCell;
 
 use crate::drivers::motor::{Motors, Pid};
 use crate::drivers::{encoder, motor};
-use crate::protocol::SysState;
 #[cfg(feature = "ble")]
 use crate::service::ble;
 use crate::service::odometry::OdometryState;
 #[cfg(feature = "ble")]
 use portable_atomic::Ordering;
+use protocol::SysState;
 
 // --- App state ---
 pub(crate) struct State {
@@ -203,7 +203,7 @@ pub(crate) async fn control_task(
     motors: Motors<'static>,
     mut led: Output<'static>,
 ) {
-    let mut ticker = Ticker::every(Duration::from_millis(30));
+    let mut ticker = Ticker::every(Duration::from_millis(50));
 
     loop {
         ticker.next().await;

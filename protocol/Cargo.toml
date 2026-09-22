@@ -1,12 +1,11 @@
 [package]
-name = "smart-car-protocol"
+name = "protocol"
 version = "0.1.0"
 edition = "2024"
 description = "小车上下位机共享的线协议：帧格式、命令/应答编解码与校验（no_std）"
 license = "MIT"
 
 [features]
-# 下位机（esp32c3-slave）打开：为协议类型派生 `defmt::Format`，用于日志。
 defmt = ["dep:defmt"]
 
 [dependencies]

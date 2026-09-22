@@ -4,7 +4,7 @@
 //! - 感知：`camera`（V4L2 零拷贝）、`preprocess`（YUYV→RGB）、`tpu`（推理 + NMS）、
 //!   `position`（位置/距离分级）。
 //! - 下位机通信与控制：`control`（`protocol` 线协议——与固件共用的
-//!   `smart-car-protocol` crate、`serial` 串口、`car` 链路 + 安全看门狗、
+//!   `protocol` crate、`serial` 串口、`car` 链路 + 安全看门狗、
 //!   `servo` 视觉伺服控制律）。
 //! - 网页遥控：`web`（零依赖 HTTP/WebSocket、play.py 手感的遥控控制律、
 //!   MJPEG 预览）。

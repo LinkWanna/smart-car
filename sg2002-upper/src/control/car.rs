@@ -713,7 +713,15 @@ mod tests {
         fake_response(
             &master,
             ResponseType::Status.as_u8(),
-            &[SysState::Running.as_u8(), 0x0B, 0x00, 0xF5, 0xFF, 0x00, 0x00],
+            &[
+                SysState::Running.as_u8(),
+                0x0B,
+                0x00,
+                0xF5,
+                0xFF,
+                0x00,
+                0x00,
+            ],
         );
         thread::sleep(Duration::from_millis(100));
         assert!(car.link_ok());

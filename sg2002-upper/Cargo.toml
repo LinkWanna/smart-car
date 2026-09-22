@@ -13,9 +13,7 @@ rouille = "3.6.2"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 clap = { version = "4.6.7", features = ["derive"] }
-
-# 上下位机共用的线协议（仓库根目录 `protocol/`）：命令组帧与应答解析。
-smart-car-protocol = { path = "../protocol" }
+protocol = { path = "../protocol" }
 
 [[bin]]
 name = "pipeline"

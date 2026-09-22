@@ -22,9 +22,7 @@ compile_error!("no command link selected; enable either the `ble` or the `uart` 
 mod drivers;
 mod service;
 
-// 协议层已抽到上下位机共用的 crate（仓库根目录 `protocol/`）；这里保留
-// `crate::protocol` 路径，固件内部照旧 `use crate::protocol::...`。
-pub(crate) use smart_car_protocol as protocol;
+// 协议层是上下位机共用的 crate（仓库根目录 `protocol/`），直接用 crate 名引用。
 
 use drivers::encoder;
 use drivers::motor::{Motors, PWM_FREQ_HZ};

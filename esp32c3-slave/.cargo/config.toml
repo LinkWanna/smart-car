@@ -6,24 +6,9 @@ rustflags = [
   "-C", "force-frame-pointers",
 ]
 
-[target.'cfg(target_arch = "xtensa")']
-runner = "espflash flash --monitor"
-rustflags = [
-  # GNU LD
-  "-C", "link-arg=-Wl,-Tlinkall.x",
-  "-C", "link-arg=-Tdefmt.x",
-  "-C", "link-arg=-nostartfiles",
-
-  # LLD
-  # "-C", "link-arg=-Tlinkall.x",
-  # "-C", "linker=rust-lld",
-]
-
 [build]
 target = "riscv32imc-unknown-none-elf"
 
-# rsproxy mirrors esp-radio 1.0.0-beta.1 / esp-phy 0.3.0 / esp-radio-rtos-driver 0.4.2
-# which the global aliyun mirror does not have yet. Project-local override only.
 [source.crates-io]
 replace-with = "rsproxy"
 

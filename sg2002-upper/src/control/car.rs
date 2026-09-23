@@ -580,11 +580,7 @@ impl Car {
         }
         let mut threads = self.threads.lock().unwrap();
         for handle in threads.drain(..) {
-            let deadline = Instant::now() + Duration::from_millis(300);
-            while !handle.is_finished() && Instant::now() < deadline {
-                thread::sleep(Duration::from_millis(2));
-            }
-            drop(handle); // 未在时限内退出则 detach，不阻塞进程退出
+            crate::join_with_timeout(handle, "链路");
         }
     }
 }

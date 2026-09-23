@@ -24,62 +24,7 @@
 use std::fmt;
 use std::time::{Duration, Instant};
 
-use crate::position::PositionResult;
-
-/// 目标距离分级（由 [`crate::position`] 按检测框面积占比给出）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Distance {
-    /// 很近：直接停车（双轮制动）。
-    Near,
-    /// 中等距离：减速前进。
-    Mid,
-    /// 远距离：全速前进。
-    Far,
-}
-
-impl Distance {
-    /// 位置分析输出的分级名（`near`/`mid`/`far`）。
-    pub fn parse(name: &str) -> Self {
-        match name {
-            "near" => Self::Near,
-            "mid" => Self::Mid,
-            _ => Self::Far,
-        }
-    }
-
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Near => "near",
-            Self::Mid => "mid",
-            Self::Far => "far",
-        }
-    }
-}
-
-/// 一帧视觉观测（由 [`crate::position::PositionResult`] 转换）。
-#[derive(Debug, Clone, Copy)]
-pub struct Observation {
-    /// 本帧是否检测到有效目标。
-    pub present: bool,
-    /// 目标横向偏差，右为正，范围 -1..=1。
-    pub err_x: f32,
-    /// 目标距离分级。
-    pub distance: Distance,
-    /// 置信度（仅用于日志）。
-    pub confidence: f32,
-}
-
-impl Observation {
-    /// 由位置分析结果构造：`err_x = (中心x - 0.5) × 2`（右为正，夹到 ±1）。
-    pub fn from_result(result: &PositionResult) -> Self {
-        Self {
-            present: result.has_target(),
-            err_x: ((result.center_x - 0.5) * 2.0).clamp(-1.0, 1.0),
-            distance: Distance::parse(&result.distance),
-            confidence: result.target_confidence,
-        }
-    }
-}
+use crate::position::{Distance, Observation};
 
 /// 控制决策输出。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

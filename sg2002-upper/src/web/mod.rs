@@ -2,18 +2,12 @@
 //!
 //! 用一台手机/电脑连上小车的 AP（`scripts/init_ap.sh`，默认 `192.168.4.1`），
 //! 浏览器打开页面即可遥控；也支持**自动模式**（视觉伺服），由页面按钮切换。
-//! 分层：
 //!
-//! - [`teleop`]：纯控制律（W/S 油门斜坡、A/D 转向、低速原地旋转、输入看门狗），
-//!   只输出 [`teleop::Output`]，不碰链路；
-//! - [`video`]：MJPG 采集线程 + 最新帧广播（只有画面，`webctl` 用）；
-//! - `server.rs`：基于 `rouille`（HTTP + WebSocket）与 `serde_json` 的路由、
-//!   会话、控制节拍（手动/自动仲裁）与状态推送；
-//! - `driver.rs`：把 [`DriveTarget`] 落到 [`crate::control::Car`] 上。
-//!
-//! 整合入口（`smartcar`）的预览来自 [`crate::vision::VisionStream`]：
-//! 相机按模型需要的 YUYV422 打开，网页拿到的 JPEG 与检测框**同帧**；
-//! 网页层只依赖 [`crate::preview::PreviewSource`] 抽象。
+//! 本模块只负责「页面/接口」：路由、WebSocket 会话、JSON 组装。控制节拍与
+//! 手动/自动仲裁在 [`crate::control::ControlSession`]（按键 -> 控制律 -> 链路），
+//! 预览来自 `VisionStream`（CPU 管线）或 [`crate::vision::VpssStream`]（VPSS
+//! 管线）——网页层只依赖 [`crate::preview::PreviewSource`] 抽象，拿到的 JPEG
+//! 与检测框**同帧**。
 //!
 //! # 接口
 //!
@@ -30,68 +24,11 @@
 //! # 安全
 //!
 //! 浏览器每 100ms 发一次完整按键快照（变化时立即发），服务端
-//! [`TeleopConfig::input_timeout`](teleop::TeleopConfig::input_timeout) 收不到就
-//! 松开所有键；WebSocket 断开时只清理该客户端的按键；模式切换、控制线程退出前
-//! 都会滑行停车，[`Car`](crate::control::Car) 自己的看门狗与 `Drop` 再兜底一层；
-//! 自动模式下视觉观测过期（>500ms）按“看不到”处理并滑行。
+//! [`TeleopConfig::input_timeout`](crate::control::TeleopConfig::input_timeout)
+//! 收不到就松开所有键；WebSocket 断开时只清理该客户端的按键；模式切换、控制
+//! 线程退出前都会滑行停车，[`Car`](crate::control::Car) 自己的看门狗与 `Drop`
+//! 再兜底一层；自动模式下视觉观测过期（>500ms）按“看不到”处理并滑行。
 
-use std::time::Duration;
-
-use crate::control::Counters;
-
-pub mod teleop;
-pub mod video;
-
-mod driver;
 mod server;
 
-pub use server::{Mode, Server, WebConfig};
-pub use teleop::{Action, Keys, Output, Teleop, TeleopConfig};
-pub use video::{CameraStream, VideoStatus};
-
-/// 下位机链路快照（HUD 用；真实实现见 `driver.rs`）。
-#[derive(Debug, Clone, Default)]
-pub struct LinkSnapshot {
-    /// 最近是否收到过 `Status`（链路可用）。
-    pub link_ok: bool,
-    /// 最近一次 `Status` 距今的时间。
-    pub link_age: Option<Duration>,
-    /// 固件状态机（`Uninit`/`Ready`/`Running`），无应答为 `None`。
-    pub sys: Option<String>,
-    /// 双轮实测转速（RPM），`[左, 右]`。
-    pub rpm: [i16; 2],
-    /// 固件闭环运动是否运行中。
-    pub dist_active: bool,
-    /// 0 = 无/运行中，1 = 已到达目标。
-    pub dist_result: u8,
-    /// 链路计数。
-    pub counters: Counters,
-    /// 最近一帧应答的可读文本。
-    pub last_frame: String,
-}
-
-/// 遥控输出端：真实串口链路（[`crate::control::Car`]）或测试替身。
-pub trait DriveTarget: Send + Sync {
-    /// 双轮目标速度（-100..100）。
-    fn set_speeds(&self, left: i16, right: i16);
-
-    /// 滑行。
-    fn coast(&self);
-
-    /// 短接制动。
-    fn brake(&self);
-
-    /// 编码器清零并进入 Ready。
-    fn init(&self);
-
-    /// 回 Uninit（调试用）。
-    fn reset(&self);
-
-    /// 下位机处于 Uninit / 状态不对时补发 `Init`；返回是否触发。
-    fn maybe_reinit(&self) -> bool {
-        false
-    }
-
-    /// 当前链路快照。
-    fn snapshot(&self) -> LinkSnapshot;
-}
+pub use server::{Server, WebConfig};

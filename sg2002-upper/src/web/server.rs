@@ -1,4 +1,4 @@
-//! 网页服务器：rouille（HTTP + WebSocket）+ serde_json 状态推送 + 控制节拍。
+//! 网页服务器：rouille（HTTP + WebSocket）+ serde_json 状态推送。
 //!
 //! 线程模型：
 //!
@@ -7,18 +7,18 @@
 //! - **WebSocket 会话**：握手交给 `rouille::websocket`，每个连接一个线程——
 //!   `Websocket::next()` 阻塞读客户端消息，收到消息后按 `status_hz` /
 //!   `video_fps` 推送状态与 JPEG（页面每 100ms 发按键心跳，天然给出推送节奏）；
-//!   客户端静默时输入看门狗（[`Teleop`]）会把车停下；
-//! - **控制线程**（[`Server::spawn_control`]）：按 `control_hz` 推进 [`Teleop`]
-//!   并把 [`Output`] 落到 [`DriveTarget`]；
-//! - **采集线程**：[`super::video::CameraStream`]，与本模块解耦。
+//!   客户端静默时输入看门狗（[`Teleop`](crate::control::Teleop)）会把车停下。
+//!
+//! 控制节拍与手动/自动仲裁在 [`crate::control::ControlSession`]（本模块只把
+//! 按键/动作/模式转成会话方法调用，并从会话状态组装 JSON）。
 //!
 //! 页面本身（`assets/index.html`）通过 `include_str!` 内嵌，零外部资源。
 
 use std::io;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::thread::{self, JoinHandle};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use log::{info, warn};
@@ -27,48 +27,15 @@ use rouille::{Request, Response};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::DriveTarget;
-use super::teleop::{Action, Keys, Output, Teleop, TeleopConfig};
-use crate::control::servo::{Action as ServoAction, ControlConfig, ControlLoop};
+use crate::control::ControlSession;
+use crate::control::session::{AutoState, Mode};
+use crate::control::teleop::{Action, Keys};
 use crate::preview::{PreviewSource, VisionSnapshot};
 
-/// 观测过期阈值：超过这个时间没有新帧，自动模式按“看不到”处理（滑行）。
-const AUTO_STALE: Duration = Duration::from_millis(500);
 /// WebSocket 每轮主动推送的时长（略小于页面 100ms 的按键心跳间隔）。
 const PUSH_WINDOW: Duration = Duration::from_millis(90);
 /// 推送窗口内的检查粒度。
 const PUSH_TICK: Duration = Duration::from_millis(5);
-
-/// 输入来源：手动遥控（网页按键）或自动视觉（追踪目标）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Mode {
-    Manual,
-    Auto,
-}
-
-impl Mode {
-    /// 解析模式名（`manual`/`auto`，也接受中文）。
-    pub fn parse(name: &str) -> Option<Self> {
-        match name.trim().to_ascii_lowercase().as_str() {
-            "manual" | "手动" => Some(Self::Manual),
-            "auto" | "自动" => Some(Self::Auto),
-            _ => None,
-        }
-    }
-
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Manual => "manual",
-            Self::Auto => "auto",
-        }
-    }
-}
-
-impl std::fmt::Display for Mode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
 
 /// 内嵌的网页（HTML + CSS + JS 单文件，零外部资源）。
 const INDEX_HTML: &str = include_str!("assets/index.html");
@@ -115,25 +82,13 @@ enum ClientMessage {
     Ping,
 }
 
-/// 自动模式的最近一次输出（HUD 展示用）。
-struct AutoState {
-    action: String,
-    cmd: [i16; 2],
-}
-
 /// 所有连接共享的状态。
 struct Shared {
     cfg: WebConfig,
-    target: Arc<dyn DriveTarget>,
-    teleop: Mutex<Teleop>,
+    /// 控制会话（链路 + 手动/自动仲裁 + 控制线程）。
+    session: Arc<ControlSession>,
     /// 预览/视觉源；`None` = 未启用预览。
     preview: Option<Arc<dyn PreviewSource>>,
-    /// 当前输入模式（默认手动；自动需要按钮切换）。
-    mode: Mutex<Mode>,
-    /// 自动模式控制律参数。
-    servo_cfg: ControlConfig,
-    /// 自动模式最近一次输出（HUD）。
-    auto: Mutex<Option<AutoState>>,
     running: Arc<AtomicBool>,
     clients: AtomicU64,
     next_client_id: AtomicU64,
@@ -141,174 +96,67 @@ struct Shared {
 }
 
 impl Shared {
-    fn mode(&self) -> Mode {
-        *self.mode.lock().unwrap()
-    }
-
-    /// 切换输入模式；进入自动模式要求视觉/模型就绪。
-    ///
-    /// 切换时立即滑行并把手动输入清干净（避免残留油门/锁存），控制线程会在
-    /// 下一拍发现模式变化并重置视觉伺服状态。
-    fn set_mode(&self, mode: Mode) -> Result<(), String> {
-        if mode == Mode::Auto {
-            match &self.preview {
-                Some(preview) if preview.auto_ready() => {}
-                Some(_) => return Err("视觉未就绪（模型/画面不可用），无法进入自动模式".into()),
-                None => return Err("未启用视觉，无法进入自动模式".into()),
-            }
-        }
-        *self.mode.lock().unwrap() = mode;
-        self.teleop.lock().unwrap().reset_inputs();
-        self.target.coast();
-        info!("输入模式 → {}", mode);
-        Ok(())
-    }
-
-    /// 控制节拍：按当前模式推进手动遥控或视觉伺服，并落地输出。
-    fn control_loop(self: &Arc<Self>) {
-        let hz = {
-            let teleop = self.teleop.lock().unwrap();
-            teleop.config().control_hz.max(1.0)
-        };
-        let period = Duration::from_secs_f32(1.0 / hz);
-        let mut next = Instant::now();
-        let mut servo = ControlLoop::new(self.servo_cfg);
-        let mut last_mode = self.mode();
-        while self.running.load(Ordering::Relaxed) {
-            let now = Instant::now();
-            let mode = self.mode();
-            if mode != last_mode {
-                // 模式刚变化：重置伺服状态（不沿用上次的搜索方向/保持），
-                // 手动输入也已在 set_mode 里清空。
-                servo = ControlLoop::new(self.servo_cfg);
-                last_mode = mode;
-            }
-            let out = match mode {
-                Mode::Manual => self.teleop.lock().unwrap().tick(now),
-                Mode::Auto => self.auto_output(&mut servo, now),
-            };
-            apply(&*self.target, out);
-            self.target.maybe_reinit();
-            next += period;
-            let now = Instant::now();
-            if next > now {
-                thread::sleep(next - now);
-            } else {
-                next = now;
-            }
-        }
-        info!("控制线程退出，滑行停车");
-        self.target.coast();
-    }
-
-    /// 自动模式：取最新视觉观测（过期/不可用 → 滑行），推进视觉伺服。
-    fn auto_output(&self, servo: &mut ControlLoop, now: Instant) -> Output {
-        let snap: Option<Arc<VisionSnapshot>> = self
-            .preview
-            .as_ref()
-            .and_then(|preview| preview.latest_snapshot())
-            .filter(|snap| now.saturating_duration_since(snap.at) < AUTO_STALE);
-        let Some(snap) = snap else {
-            *self.auto.lock().unwrap() = Some(AutoState {
-                action: "等待视觉".to_string(),
-                cmd: [0, 0],
-            });
-            return Output::Coast;
-        };
-        let action = servo.step(&snap.observation, now);
-        let cmd = action.wheels().map_or([0, 0], |(l, r)| [l, r]);
-        *self.auto.lock().unwrap() = Some(AutoState {
-            action: action.to_string(),
-            cmd,
-        });
-        action_output(action)
-    }
-
     /// 一帧状态（WebSocket 推送与 `GET /api/status` 共用）。
     fn status_value(&self) -> Value {
-        let now = Instant::now();
-        let (hud, input_age) = {
-            let teleop = self.teleop.lock().unwrap();
-            (teleop.hud(), teleop.input_age(now))
-        };
-        let link = self.target.snapshot();
+        let st = self.session.status();
         let mut flags: Vec<&str> = Vec::new();
-        if hud.flags.pivot {
+        if st.hud.flags.pivot {
             flags.push("PIVOT");
         }
-        if hud.flags.reverse {
+        if st.hud.flags.reverse {
             flags.push("REV");
         }
-        if hud.flags.braking {
+        if st.hud.flags.braking {
             flags.push("BRAKE");
         }
         json!({
             "type": "status",
             "uptime": self.started.elapsed().as_secs_f32(),
-            "link": link.link_ok,
-            "link_age_ms": link.link_age.map(|d| d.as_millis() as u64),
-            "sys": link.sys,
-            "rpm": link.rpm,
-            "dist": { "active": link.dist_active, "result": link.dist_result },
+            "link": st.link.link_ok,
+            "link_age_ms": st.link.link_age.map(|d| d.as_millis() as u64),
+            "sys": st.link.sys,
+            "rpm": st.link.rpm,
+            "dist": { "active": st.link.dist_active, "result": st.link.dist_result },
             "drive": {
-                "throttle": hud.throttle,
-                "steer": hud.steer,
+                "throttle": st.hud.throttle,
+                "steer": st.hud.steer,
                 "flags": flags,
-                "cmd": hud.cmd,
-                "keys": hud.keys.to_string(),
-                "input_age_ms": input_age.map(|d| d.as_millis() as u64),
+                "cmd": st.hud.cmd,
+                "keys": st.hud.keys.to_string(),
+                "input_age_ms": st.input_age.map(|d| d.as_millis() as u64),
             },
-            "mode": self.mode().as_str(),
-            "auto_ready": self.preview.as_ref().is_some_and(|p| p.auto_ready()),
-            "auto": self.auto_value(),
+            "mode": st.mode.as_str(),
+            "auto_ready": st.auto_ready,
+            "auto": auto_value(st.auto.as_ref()),
             "counters": {
-                "acks": link.counters.acks,
-                "nacks": link.counters.nacks,
-                "checksum_fails": link.counters.checksum_fails,
-                "write_errors": link.counters.write_errors,
-                "watchdog_trips": link.counters.watchdog_trips,
+                "acks": st.link.counters.acks,
+                "nacks": st.link.counters.nacks,
+                "checksum_fails": st.link.counters.checksum_fails,
+                "write_errors": st.link.counters.write_errors,
+                "watchdog_trips": st.link.counters.watchdog_trips,
             },
-            "last_frame": link.last_frame,
+            "last_frame": st.link.last_frame,
             "camera": self.camera_value(),
             "vision": self.vision_value(),
             "clients": self.clients.load(Ordering::Relaxed),
         })
     }
 
-    /// 自动模式的最近一次输出（手动模式下为 null）。
-    fn auto_value(&self) -> Value {
-        if self.mode() != Mode::Auto {
-            return Value::Null;
-        }
-        match &*self.auto.lock().unwrap() {
-            Some(auto) => json!({ "action": auto.action, "cmd": auto.cmd }),
-            None => Value::Null,
-        }
-    }
-
     /// 连接建立时的问候消息（带页面需要的固定参数）。
     fn hello_value(&self) -> Value {
-        let (control_hz, input_timeout_ms, max_speed, max_reverse) = {
-            let teleop = self.teleop.lock().unwrap();
-            let cfg = teleop.config();
-            (
-                cfg.control_hz,
-                cfg.input_timeout.as_millis() as u64,
-                cfg.max_speed,
-                cfg.max_reverse,
-            )
-        };
+        let cfg = self.session.teleop_config();
+        let st = self.session.status();
         json!({
             "type": "hello",
             "version": 1,
-            "control_hz": control_hz,
+            "control_hz": cfg.control_hz,
             "status_hz": self.cfg.status_hz,
             "video_fps": self.cfg.video_fps,
-            "input_timeout_ms": input_timeout_ms,
-            "max_speed": max_speed,
-            "max_reverse": max_reverse,
-            "mode": self.mode().as_str(),
-            "auto_ready": self.preview.as_ref().is_some_and(|p| p.auto_ready()),
+            "input_timeout_ms": cfg.input_timeout.as_millis() as u64,
+            "max_speed": cfg.max_speed,
+            "max_reverse": cfg.max_reverse,
+            "mode": st.mode.as_str(),
+            "auto_ready": st.auto_ready,
             "camera": self.camera_value(),
         })
     }
@@ -356,31 +204,30 @@ impl Shared {
 }
 
 /// 网页服务器句柄。
+///
+/// 自带停止标志：信号处理器通过 [`Server::stop_flag`] 置 false 后
+/// [`Server::run`] 返回（只停监听循环，其它组件由调用方按序停）。
 pub struct Server {
     inner: rouille::Server<Handler>,
-    shared: Arc<Shared>,
     running: Arc<AtomicBool>,
 }
 
 type Handler = Box<dyn Fn(&Request) -> Response + Send + Sync>;
 
 impl Server {
-    /// 绑定监听地址；`running` 置 false 后 [`Server::run`] 退出。
+    /// 绑定监听地址。
+    ///
+    /// 控制线程由调用方用 [`ControlSession::spawn`] 启动/join。
     pub fn bind(
         cfg: WebConfig,
-        teleop_cfg: TeleopConfig,
-        target: Arc<dyn DriveTarget>,
+        session: Arc<ControlSession>,
         preview: Option<Arc<dyn PreviewSource>>,
-        running: Arc<AtomicBool>,
     ) -> io::Result<Self> {
+        let running = Arc::new(AtomicBool::new(true));
         let shared = Arc::new(Shared {
             cfg,
-            target,
-            teleop: Mutex::new(Teleop::new(teleop_cfg)),
+            session,
             preview,
-            mode: Mutex::new(Mode::Manual),
-            servo_cfg: ControlConfig::default(),
-            auto: Mutex::new(None),
             running: Arc::clone(&running),
             clients: AtomicU64::new(0),
             next_client_id: AtomicU64::new(0),
@@ -392,22 +239,17 @@ impl Server {
         let inner = rouille::Server::new(addr.as_str(), handler)
             .map_err(|e| io::Error::other(format!("监听 {addr} 失败: {e}")))?
             .pool_size(POOL_SIZE);
-        Ok(Self {
-            inner,
-            shared,
-            running,
-        })
+        Ok(Self { inner, running })
+    }
+
+    /// 停止标志（信号处理器只做原子写，是 async-signal-safe 的）。
+    pub fn stop_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.running)
     }
 
     /// 实际监听地址（测试里用 `port = 0` 拿随机端口）。
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         Ok(self.inner.server_addr())
-    }
-
-    /// 启动控制线程；返回的句柄在 [`Server::run`] 退出后 join。
-    pub fn spawn_control(&self) -> JoinHandle<()> {
-        let shared = Arc::clone(&self.shared);
-        thread::spawn(move || shared.control_loop())
     }
 
     /// 请求循环；`running` 为 false 时排空在途请求并返回。
@@ -441,18 +283,14 @@ fn route(request: &Request, shared: &Arc<Shared>) -> Response {
             let Some(mode) = Mode::parse(&name) else {
                 return Response::text("用法: /api/mode?set=auto|manual\n").with_status_code(400);
             };
-            match shared.set_mode(mode) {
+            match shared.session.set_mode(mode) {
                 Ok(()) => Response::json(&json!({ "ok": true, "mode": mode.as_str() })),
                 Err(e) => Response::text(format!("{e}\n")).with_status_code(409),
             }
         }
         "/api/input" => {
             let keys = Keys::parse(&request.get_param("keys").unwrap_or_default());
-            shared
-                .teleop
-                .lock()
-                .unwrap()
-                .set_keys(keys, 0, Instant::now());
+            shared.session.set_keys(keys, 0, Instant::now());
             Response::json(&json!({ "ok": true, "keys": keys.to_string() }))
         }
         "/api/action" => {
@@ -463,8 +301,7 @@ fn route(request: &Request, shared: &Arc<Shared>) -> Response {
             let Some(action) = Action::parse(&name) else {
                 return Response::text(format!("未知动作 {name:?}\n")).with_status_code(400);
             };
-            let out = shared.teleop.lock().unwrap().action(action);
-            apply(&*shared.target, out);
+            shared.session.action(action);
             Response::json(&json!({ "ok": true, "action": action.to_string() }))
         }
         "/api/events" => websocket_route(request, shared),
@@ -489,32 +326,11 @@ fn websocket_route(request: &Request, shared: &Arc<Shared>) -> Response {
     response
 }
 
-/// 把控制律输出落到链路。
-fn apply(target: &dyn DriveTarget, out: Output) {
-    match out {
-        Output::Drive { left, right } => target.set_speeds(left, right),
-        Output::Coast => target.coast(),
-        Output::Brake => target.brake(),
-        Output::Hold => {}
-        Output::Init => {
-            target.init();
-        }
-        Output::Reset => {
-            target.reset();
-        }
-    }
-}
-
-/// 视觉伺服的决策 → 链路输出。
-fn action_output(action: ServoAction) -> Output {
-    match action {
-        ServoAction::Brake => Output::Brake,
-        ServoAction::Track { .. } | ServoAction::Search { .. } => {
-            action.wheels().map_or(Output::Coast, |(left, right)| Output::Drive {
-                left,
-                right,
-            })
-        }
+/// 自动模式最近一次输出的 JSON（`None` → null）。
+fn auto_value(auto: Option<&AutoState>) -> Value {
+    match auto {
+        Some(auto) => json!({ "action": auto.action, "cmd": auto.cmd }),
+        None => Value::Null,
     }
 }
 
@@ -614,7 +430,7 @@ fn websocket_session(mut socket: Websocket, shared: Arc<Shared>) {
         }
     }
 
-    shared.teleop.lock().unwrap().release_keys(id);
+    shared.session.release_keys(id);
     shared.clients.fetch_sub(1, Ordering::Relaxed);
     info!("WebSocket #{id} 已断开");
 }
@@ -627,30 +443,22 @@ fn handle_message(text: &str, socket: &mut Websocket, shared: &Arc<Shared>, id: 
     match message {
         ClientMessage::Keys { keys } => {
             let keys = Keys::parse(&keys);
-            shared
-                .teleop
-                .lock()
-                .unwrap()
-                .set_keys(keys, id, Instant::now());
+            shared.session.set_keys(keys, id, Instant::now());
             true
         }
         ClientMessage::Action { action } => {
             let Some(action) = Action::parse(&action) else {
                 return send_json(socket, &json!({ "type": "error", "error": "未知动作" }));
             };
-            // 安全：自动模式下按“停止”先切回手动，否则下一拍伺服会立刻接管。
-            if action == Action::Stop && shared.mode() == Mode::Auto {
-                shared.set_mode(Mode::Manual).ok();
-            }
-            let out = shared.teleop.lock().unwrap().action(action);
-            apply(&*shared.target, out);
+            // 安全：自动模式下按“停止”先切回手动（会话内部处理），否则下一拍伺服会接管。
+            shared.session.action(action);
             true
         }
         ClientMessage::Mode { mode } => {
             let Some(mode) = Mode::parse(&mode) else {
                 return send_json(socket, &json!({ "type": "error", "error": "未知模式" }));
             };
-            match shared.set_mode(mode) {
+            match shared.session.set_mode(mode) {
                 Ok(()) => send_json(socket, &json!({ "type": "mode", "mode": mode.as_str() })),
                 Err(e) => send_json(socket, &json!({ "type": "error", "error": e })),
             }
@@ -670,12 +478,14 @@ fn send_json(socket: &mut Websocket, value: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::control::servo::{Distance, Observation};
+    use crate::control::{DriveTarget, LinkSnapshot, TeleopConfig};
+    use crate::position::{Distance, Observation};
     use crate::preview::{CameraStatus, PreviewFrame, VisionStatus, VisionTimings};
-    use crate::web::LinkSnapshot;
     use std::io::{Read, Write};
     use std::net::TcpStream;
+    use std::sync::Mutex;
     use std::sync::atomic::AtomicBool;
+    use std::thread::JoinHandle;
 
     /// 记录收到的链路调用，供断言。
     #[derive(Default)]
@@ -841,7 +651,7 @@ mod tests {
         running: Arc<AtomicBool>,
         target: Arc<FakeTarget>,
         accept: JoinHandle<()>,
-        control: JoinHandle<()>,
+        session: Arc<ControlSession>,
     }
 
     impl TestServer {
@@ -854,9 +664,9 @@ mod tests {
             video_fps: f32,
             preview: Option<Arc<dyn PreviewSource>>,
         ) -> Self {
-            let running = Arc::new(AtomicBool::new(true));
             let target = Arc::new(FakeTarget::default());
             let target_dyn: Arc<dyn DriveTarget> = target.clone();
+            let session = ControlSession::new(target_dyn, TeleopConfig::default(), preview.clone());
             let server = Server::bind(
                 WebConfig {
                     bind: "127.0.0.1".to_string(),
@@ -864,28 +674,27 @@ mod tests {
                     status_hz,
                     video_fps,
                 },
-                TeleopConfig::default(),
-                target_dyn,
+                Arc::clone(&session),
                 preview,
-                Arc::clone(&running),
             )
             .expect("绑定端口失败");
             let addr = server.local_addr().unwrap();
-            let control = server.spawn_control();
+            let running = server.stop_flag();
+            session.spawn();
             let accept = thread::spawn(move || server.run());
             Self {
                 addr,
                 running,
                 target,
                 accept,
-                control,
+                session,
             }
         }
 
         fn stop(self) {
             self.running.store(false, Ordering::SeqCst);
             self.accept.join().unwrap();
-            self.control.join().unwrap();
+            self.session.stop();
         }
     }
 

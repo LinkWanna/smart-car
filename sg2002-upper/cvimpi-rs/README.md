@@ -150,7 +150,8 @@ let jpeg_input = vpss.get_chn_frame(1, 1000)?;
   所以 bind 链路上可以用 PTS 把码流和采集帧精确对上。
 * **残留 bind 很坑**：进程被 `kill -9` 时 bind 节点留在内核里，之后新的
   `CVI_SYS_Bind` 会返回成功但数据不通（`GetStream` 一直 BUSY、VPSS 整组堵死）。
-  绑定前先 `vpss::clear_venc_bind(0)` 清一次残留。
+  绑定前先 `vpss::clear_venc_bind(0)` 清一次残留（没有绑定时内核返回**成功 +
+  全零 src**，`venc_bind_source` 会过滤掉，不会误报）。
 * **CSC 量程**：驱动默认矩阵是 full range（`R = Y + 1.402(V-128)`），而 UVC 相机
   出的是 BT.601 limited（Y 16~235），直接用画面偏灰、模型置信度下降（实测
   0.61 vs 0.71）。`Vpss::set_yuv601_limited_to_full()` 换上 limited→full 的矩阵后，

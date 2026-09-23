@@ -1,16 +1,16 @@
 //! 网页预览与视觉之间的中性契约：一帧预览 = JPEG 画面 + **同帧**的视觉结果。
 //!
-//! 两个实现：
-//! - [`crate::web::video::CameraStream`]：相机 MJPG 直出，只有画面（`webctl` 用）；
-//! - [`crate::vision::VisionStream`]：相机 YUYV（模型输入格式）采集 + 编码，
-//!   画面与检测严格同帧（`smartcar` 用）。
+//! 两个实现（`smartcar` 按硬件可用性二选一）：
+//! - [`crate::vision::VisionStream`]：CPU 管线（YUYV→RGB 软件转换 + 编码线程）；
+//! - [`crate::vision::VpssStream`]：VPSS 硬件管线（硬件 CSC + VENC 硬编）。
 //!
+//! 两者都是「相机 YUYV（模型输入格式）采集 + 编码」，画面与检测严格同帧。
 //! 网页层只依赖本模块的抽象，不关心相机是怎么打开的。
 
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::control::servo::Observation;
+use crate::position::Observation;
 
 /// 归一化检测框（0..1，坐标系 = 模型输入帧）。
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -130,7 +130,7 @@ pub trait PreviewSource: Send + Sync {
         None
     }
 
-    /// 停止采集并回收资源；幂等，默认什么都不做（纯画面源自己实现）。
+    /// 停止采集并回收资源；幂等，只停自己的线程（默认什么都不做，纯画面源自己实现）。
     fn stop(&self) {}
 
     /// 自动模式是否可用：有视觉 + 模型可用 + 画面新鲜。

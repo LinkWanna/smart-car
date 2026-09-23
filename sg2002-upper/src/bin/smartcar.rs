@@ -4,21 +4,21 @@
 //! smartcar                        # /dev/ttyS1 + /dev/video0 + 自动找模型 + :80
 //! smartcar --port 8080            # 非特权端口（本地调试）
 //! smartcar --model /root/xxx.cvimodel
-//! smartcar --no-vision            # 只遥控（页面同 webctl）
+//! smartcar --no-vision            # 只遥控（无视觉，自动模式不可用）
 //! smartcar --quality 80          # 预览 JPEG 质量
 //! smartcar --video-fps 10        # 限制预览帧率（默认 0 = 不锁帧，跟相机）
 //! smartcar --vpss off            # 只用 CPU 路径（YUYV→RGB 软件转换 + memcpy）
 //! ```
 //!
 //! 视觉后端（`--vpss auto` 默认）：
-//! - **VPSS 硬件**（`vpss_stream.rs`）：相机 YUYV 只 memcpy 一次进 VB 块，硬件 CSC
+//! - **VPSS 硬件**（`vision::vpss`）：相机 YUYV 只 memcpy 一次进 VB 块，硬件 CSC
 //!   同时出 chn0 RGB 平面（物理地址零拷贝喂 TPU）与 chn1 NV12（VENC 硬编 JPEG，
 //!   640x480 原尺寸、每帧都出；`--video-fps` 只作为可选的推送上限）；
-//! - **CPU 路径**（`vision.rs`，回退）：YUYV→RGB 软件转换 + memcpy 喂 TPU，
+//! - **CPU 路径**（`vision::cpu`，回退）：YUYV→RGB 软件转换 + memcpy 喂 TPU，
 //!   预览走 VENC/软件编码。VPSS 建组失败、组号用尽或模型尺寸不匹配时自动回退。
 //!
 //! 输入模式由页面按钮切换（默认手动，不允许键盘悄悄切换）：
-//! - **手动**：WASD（`web::teleop`，与 `webctl` 相同的手感与看门狗）；
+//! - **手动**：WASD（`control::teleop`：油门斜坡 + 转向 + 输入看门狗）；
 //! - **自动**：视觉伺服（`control::servo`），丢失目标原地旋转搜索、近距刹车。
 //!   视觉观测超过 500ms 未更新按“看不到”处理（滑行）。
 //!
@@ -33,12 +33,11 @@ use std::time::Duration;
 
 use clap::Parser;
 use log::{error, info, warn};
-use sg2002_upper::control::{Car, CarConfig};
+use sg2002_upper::control::{Car, CarConfig, ControlSession, DriveTarget, TeleopConfig};
 use sg2002_upper::logging;
 use sg2002_upper::preview::PreviewSource;
-use sg2002_upper::vision::{VisionConfig, VisionStream};
-use sg2002_upper::vpss_stream::VpssStream;
-use sg2002_upper::web::{DriveTarget, Server, TeleopConfig, WebConfig};
+use sg2002_upper::vision::{VisionConfig, VisionStream, VpssStream};
+use sg2002_upper::web::{Server, WebConfig};
 
 /// 等待下位机 `Init` 应答的超时。
 const READY_TIMEOUT: Duration = Duration::from_secs(3);
@@ -226,11 +225,13 @@ fn main() {
     }
     let car = Arc::new(car);
 
-    let running = Arc::new(AtomicBool::new(true));
-    install_signals(&running);
+    // 信号处理器先指向这个「启动窗口」标志；服务器建好后转交给它的 stop_flag
+    // （见下），这样启动期间（相机/模型初始化）的 Ctrl+C 也不会被漏掉。
+    let startup_alive = Arc::new(AtomicBool::new(true));
+    install_signals(&startup_alive);
 
-    // 视觉：相机以模型需要的 YUYV422 打开，预览与检测同帧（vision.rs）。
-    // `--vpss auto` 时优先走硬件 CSC 管线（vpss_stream.rs）：相机 YUYV 只 memcpy 一次
+    // 视觉：相机以模型需要的 YUYV422 打开，预览与检测同帧（vision）。
+    // `--vpss auto` 时优先走硬件 CSC 管线（vision::vpss）：相机 YUYV 只 memcpy 一次
     // 进 VB 块，VPSS 同时出 RGB 平面（零拷贝喂 TPU）与 NV12（VENC 硬编预览，
     // 640x480 原尺寸、每帧都出）；VPSS 不可用时自动回退 CPU 路径。
     let preview: Option<Arc<dyn PreviewSource>> = if cli.no_vision {
@@ -252,15 +253,13 @@ fn main() {
                 };
                 let mut stream: Option<Arc<dyn PreviewSource>> = None;
                 if cli.vpss == VpssMode::Auto {
-                    match VpssStream::try_start(cfg.clone(), Arc::clone(&running)) {
+                    match VpssStream::try_start(cfg.clone()) {
                         Ok(vpss) => stream = Some(Arc::new(vpss) as Arc<dyn PreviewSource>),
                         Err(e) => warn!("VPSS 管线不可用（{e}）；回退 CPU 路径"),
                     }
                 }
-                stream.or_else(|| {
-                    Some(Arc::new(VisionStream::start(cfg, Arc::clone(&running)))
-                        as Arc<dyn PreviewSource>)
-                })
+                stream
+                    .or_else(|| Some(Arc::new(VisionStream::start(cfg)) as Arc<dyn PreviewSource>))
             }
             Err(e) => {
                 warn!("{e}；改为仅遥控（自动模式不可用）");
@@ -276,7 +275,9 @@ fn main() {
         invert_steer: cli.invert_steer,
         ..TeleopConfig::default()
     };
+    // 控制会话：链路 + 手动控制律 + 视觉伺服（控制线程由它自己 spawn）。
     let target: Arc<dyn DriveTarget> = car.clone();
+    let session = ControlSession::new(target, teleop, preview.clone());
     // 服务器接管 preview（用于推送），这里留一份用于退出时 stop。
     let preview_handle = preview.as_ref().map(Arc::clone);
     let server = Server::bind(
@@ -286,18 +287,22 @@ fn main() {
             status_hz: 10.0,
             video_fps: cli.video_fps,
         },
-        teleop,
-        target,
+        Arc::clone(&session),
         preview,
-        Arc::clone(&running),
     )
     .unwrap_or_else(|e| {
         error!("{e}");
         std::process::exit(2);
     });
+    // 把信号处理器转到服务器的停止标志；启动窗口内收到过信号则立即补上。
+    let stop = server.stop_flag();
+    install_signals(&stop);
+    if !startup_alive.load(Ordering::SeqCst) {
+        stop.store(false, Ordering::SeqCst);
+    }
 
     let addr = server.local_addr().expect("读取监听地址失败");
-    let control = server.spawn_control();
+    session.spawn();
     if cli.bind == "0.0.0.0" {
         info!(
             "  页面：http://192.168.4.1{}/   （AP 热点默认地址；本机监听 {addr}）",
@@ -310,10 +315,9 @@ fn main() {
     info!("{}", "=".repeat(60));
 
     server.run();
-    running.store(false, Ordering::SeqCst);
 
     // 先停控制线程（它会滑行停车），再关视觉，最后关链路。
-    control.join().ok();
+    session.stop();
     if let Some(preview) = &preview_handle {
         preview.stop();
     }

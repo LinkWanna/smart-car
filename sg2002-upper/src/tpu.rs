@@ -161,7 +161,8 @@ fn decode(
     labels: &[String],
 ) -> Vec<Detection> {
     let f32_len = out_bytes.len() / 4;
-    let raw: &[f32] = unsafe { std::slice::from_raw_parts(out_bytes.as_ptr() as *const f32, f32_len) };
+    let raw: &[f32] =
+        unsafe { std::slice::from_raw_parts(out_bytes.as_ptr() as *const f32, f32_len) };
 
     nms_decode(raw, n_anchors, conf_thresh, iou_thresh, 20)
         .into_iter()
@@ -260,8 +261,7 @@ impl TpuInference {
     }
 
     pub fn new(model_path: &str, conf_thresh: f32, iou_thresh: f32, labels: Vec<String>) -> Self {
-        Self::try_new(model_path, conf_thresh, iou_thresh, labels)
-            .unwrap_or_else(|e| panic!("{e}"))
+        Self::try_new(model_path, conf_thresh, iou_thresh, labels).unwrap_or_else(|e| panic!("{e}"))
     }
 
     /// 模型输入张量形状（如 `[1, 3, 480, 640]`）。
@@ -316,8 +316,7 @@ impl TpuInference {
     }
 
     pub fn infer(&mut self, planar: &[u8]) -> Vec<Detection> {
-        self.try_infer(planar)
-            .unwrap_or_else(|e| panic!("{}", e))
+        self.try_infer(planar).unwrap_or_else(|e| panic!("{}", e))
     }
 
     pub fn last_timing(&self) -> (f64, f64) {

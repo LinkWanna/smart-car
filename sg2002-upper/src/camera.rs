@@ -1,12 +1,12 @@
 //! camera.rs — V4L2 零拷贝相机，使用 `v4l` crate 替代手写 `videodev2.h`
 //!
-//! [`Camera::new`] 一步完成打开/校验/配置/申请缓冲/开流；采集用
+//! [`Camera::try_new`] 一步完成打开/校验/配置/申请缓冲/开流；采集用
 //! [`Camera::get_frame`]，返回的 [`CaptureFrame`] 是 mmap 缓冲的只读句柄：
 //! 帧下标封装在句柄内，归还由 [`CaptureFrame::release`] 或 `Drop` 完成。
 //! 可以同时持有多帧（上限是申请的缓冲数），全部不归还时 `DQBUF` 阻塞等待回填。
 //!
 //! ```ignore
-//! let camera = Camera::new("/dev/video0", "yuyv");
+//! let camera = Camera::try_new("/dev/video0", "yuyv")?;
 //! let frame = camera.get_frame()?;
 //! let pixels = frame.as_slice();   // 零拷贝
 //! frame.release()?;                // 或者直接 drop(frame)
@@ -72,16 +72,11 @@ pub struct Camera {
 }
 
 impl Camera {
-    /// [`Camera::try_new`] 的 panic 版本（early panic 风格，与上游管线一致）。
-    pub fn new(device: &str, fmt_str: &str) -> Self {
-        Self::try_new(device, fmt_str).unwrap_or_else(|e| panic!("{e}"))
-    }
-
     /// 打开设备并按 `fmt_str`（`yuyv` / `jpeg` / `mjpeg`）配置 640x480、
     /// 申请 mmap 缓冲、启动视频流。
     ///
-    /// 与 [`Camera::new`] 的区别是任一步失败返回 `io::Error`（消息带
-    /// `camera_init 失败:` 前缀），网页预览可以据此优雅降级；成功后可用
+    /// 任一步失败返回 `io::Error`（消息带 `camera_init 失败:` 前缀），
+    /// 调用方（视觉管线 / 网页预览）据此优雅降级；成功后可用
     /// [`Camera::pixel_format`] 检查驱动是否真的接受了请求的格式。
     pub fn try_new(device: &str, fmt_str: &str) -> io::Result<Self> {
         let fourcc = match fmt_str {
@@ -341,6 +336,49 @@ impl std::fmt::Display for Camera {
             self.device, self.w, self.h, self.fourcc
         )
     }
+}
+
+/// 打开 YUYV 相机：先用配置的节点；不存在/打不开时在 `/dev/video*` 里找第一个
+/// 能出 YUYV 的。
+///
+/// USB 相机重新枚举后编号会变（`video0` → `video1`），所以这里不能死认一个节点。
+pub fn open_yuyv(device: &str) -> io::Result<Camera> {
+    let first_error = match Camera::try_new(device, "yuyv") {
+        Ok(camera) => return Ok(camera),
+        Err(e) => e,
+    };
+    if std::path::Path::new(device).exists() {
+        // 节点在但配置不上（被占用/格式不支持）：直接报错，避免误开别的节点
+        return Err(first_error);
+    }
+
+    let mut nodes: Vec<std::path::PathBuf> = std::fs::read_dir("/dev")
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with("video"))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    nodes.sort();
+    for node in nodes {
+        let Some(path) = node.to_str() else { continue };
+        if path == device {
+            continue;
+        }
+        if let Ok(camera) = Camera::try_new(path, "yuyv") {
+            log::info!("{device} 不存在，改用 {path}（USB 重新枚举后编号会变）");
+            return Ok(camera);
+        }
+    }
+    Err(io::Error::other(format!(
+        "找不到可用的 YUYV 相机（{device} 及 /dev/video*）"
+    )))
 }
 
 #[cfg(test)]

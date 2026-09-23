@@ -278,7 +278,10 @@ fn run(cli: &Cli) {
                         .with_quality(u32::from(cli.quality)),
                 ),
             );
-            must("CVI_SYS_Bind(VPSS chn1 → VENC 0)", vpss.bind_chn_to_venc(1, 0));
+            must(
+                "CVI_SYS_Bind(VPSS chn1 → VENC 0)",
+                vpss.bind_chn_to_venc(1, 0),
+            );
             match cvimpi_rs::vpss::venc_bind_source(0) {
                 Some(src) => say(&format!(
                     "  查回绑定：src mod={} dev={} chn={}",

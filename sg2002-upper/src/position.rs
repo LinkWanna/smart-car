@@ -1,6 +1,18 @@
 //! position.rs — 位置分析，移植自 python/src/position.py
+//!
+//! 输入 TPU 检测框，输出 [`PositionResult`]（九宫格分区 / 距离分级）；以及
+//! 控制律用的 [`Observation`]（`PositionResult` 的轻量投影）与 [`Distance`]。
 
 use crate::tpu::Detection;
+
+/// 九宫格边界（640x480 管线的默认值）：横向/纵向 33%~66%。
+const LEFT_BOUNDARY: f32 = 0.33;
+const RIGHT_BOUNDARY: f32 = 0.66;
+const TOP_BOUNDARY: f32 = 0.33;
+const BOTTOM_BOUNDARY: f32 = 0.66;
+/// 距离分级阈值（检测框面积占比）：>5% 近、>1% 中、其余远。
+const NEAR_THRESHOLD: f32 = 0.05;
+const MID_THRESHOLD: f32 = 0.01;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Zone;
@@ -66,6 +78,21 @@ pub struct PositionAnalyzer {
 }
 
 impl PositionAnalyzer {
+    /// 640x480 管线的默认配置（阈值与旧 `vision.rs` 的常量一致）。
+    pub fn for_640x480() -> Self {
+        Self::new(
+            640,
+            480,
+            LEFT_BOUNDARY,
+            RIGHT_BOUNDARY,
+            TOP_BOUNDARY,
+            BOTTOM_BOUNDARY,
+            NEAR_THRESHOLD,
+            MID_THRESHOLD,
+            None,
+        )
+    }
+
     pub fn new(
         frame_w: usize,
         frame_h: usize,
@@ -158,6 +185,61 @@ impl PositionAnalyzer {
             "mid".to_string()
         } else {
             "far".to_string()
+        }
+    }
+}
+
+/// 目标距离分级（由 [`PositionResult`] 按检测框面积占比给出）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Distance {
+    /// 很近：直接停车（双轮制动）。
+    Near,
+    /// 中等距离：减速前进。
+    Mid,
+    /// 远距离：全速前进。
+    Far,
+}
+
+impl Distance {
+    /// 位置分析输出的分级名（`near`/`mid`/`far`）。
+    pub fn parse(name: &str) -> Self {
+        match name {
+            "near" => Self::Near,
+            "mid" => Self::Mid,
+            _ => Self::Far,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Near => "near",
+            Self::Mid => "mid",
+            Self::Far => "far",
+        }
+    }
+}
+
+/// 一帧视觉观测（由 [`PositionResult`] 转换），控制律与预览快照的输入。
+#[derive(Debug, Clone, Copy)]
+pub struct Observation {
+    /// 本帧是否检测到有效目标。
+    pub present: bool,
+    /// 目标横向偏差，右为正，范围 -1..=1。
+    pub err_x: f32,
+    /// 目标距离分级。
+    pub distance: Distance,
+    /// 置信度（仅用于日志）。
+    pub confidence: f32,
+}
+
+impl Observation {
+    /// 由位置分析结果构造：`err_x = (中心x - 0.5) × 2`（右为正，夹到 ±1）。
+    pub fn from_result(result: &PositionResult) -> Self {
+        Self {
+            present: result.has_target(),
+            err_x: ((result.center_x - 0.5) * 2.0).clamp(-1.0, 1.0),
+            distance: Distance::parse(&result.distance),
+            confidence: result.target_confidence,
         }
     }
 }

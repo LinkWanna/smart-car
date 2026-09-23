@@ -1,6 +1,5 @@
 ip addr add 192.168.1.2/24 dev eth0
 ./smartcar --bind 192.168.1.2     # 整合：视觉追踪 + 网页（手动/自动切换）
-./webctl --bind 192.168.1.2       # 只遥控（MJPG 预览）
 
 # 日志走 stderr（时间戳/级别/模块），默认 info；级别用 SMARTCAR_LOG 控制：
 SMARTCAR_LOG=debug ./smartcar --bind 192.168.1.2           # 全部 debug（含逐帧编码耗时）
@@ -11,7 +10,7 @@ SMARTCAR_LOG=warn,hwjpeg=debug ./smartcar --bind 192.168.1.2  # 默认 warn，�
 
 ## 视觉后端（`--vpss auto|off`，默认 auto）
 
-`--vpss auto` 优先走 **VPSS 硬件管线**（`src/vpss_stream.rs`）：相机 YUYV 只 memcpy
+`--vpss auto` 优先走 **VPSS 硬件管线**（`vision::vpss`）：相机 YUYV 只 memcpy
 一次进 VB 块，VPSS 硬件 CSC 一路进两路出 ——
 
 - chn0 `RGB_888_PLANAR`：stride=640、三平面物理地址连续，正好是模型 `[1,3,480,640]`
@@ -62,6 +61,9 @@ VPSS chn1 默认用 `CVI_SYS_Bind` **直连 VENC**（内核内交接），用户
   「用户态取帧 + `SendFrame` + 延迟取流」；
 - bind 调用失败、或取流连续失败 5 次 → 自动解绑并退回用户态取帧（不会卡死）；
 - 退出前 `UnBind`；启动时 `clear_venc_bind()` 清掉上次崩溃留下的残留节点。
+- 退出前会把**未取的码流取干净**（user 路由下是上一轮 `SendFrame` 的那帧）：
+  否则驱动在 `DestroyChn` 时会一直等码流缓冲释放，线程卡死在 ioctl 里、
+  内核留下 VENC 通道 / VB 块（实测；修好后三种路由都在 ~0.5s 内干净退出）。
 
 实测（640x480 YUYV，同一场景）：
 

@@ -411,11 +411,16 @@ impl<'a> Vpss<'a> {
 }
 
 /// 查询某个 VENC 通道当前绑定的源（诊断用；没有绑定时返回 `None`）。
+///
+/// 注意：内核在「没有绑定」时 `CVI_SYS_GetBindbyDest` 返回**成功 + 全零 src**
+/// （`libsys` 清零后没填；`0 = CVI_ID_BASE`，不可能是真实源），所以这里过滤掉
+/// 全零值 —— 否则每次启动都会误报「残留绑定」。
 pub fn venc_bind_source(venc_chn: ffi::VENC_CHN) -> Option<ffi::MMF_CHN_S> {
     let dst = ffi::mmf_chn(ffi::CVI_ID_VENC, 0, venc_chn);
     let mut src = ffi::mmf_chn(ffi::CVI_ID_VPSS, -1, -1);
     let ret = unsafe { ffi::CVI_SYS_GetBindbyDest(&dst, &mut src) };
-    (ret == ffi::CVI_SUCCESS).then_some(src)
+    let zeroed = src.enModId == 0 && src.s32DevId == 0 && src.s32ChnId == 0;
+    (ret == ffi::CVI_SUCCESS && !zeroed).then_some(src)
 }
 
 /// 清掉 VENC 通道上可能残留的绑定（上次进程崩溃 / `kill -9` 留下的 bind 节点）。

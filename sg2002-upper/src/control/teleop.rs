@@ -1,4 +1,4 @@
-//! 网页遥控控制律：按键快照 -> 左右轮速度（`esp32c3-smart-car/tools/play.py`
+//! 手动遥控控制律：按键快照 -> 左右轮速度（`esp32c3-smart-car/tools/play.py`
 //! 的等价实现）。
 //!
 //! 驾驶手感与 play.py 一致：
@@ -10,10 +10,11 @@
 //!   `turn_gain × |油门| / max_speed` 做差速；
 //! - 超过 [`TeleopConfig::input_timeout`] 没有收到按键快照（浏览器卡死/断网）
 //!   就当作全部松开，让车自己停下来；
-//! - 制动/复位动作会把输出锁存（[`Latch`]），直到有新按键或 Init。
+//! - 制动/复位动作会把输出锁存（`Latch`），直到有新按键或 Init。
 //!
-//! 本模块只做决策，不碰链路：输出 [`Output`] 由 [`crate::web::server`] 落地成
-//! [`DriveTarget`](super::DriveTarget) 调用，因此可以在主机上单独测试。
+//! 本模块只做决策，不碰链路：输出 [`Output`] 由 [`crate::control::session`]
+//! 落地成 [`DriveTarget`](crate::control::DriveTarget) 调用，因此可以在主机上
+//! 单独测试。
 
 use std::fmt;
 use std::time::{Duration, Instant};

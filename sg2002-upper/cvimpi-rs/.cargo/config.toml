@@ -1,0 +1,8 @@
+# 默认走交叉编译：`cargo build` / `cargo check` 都以板子为目标。
+[build]
+target = "riscv64gc-unknown-linux-musl"
+
+# Xuantie / CVITEK 的 musl 工具链（与 `libs/` 下的 .so 匹配）。
+# 如果 SDK 提供的工具链前缀不同，改这一行即可。
+[target.riscv64gc-unknown-linux-musl]
+linker = "riscv64-unknown-linux-musl-gcc"

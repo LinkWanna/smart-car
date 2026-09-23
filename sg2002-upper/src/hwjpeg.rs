@@ -38,7 +38,11 @@ mod ffi {
     }
 
     pub fn last_error() -> String {
-        unsafe { CStr::from_ptr(hwjpeg_error()).to_string_lossy().into_owned() }
+        unsafe {
+            CStr::from_ptr(hwjpeg_error())
+                .to_string_lossy()
+                .into_owned()
+        }
     }
 
     pub fn input_format() -> u32 {

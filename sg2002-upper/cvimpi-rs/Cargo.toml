@@ -1,0 +1,12 @@
+[package]
+name = "cvimpi-rs"
+version = "0.1.0"
+edition = "2024"
+description = "Thin Rust FFI wrapper for the CVI MPI JPEG encode/decode workflow"
+publish = false
+
+[dependencies]
+
+[profile.release]
+lto = true
+strip = true

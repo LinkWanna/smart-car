@@ -323,6 +323,10 @@ fn fail(what: &str, e: io::Error) -> io::Error {
     io::Error::new(e.kind(), format!("camera_init 失败: {what}: {e}"))
 }
 
+/// `CaptureFrame` 只借用相机，`Camera` 本身（fd + mmap 地址）移动到别的线程
+/// 使用时没有线程局部状态，V4L2 ioctl 对 fd 也是线程无关的。
+unsafe impl Send for Camera {}
+
 impl Drop for Camera {
     fn drop(&mut self) {
         self.stop();

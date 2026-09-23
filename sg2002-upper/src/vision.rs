@@ -38,12 +38,12 @@ use crate::tpu::TpuInference;
 pub use crate::preprocess::{FRAME_H, FRAME_W};
 
 /// 位置分级边界（与 `pipeline` 一致）：横向/纵向 33%~66%，面积占比 5%/1%。
-const LEFT_BOUNDARY: f32 = 0.33;
-const RIGHT_BOUNDARY: f32 = 0.66;
-const TOP_BOUNDARY: f32 = 0.33;
-const BOTTOM_BOUNDARY: f32 = 0.66;
-const NEAR_THRESHOLD: f32 = 0.05;
-const MID_THRESHOLD: f32 = 0.01;
+pub(crate) const LEFT_BOUNDARY: f32 = 0.33;
+pub(crate) const RIGHT_BOUNDARY: f32 = 0.66;
+pub(crate) const TOP_BOUNDARY: f32 = 0.33;
+pub(crate) const BOTTOM_BOUNDARY: f32 = 0.66;
+pub(crate) const NEAR_THRESHOLD: f32 = 0.05;
+pub(crate) const MID_THRESHOLD: f32 = 0.01;
 
 /// 相机打开失败时的重试次数（USB 枚举/上一个进程释放设备都需要时间）。
 const CAMERA_OPEN_RETRIES: usize = 3;
@@ -277,7 +277,7 @@ pub fn snapshot(step: &VisionStep) -> VisionSnapshot {
 /// 打开相机：先用配置的节点；不存在/打不开时在 `/dev/video*` 里找第一个能出 YUYV 的。
 ///
 /// USB 相机重新枚举后编号会变（`video0` → `video1`），所以这里不能死认一个节点。
-fn open_camera(device: &str) -> io::Result<Camera> {
+pub(crate) fn open_camera(device: &str) -> io::Result<Camera> {
     let first_error = match Camera::try_new(device, "yuyv") {
         Ok(camera) => return Ok(camera),
         Err(e) => e,
@@ -325,71 +325,189 @@ fn elapsed_ms(since: Instant) -> f64 {
 // ---------------------------------------------------------------------------
 
 /// 投给预览线程的一帧：数据（YUYV 或 RGB 平面）+ 同帧快照。
-struct EncodePacket {
-    data: Vec<u8>,
-    snapshot: Arc<VisionSnapshot>,
+pub(crate) struct EncodePacket {
+    pub(crate) data: Vec<u8>,
+    pub(crate) snapshot: Arc<VisionSnapshot>,
 }
 
 /// 线程共享状态（一次锁拿到全部，避免撕裂读）。
+///
+/// 两条管线（CPU 版 [`VisionStream`] 与 VPSS 版 `VpssStream`）共用这份状态、
+/// 状态更新方法与 [`PreviewSource`] 实现，所以网页/控制侧看到的字段完全一致。
 #[derive(Default)]
-struct StreamState {
+pub(crate) struct StreamState {
     /// 模型帧（采集/推理）统计。
-    frames: u64,
-    fps: f64,
-    last_at: Option<Instant>,
-    latest_snapshot: Option<Arc<VisionSnapshot>>,
+    pub(crate) frames: u64,
+    pub(crate) fps: f64,
+    pub(crate) last_at: Option<Instant>,
+    pub(crate) latest_snapshot: Option<Arc<VisionSnapshot>>,
     /// 预览投递计数（诊断：模型帧 → 预览线程）。
-    preview_sent: u64,
-    preview_dropped: u64,
-    preview_published: u64,
-    encode_ms_avg: f64,
+    pub(crate) preview_sent: u64,
+    pub(crate) preview_dropped: u64,
+    pub(crate) preview_published: u64,
+    pub(crate) encode_ms_avg: f64,
     /// 预览（JPEG）统计；`frame_if_new` 只认它。
-    preview: Option<Arc<PreviewFrame>>,
-    preview_at: Option<Instant>,
-    preview_fps: f64,
-    encode_ms: f64,
-    /// 预览编码后端（`hw` / `sw`）。
-    encode: String,
+    pub(crate) preview: Option<Arc<PreviewFrame>>,
+    pub(crate) preview_at: Option<Instant>,
+    pub(crate) preview_fps: f64,
+    pub(crate) encode_ms: f64,
+    /// 预览编码后端（`hw` / `sw` / `vpss`）。
+    pub(crate) encode: String,
     /// 实际使用的相机节点（USB 重新枚举后会变）。
-    device: String,
-    camera_format: String,
-    available: bool,
-    camera_error: Option<String>,
-    model_ok: bool,
-    model: String,
-    model_input: String,
-    infer_ms: f64,
-    nms_ms: f64,
-    position_ms: f64,
-    dets: usize,
-    error: Option<String>,
+    pub(crate) device: String,
+    pub(crate) camera_format: String,
+    pub(crate) available: bool,
+    pub(crate) camera_error: Option<String>,
+    pub(crate) model_ok: bool,
+    pub(crate) model: String,
+    pub(crate) model_input: String,
+    pub(crate) infer_ms: f64,
+    pub(crate) nms_ms: f64,
+    pub(crate) position_ms: f64,
+    pub(crate) dets: usize,
+    pub(crate) error: Option<String>,
 }
 
 impl StreamState {
-    fn model_age_ms(&self) -> Option<u64> {
+    pub(crate) fn model_age_ms(&self) -> Option<u64> {
         self.last_at.map(|at| at.elapsed().as_millis() as u64)
     }
 
-    fn preview_age_ms(&self) -> Option<u64> {
+    pub(crate) fn preview_age_ms(&self) -> Option<u64> {
         self.preview_at.map(|at| at.elapsed().as_millis() as u64)
+    }
+
+    /// 记一帧模型结果（帧数 / EMA 帧率 / 耗时分项 / 最新快照）。
+    pub(crate) fn record_model_frame(
+        &mut self,
+        now: Instant,
+        timings: &crate::preview::VisionTimings,
+        snapshot: Arc<VisionSnapshot>,
+    ) {
+        if let Some(prev) = self.last_at {
+            let dt = now.saturating_duration_since(prev).as_secs_f64();
+            if dt > 0.0 {
+                self.fps = if self.fps > 0.0 {
+                    self.fps * 0.8 + (1.0 / dt) * 0.2
+                } else {
+                    1.0 / dt
+                };
+            }
+        }
+        self.frames += 1;
+        self.last_at = Some(now);
+        self.infer_ms = timings.infer_ms;
+        self.nms_ms = timings.nms_ms;
+        self.position_ms = timings.position_ms;
+        self.dets = snapshot.dets.len();
+        self.latest_snapshot = Some(snapshot);
+    }
+
+    /// 记一帧已发布的预览（投递/发布计数、编码耗时 EMA、预览帧率）。
+    pub(crate) fn record_preview(
+        &mut self,
+        frame: Arc<PreviewFrame>,
+        encode_ms: f64,
+        now: Instant,
+    ) {
+        self.preview_published += 1;
+        self.encode_ms_avg = if self.encode_ms_avg > 0.0 {
+            self.encode_ms_avg * 0.9 + encode_ms * 0.1
+        } else {
+            encode_ms
+        };
+        if let Some(prev) = self.preview_at {
+            let dt = now.saturating_duration_since(prev).as_secs_f64();
+            if dt > 0.0 {
+                self.preview_fps = if self.preview_fps > 0.0 {
+                    self.preview_fps * 0.8 + (1.0 / dt) * 0.2
+                } else {
+                    1.0 / dt
+                };
+            }
+        }
+        self.preview_at = Some(now);
+        self.encode_ms = encode_ms;
+        self.preview = Some(frame);
     }
 }
 
-struct StreamInner {
-    cfg: VisionConfig,
-    state: Mutex<StreamState>,
+pub(crate) struct StreamInner {
+    pub(crate) cfg: VisionConfig,
+    pub(crate) state: Mutex<StreamState>,
     /// 预览线程要的数据格式：true = YUYV（硬件编码），false = RGB 平面（软件编码）。
-    preview_yuyv: AtomicBool,
+    pub(crate) preview_yuyv: AtomicBool,
 }
 
 impl StreamInner {
-    fn new(cfg: VisionConfig) -> Self {
+    pub(crate) fn new(cfg: VisionConfig) -> Self {
         Self {
             cfg,
             state: Mutex::new(StreamState::default()),
             // 先按软件编码（RGB 平面）兜底，编码线程定下后端后会更新
             preview_yuyv: AtomicBool::new(false),
         }
+    }
+}
+
+impl PreviewSource for StreamInner {
+    fn frame_if_new(&self, after: u64) -> Option<Arc<PreviewFrame>> {
+        let state = self.state.lock().unwrap();
+        match &state.preview {
+            Some(frame) if frame.seq > after => Some(Arc::clone(frame)),
+            _ => None,
+        }
+    }
+
+    fn latest(&self) -> Option<Arc<PreviewFrame>> {
+        self.state.lock().unwrap().preview.clone()
+    }
+
+    fn camera_status(&self) -> CameraStatus {
+        let state = self.state.lock().unwrap();
+        CameraStatus {
+            available: state.available,
+            device: if state.device.is_empty() {
+                self.cfg.device.clone()
+            } else {
+                state.device.clone()
+            },
+            format: state.camera_format.clone(),
+            frames: state.frames,
+            fps: if state.preview_fps > 0.0 {
+                state.preview_fps
+            } else {
+                state.fps
+            },
+            age_ms: state.preview_age_ms().or_else(|| state.model_age_ms()),
+            error: state.camera_error.clone(),
+        }
+    }
+
+    fn vision_status(&self) -> Option<VisionStatus> {
+        let state = self.state.lock().unwrap();
+        Some(VisionStatus {
+            model_ok: state.model_ok,
+            model: state.model.clone(),
+            input: state.model_input.clone(),
+            encode: state.encode.clone(),
+            sent: state.preview_sent,
+            dropped: state.preview_dropped,
+            published: state.preview_published,
+            encode_avg_ms: state.encode_ms_avg,
+            fps: state.fps,
+            age_ms: state.model_age_ms(),
+            infer_ms: state.infer_ms,
+            nms_ms: state.nms_ms,
+            position_ms: state.position_ms,
+            encode_ms: state.encode_ms,
+            dets: state.dets,
+            error: state.error.clone(),
+        })
+    }
+
+    fn latest_snapshot(&self) -> Option<Arc<VisionSnapshot>> {
+        self.state.lock().unwrap().latest_snapshot.clone()
     }
 }
 
@@ -469,62 +587,27 @@ impl Drop for VisionStream {
 
 impl PreviewSource for VisionStream {
     fn frame_if_new(&self, after: u64) -> Option<Arc<PreviewFrame>> {
-        let state = self.inner.state.lock().unwrap();
-        match &state.preview {
-            Some(frame) if frame.seq > after => Some(Arc::clone(frame)),
-            _ => None,
-        }
+        self.inner.frame_if_new(after)
     }
 
     fn latest(&self) -> Option<Arc<PreviewFrame>> {
-        self.inner.state.lock().unwrap().preview.clone()
+        self.inner.latest()
     }
 
     fn camera_status(&self) -> CameraStatus {
-        let state = self.inner.state.lock().unwrap();
-        CameraStatus {
-            available: state.available,
-            device: if state.device.is_empty() {
-                self.inner.cfg.device.clone()
-            } else {
-                state.device.clone()
-            },
-            format: state.camera_format.clone(),
-            frames: state.frames,
-            fps: if state.preview_fps > 0.0 {
-                state.preview_fps
-            } else {
-                state.fps
-            },
-            age_ms: state.preview_age_ms().or_else(|| state.model_age_ms()),
-            error: state.camera_error.clone(),
-        }
+        self.inner.camera_status()
     }
 
     fn vision_status(&self) -> Option<VisionStatus> {
-        let state = self.inner.state.lock().unwrap();
-        Some(VisionStatus {
-            model_ok: state.model_ok,
-            model: state.model.clone(),
-            input: state.model_input.clone(),
-            encode: state.encode.clone(),
-            sent: state.preview_sent,
-            dropped: state.preview_dropped,
-            published: state.preview_published,
-            encode_avg_ms: state.encode_ms_avg,
-            fps: state.fps,
-            age_ms: state.model_age_ms(),
-            infer_ms: state.infer_ms,
-            nms_ms: state.nms_ms,
-            position_ms: state.position_ms,
-            encode_ms: state.encode_ms,
-            dets: state.dets,
-            error: state.error.clone(),
-        })
+        self.inner.vision_status()
     }
 
     fn latest_snapshot(&self) -> Option<Arc<VisionSnapshot>> {
-        self.inner.state.lock().unwrap().latest_snapshot.clone()
+        self.inner.latest_snapshot()
+    }
+
+    fn stop(&self) {
+        VisionStream::stop(self);
     }
 }
 
@@ -587,7 +670,6 @@ fn capture_loop(
     let mut last_preview = Instant::now()
         .checked_sub(preview_period)
         .unwrap_or_else(Instant::now);
-    let mut last_at = Instant::now();
     let mut last_error: Option<String> = None;
     let mut last_error_at = Instant::now()
         .checked_sub(Duration::from_secs(5))
@@ -610,27 +692,12 @@ fn capture_loop(
         match vision.step(preview) {
             Ok(step) => {
                 let now = Instant::now();
-                let dt = now.saturating_duration_since(last_at).as_secs_f64();
-                last_at = now;
                 let snap = Arc::new(snapshot(&step));
                 let has_preview = step.preview.is_some();
                 {
                     let mut state = inner.state.lock().unwrap();
-                    state.frames += 1;
-                    if dt > 0.0 {
-                        state.fps = if state.fps > 0.0 {
-                            state.fps * 0.8 + (1.0 / dt) * 0.2
-                        } else {
-                            1.0 / dt
-                        };
-                    }
-                    state.last_at = Some(now);
-                    state.infer_ms = step.timings.infer_ms;
-                    state.nms_ms = step.timings.nms_ms;
-                    state.position_ms = step.timings.position_ms;
-                    state.dets = snap.dets.len();
+                    state.record_model_frame(now, &step.timings, Arc::clone(&snap));
                     state.error = vision.model_error().map(str::to_string);
-                    state.latest_snapshot = Some(Arc::clone(&snap));
                 }
                 if has_preview {
                     let packet = EncodePacket {
@@ -699,20 +766,6 @@ fn encoder_loop(
         sync_preview_backend(&inner, &preview);
         let encode_ms = elapsed_ms(t0);
         let seq = packet.snapshot.seq;
-        {
-            let mut state = inner.state.lock().unwrap();
-            state.preview_published += 1;
-            state.encode_ms_avg = if state.encode_ms_avg > 0.0 {
-                state.encode_ms_avg * 0.9 + encode_ms * 0.1
-            } else {
-                encode_ms
-            };
-            if state.preview_published % 100 == 0 {
-                let (avg, pubs) = (state.encode_ms_avg, state.preview_published);
-                drop(state);
-                info!("预览已发布 {pubs} 帧，平均编码 {avg:.1}ms");
-            }
-        }
         let frame = Arc::new(PreviewFrame {
             seq,
             jpeg: Some(jpeg_bytes),
@@ -720,19 +773,12 @@ fn encoder_loop(
         });
         let now = Instant::now();
         let mut state = inner.state.lock().unwrap();
-        if let Some(prev) = state.preview_at {
-            let dt = now.saturating_duration_since(prev).as_secs_f64();
-            if dt > 0.0 {
-                state.preview_fps = if state.preview_fps > 0.0 {
-                    state.preview_fps * 0.8 + (1.0 / dt) * 0.2
-                } else {
-                    1.0 / dt
-                };
-            }
+        state.record_preview(frame, encode_ms, now);
+        if state.preview_published % 100 == 0 {
+            let (avg, pubs) = (state.encode_ms_avg, state.preview_published);
+            drop(state);
+            info!("预览已发布 {pubs} 帧，平均编码 {avg:.1}ms");
         }
-        state.preview_at = Some(now);
-        state.encode_ms = encode_ms;
-        state.preview = Some(frame);
     }
     info!("预览编码线程退出");
 }

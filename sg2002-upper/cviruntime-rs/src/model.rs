@@ -83,6 +83,25 @@ impl Model {
             return Err(Error::TensorNull);
         }
         unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), dst, data.len()) };
+        self.run()
+    }
+
+    /// 零拷贝前向：把输入张量直接指向 `paddr` 物理内存，再 `Forward`。
+    ///
+    /// 典型用法是让 VPSS 通道输出（VB block）直接当模型输入
+    /// （`CVI_NN_SetTensorPhysicalAddr`，见 `cvimpi_rs::vpss::VpssFrame::phy_addr`）。
+    ///
+    /// **注意**：运行时文档写明该接口会释放"张量初始化时自动分配的内存"，
+    /// 所以调用之后不要再用 [`Model::forward`]（它往那块已释放的内存 memcpy）。
+    pub fn forward_physical(&self, paddr: u64) -> Result<&[u8], Error> {
+        let rc = unsafe { sys::set_tensor_physical_addr(self.inputs[0].ptr, paddr) };
+        if rc != 0 {
+            return Err(Error::SetTensorFailed(rc));
+        }
+        self.run()
+    }
+
+    fn run(&self) -> Result<&[u8], Error> {
         let rc = unsafe {
             sys::forward(
                 self.handle,

@@ -90,7 +90,7 @@ pub struct VisionStatus {
     pub model: String,
     /// 模型输入张量形状（如 `[1, 3, 480, 640]`）。
     pub input: String,
-    /// 预览编码后端：`hw`（VENC 硬件）/ `sw`（纯 Rust）/ `none`。
+    /// 预览编码后端：`hw`（VENC 硬件）/ `sw`（纯 Rust）/ `vpss`（VPSS 硬 CSC + VENC 硬编）/ `none`。
     pub encode: String,
     /// 预览投递成功/丢弃/已发布计数（诊断用）。
     pub sent: u64,
@@ -128,6 +128,9 @@ pub trait PreviewSource: Send + Sync {
     fn latest_snapshot(&self) -> Option<Arc<VisionSnapshot>> {
         None
     }
+
+    /// 停止采集并回收资源；幂等，默认什么都不做（纯画面源自己实现）。
+    fn stop(&self) {}
 
     /// 自动模式是否可用：有视觉 + 模型可用 + 画面新鲜。
     fn auto_ready(&self) -> bool {

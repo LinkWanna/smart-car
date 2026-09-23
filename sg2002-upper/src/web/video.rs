@@ -213,6 +213,10 @@ impl PreviewSource for CameraStream {
     fn vision_status(&self) -> Option<VisionStatus> {
         None
     }
+
+    fn stop(&self) {
+        CameraStream::stop(self);
+    }
 }
 
 impl Drop for CameraStream {

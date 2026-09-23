@@ -152,6 +152,33 @@ impl Detection {
     }
 }
 
+/// 输出张量 → 检测框（NMS）。
+fn decode(
+    out_bytes: &[u8],
+    n_anchors: usize,
+    conf_thresh: f32,
+    iou_thresh: f32,
+    labels: &[String],
+) -> Vec<Detection> {
+    let f32_len = out_bytes.len() / 4;
+    let raw: &[f32] = unsafe { std::slice::from_raw_parts(out_bytes.as_ptr() as *const f32, f32_len) };
+
+    nms_decode(raw, n_anchors, conf_thresh, iou_thresh, 20)
+        .into_iter()
+        .map(|d| Detection {
+            label: labels
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "object".to_string()),
+            confidence: d.conf,
+            x1: d.x1,
+            y1: d.y1,
+            x2: d.x2,
+            y2: d.y2,
+        })
+        .collect()
+}
+
 pub struct TpuEngine {
     inner: Model,
 }
@@ -175,12 +202,29 @@ impl TpuEngine {
             .map_err(|e| io::Error::other(format!("Forward 失败: {e}")))
     }
 
+    /// 零拷贝前向：输入张量直接指向 `paddr` 处的物理内存（例如 VPSS 通道输出帧），
+    /// CPU 不搬运像素。调用方负责让这块内存在 Forward 期间保持有效
+    /// （`vpss::VpssFrame` 持有期间不会被复用）。
+    ///
+    /// 注意：`CVI_NN_SetTensorPhysicalAddr` 会释放运行时自动分配的输入内存，
+    /// 因此**同一个模型**之后不能再用 [`TpuEngine::try_infer`]（memcpy 路径）。
+    pub fn try_forward_physical(&self, paddr: u64) -> io::Result<&[u8]> {
+        self.inner
+            .forward_physical(paddr)
+            .map_err(|e| io::Error::other(format!("Forward(paddr={paddr:#x}) 失败: {e}")))
+    }
+
     pub fn infer(&self, data: &[u8]) -> &[u8] {
         self.try_infer(data).unwrap_or_else(|e| panic!("{e}"))
     }
 
     pub fn in_shape(&self) -> &[i32] {
         &self.inner.inputs[0].shape
+    }
+
+    /// 输入张量的字节数（`[1,3,480,640]` u8 = 921600）。
+    pub fn input_bytes(&self) -> usize {
+        self.inner.inputs[0].bytes
     }
 
     pub fn out_shape(&self) -> &[i32] {
@@ -225,38 +269,50 @@ impl TpuInference {
         self.engine.in_shape()
     }
 
+    /// 模型输入张量的字节数（零拷贝路径要求等于 VPSS RGB 帧的紧凑大小）。
+    pub fn input_bytes(&self) -> usize {
+        self.engine.input_bytes()
+    }
+
     /// 推理；失败返回 `io::Error`（不 panic）。
     pub fn try_infer(&mut self, planar: &[u8]) -> io::Result<Vec<Detection>> {
         let t0 = std::time::Instant::now();
         let out_bytes = self.engine.try_infer(planar)?;
         let tpu_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        self.last_tpu_ms = tpu_ms;
-
-        let t1 = std::time::Instant::now();
-        let f32_len = out_bytes.len() / 4;
-        let raw: &[f32] =
-            unsafe { std::slice::from_raw_parts(out_bytes.as_ptr() as *const f32, f32_len) };
-
         let n_anchors = self.engine.out_shape()[2] as usize;
-        let dets = nms_decode(raw, n_anchors, self.conf_thresh, self.iou_thresh, 20);
-        let nms_ms = t1.elapsed().as_secs_f64() * 1000.0;
-        self.last_nms_ms = nms_ms;
+        let t1 = std::time::Instant::now();
+        let dets = decode(
+            out_bytes,
+            n_anchors,
+            self.conf_thresh,
+            self.iou_thresh,
+            &self.labels,
+        );
+        self.last_tpu_ms = tpu_ms;
+        self.last_nms_ms = t1.elapsed().as_secs_f64() * 1000.0;
+        Ok(dets)
+    }
 
-        Ok(dets
-            .into_iter()
-            .map(|d| Detection {
-                label: self
-                    .labels
-                    .get(0)
-                    .cloned()
-                    .unwrap_or_else(|| "object".to_string()),
-                confidence: d.conf,
-                x1: d.x1,
-                y1: d.y1,
-                x2: d.x2,
-                y2: d.y2,
-            })
-            .collect())
+    /// 零拷贝推理：输入直接指向 VPSS 输出帧的物理地址。
+    ///
+    /// **调用后本实例不能再走 [`TpuInference::try_infer`]**（运行时已释放
+    /// 自动分配的输入内存），需要双路径时请用两个模型实例。
+    pub fn try_infer_physical(&mut self, paddr: u64) -> io::Result<Vec<Detection>> {
+        let t0 = std::time::Instant::now();
+        let out_bytes = self.engine.try_forward_physical(paddr)?;
+        let tpu_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let n_anchors = self.engine.out_shape()[2] as usize;
+        let t1 = std::time::Instant::now();
+        let dets = decode(
+            out_bytes,
+            n_anchors,
+            self.conf_thresh,
+            self.iou_thresh,
+            &self.labels,
+        );
+        self.last_tpu_ms = tpu_ms;
+        self.last_nms_ms = t1.elapsed().as_secs_f64() * 1000.0;
+        Ok(dets)
     }
 
     pub fn infer(&mut self, planar: &[u8]) -> Vec<Detection> {

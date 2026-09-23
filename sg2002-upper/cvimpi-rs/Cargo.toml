@@ -6,6 +6,7 @@ description = "Thin Rust FFI wrapper for the CVI MPI JPEG encode/decode workflow
 publish = false
 
 [dependencies]
+libc = "0.2"
 
 [profile.release]
 lto = true

@@ -2,7 +2,8 @@
 //!
 //! 模块分层：
 //! - 感知：`camera`（V4L2 零拷贝）、`preprocess`（YUYV→RGB / YUYV→JPEG 的像素工作流）、
-//!   `tpu`（推理 + NMS）、`position`（位置/距离分级）、`vision`（视觉核心 + 后台线程 + 同帧预览）；
+//!   `tpu`（推理 + NMS）、`position`（位置/距离分级）、`vision`（视觉核心 + 后台线程 + 同帧预览）、
+//!   `vpss_stream`（硬件 CSC 版管线：VPSS 双通道 → TPU 零拷贝 + VENC 硬编预览）；
 //! - 下位机通信与控制：`control`（`protocol` 线协议——与固件共用的
 //!   `protocol` crate、`serial` 串口、`car` 链路 + 安全看门狗、
 //!   `servo` 视觉伺服控制律）。
@@ -29,4 +30,5 @@ pub mod preview;
 pub mod stats;
 pub mod tpu;
 pub mod vision;
+pub mod vpss_stream;
 pub mod web;

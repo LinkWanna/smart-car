@@ -9,6 +9,7 @@
 //!   （[`sys::Sys`]、[`sys::VbPoolConfig`]）；其余句柄都从它派生。
 //! * [`encoder`] — `PT_JPEG` 编码通道及其 VB 输入帧 [`encoder::Frame`]。
 //! * [`decoder`] — `PT_JPEG` 解码通道及 [`decoder::DecodedFrame`]。
+//! * [`vpss`] — 视频后处理（硬件 CSC + 缩放），直接走 `/dev/cvi-vpss` 的 ioctl。
 //!
 //! 共享逻辑留在 crate 根部：错误类型 [`Error`] 和对照 `cvi_buffer.h` 的缓冲布局计算。
 //!
@@ -70,6 +71,7 @@ pub mod decoder;
 pub mod encoder;
 pub mod ffi;
 pub mod sys;
+pub mod vpss;
 
 use core::fmt;
 use core::marker::PhantomData;
@@ -197,6 +199,9 @@ pub fn plane_dims(fmt: ffi::PIXEL_FORMAT_E, width: u32, height: u32) -> Option<P
         PIXEL_FORMAT_YUV_400 => (1, [width, 0, 0], [height, 0, 0]),
         PIXEL_FORMAT_NV12 | PIXEL_FORMAT_NV21 => (2, [width, width, 0], [height, height / 2, 0]),
         PIXEL_FORMAT_NV16 | PIXEL_FORMAT_NV61 => (2, [width, width, 0], [height, height, 0]),
+        PIXEL_FORMAT_RGB_888_PLANAR | PIXEL_FORMAT_BGR_888_PLANAR => {
+            (3, [width, width, width], [height, height, height])
+        }
         PIXEL_FORMAT_YUYV | PIXEL_FORMAT_UYVY | PIXEL_FORMAT_YVYU | PIXEL_FORMAT_VYUY => {
             (1, [width * 2, 0, 0], [height, 0, 0])
         }
@@ -264,6 +269,12 @@ fn common_pic_layout(
             plane_num = 3;
         }
         PIXEL_FORMAT_YUV_PLANAR_444 => {
+            c_stride = main_stride;
+            c_size = y_size;
+            main_size = y_size + (c_size << 1);
+            plane_num = 3;
+        }
+        PIXEL_FORMAT_RGB_888_PLANAR | PIXEL_FORMAT_BGR_888_PLANAR => {
             c_stride = main_stride;
             c_size = y_size;
             main_size = y_size + (c_size << 1);

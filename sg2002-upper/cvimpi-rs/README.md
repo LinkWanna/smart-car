@@ -1,14 +1,21 @@
 # cvimpi-rs
 
-`cvi_mpi`（CV180X / CV181X / SG200X）的 **Rust 薄 FFI 封装**，只覆盖 **JPEG 编解码**一条工作流：
+`cvi_mpi`（CV180X / CV181X / SG200X）的 **Rust 薄 FFI 封装**，覆盖 **JPEG 编解码**与
+**VPSS 视频后处理**两条工作流：
 
 | 能力 | 依赖的 MPI 模块 | 对应头文件 |
 |---|---|---|
 | JPEG 编码（YUV → JPEG） | `venc`（`PT_JPEG`） | `cvi_venc.h` |
 | JPEG 解码（JPEG → YUV） | `vdec`（`PT_JPEG`） | `cvi_vdec.h` |
+| 硬件 CSC / 缩放（YUYV → RGB 平面 + NV12 双路输出） | `vpss`（`/dev/cvi-vpss` ioctl 直连） | `cvi_vpss.h` |
 | 初始化 / VB 池 | `sys` | `cvi_sys.h`、`cvi_vb.h` |
 
-VI / ISP / VPSS / VO / RGN / GDC / audio / IVE / bin 全部不在范围内；需要时可直接用 `ffi` 模块里的原始绑定继续扩展。
+VI / ISP / VO / RGN / GDC / audio / IVE / bin 全部不在范围内；需要时可直接用 `ffi` 模块里的原始绑定继续扩展。
+
+> VPSS 没有走厂商的 `libvpss.so`（板端镜像里没有这个库），而是按
+> `include/linux/vpss_uapi.h` 的 ioctl 协议在 `vpss` 模块里直接实现；
+> ABI（结构体尺寸 / 字段偏移 / ioctl 号）由 `tools/vpss_abi_probe.c` 在 C 头上实测，
+> 并在 `ffi.rs` 底部用编译期断言钉死（`cargo check` 即可校验）。
 
 ## 环境准备
 
@@ -91,6 +98,53 @@ let yuv = out.copy_tight()?;                          // DecodedFrame Drop 时�
   cached 帧由 `Encoder::send_frame` 在送硬件前自动 `CVI_SYS_IonFlushCache`；
   手动调 `CVI_VENC_SendFrame` 时用 `Frame::flush`（uncached 帧是 no-op）。
   实测 SG2002 写 640x480 NV12（460KB）：uncached 25ms → cached 3.3ms。
+
+## VPSS（视频后处理）
+
+```rust
+use cvimpi_rs::{ffi, sys::{Sys, VbPoolConfig}, vpss::{VpssChnConfig, VpssConfig}};
+
+let sys = Sys::init(&[VbPoolConfig::new(640 * 480 * 3, 6)])?; // 池 block 要放得下最大的一帧
+let vpss = sys.create_vpss(&VpssConfig {
+    grp: cvimpi_rs::vpss::VPSS_GRP_AUTO,      // 组号自动分配，见下
+    max_w: 640,
+    max_h: 480,
+    in_format: ffi::PIXEL_FORMAT_YUYV,
+    chns: vec![
+        VpssChnConfig::new(0, 640, 480, ffi::PIXEL_FORMAT_RGB_888_PLANAR), // 给 TPU
+        VpssChnConfig::new(1, 640, 480, ffi::PIXEL_FORMAT_NV12),           // 给 VENC
+    ],
+})?;
+vpss.set_yuv601_limited_to_full()?;           // 相机 YUYV 是 limited range，见下
+
+let mut frame = sys.alloc_frame_cached(640, 480, ffi::PIXEL_FORMAT_YUYV)?;
+frame.write_tight(&yuyv)?;
+frame.flush()?;
+vpss.send_frame(frame.info(), ffi::CVI_IO_BLOCK)?;
+
+let rgb = vpss.get_chn_frame(0, 1000)?;       // Drop 时自动 ReleaseChnFrame
+let jpeg_input = vpss.get_chn_frame(1, 1000)?;
+```
+
+要点（真机实测，SG2002 / LicheeRV Nano）：
+
+* **一个组号一个 boot 只能建一次**：`DestroyGrp` / `CVI_SYS_Exit` 都不复位，
+  第二次用同一个组号 `CreateGrp` 稳定返回 `-ENOSYS`（Function not implemented），
+  换一个没用过的组号立刻正常。所以 `grp` 用 `VPSS_GRP_AUTO`（进程级计数器往后找）；
+  16 个组用完后 VPSS 不可用（重启板子恢复），调用方要能降级到 CPU 路径。
+* **CSC 量程**：驱动默认矩阵是 full range（`R = Y + 1.402(V-128)`），而 UVC 相机
+  出的是 BT.601 limited（Y 16~235），直接用画面偏灰、模型置信度下降（实测
+  0.61 vs 0.71）。`Vpss::set_yuv601_limited_to_full()` 换上 limited→full 的矩阵后，
+  RGB 输出与 CPU 参考**逐像素一致**（mean|diff| = 0），模型输出也完全一致。
+  （副作用：NV12 通道的 Y 会被一起扩张成 full range，浏览器看 JPEG 反而更通透。）
+* 输入帧必须是 VB block（`sys.alloc_frame_cached` + `Frame::flush`）；
+  输出帧的 `phy_addr()` 可直接交给 TPU（`cviruntime_rs::Model::forward_physical`）。
+* VB 池 block 要 ≥ 最大的一帧：640x480 时 YUYV 614400 / RGB 平面 921600 / NV12 460800。
+* 实测（640x480，YUYV 进、RGB 平面 + NV12 出）：`SendFrame` 0.3~1.7ms、
+  `GetChnFrame` 0.1~1.3ms，纯流水线 50fps；RGB 平面 stride = 640 且三个平面物理地址
+  连续，可以直接当 `[1,3,480,640]` 的 NCHW 模型输入。
+* 上板探针：`sg2002-upper/src/bin/vpss_probe.rs`（`--step init|frame|twice`、
+  `--csc default|expand601`、`--venc`、`--model`、`--frames N`）。
 
 ## 缓冲池大小怎么算
 

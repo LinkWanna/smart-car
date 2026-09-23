@@ -5,8 +5,16 @@
 //! smartcar --port 8080            # 非特权端口（本地调试）
 //! smartcar --model /root/xxx.cvimodel
 //! smartcar --no-vision            # 只遥控（页面同 webctl）
-//! smartcar --scale 2 --quality 70 # 预览降采样到 320x240，省 CPU
+//! smartcar --vpss off             # 只用 CPU 路径（YUYV→RGB 软件转换 + memcpy）
+//! smartcar --scale 2 --quality 70 # 预览降采样到 320x240（VPSS 走硬件缩放）
 //! ```
+//!
+//! 视觉后端（`--vpss auto` 默认）：
+//! - **VPSS 硬件**（`vpss_stream.rs`）：相机 YUYV 只 memcpy 一次进 VB 块，硬件 CSC
+//!   同时出 chn0 RGB 平面（物理地址零拷贝喂 TPU）与 chn1 NV12（VENC 硬编 JPEG，
+//!   `--scale` 由硬件缩放）；
+//! - **CPU 路径**（`vision.rs`，回退）：YUYV→RGB 软件转换 + memcpy 喂 TPU，
+//!   预览走 VENC/软件编码。VPSS 建组失败、组号用尽或模型尺寸不匹配时自动回退。
 //!
 //! 输入模式由页面按钮切换（默认手动，不允许键盘悄悄切换）：
 //! - **手动**：WASD（`web::teleop`，与 `webctl` 相同的手感与看门狗）；
@@ -28,6 +36,7 @@ use sg2002_upper::control::{Car, CarConfig};
 use sg2002_upper::logging;
 use sg2002_upper::preview::PreviewSource;
 use sg2002_upper::vision::{VisionConfig, VisionStream};
+use sg2002_upper::vpss_stream::VpssStream;
 use sg2002_upper::web::{DriveTarget, Server, TeleopConfig, WebConfig};
 
 /// 等待下位机 `Init` 应答的超时。
@@ -69,6 +78,10 @@ struct Cli {
     /// 关闭视觉（只遥控；自动模式不可用）
     #[arg(long)]
     no_vision: bool,
+
+    /// 视觉后端：`auto` = 优先 VPSS 硬件（失败回退 CPU），`off` = 只用 CPU 路径
+    #[arg(long, value_enum, default_value_t = VpssMode::Auto)]
+    vpss: VpssMode,
 
     /// 预览 JPEG 质量（1..=100）
     #[arg(long, value_parser = clap::value_parser!(u8).range(1..=100), default_value_t = 70)]
@@ -132,6 +145,16 @@ fn fps(text: &str) -> Result<f32, String> {
         return Err("需在 0.5..=60 之间".to_string());
     }
     Ok(value)
+}
+
+/// 视觉处理后端。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum VpssMode {
+    /// 优先 VPSS 硬件 CSC（chn0 RGB 平面零拷贝喂 TPU + chn1 NV12 硬编预览），
+    /// 建组失败/组号用尽/模型尺寸不匹配时自动回退 CPU 路径。
+    Auto,
+    /// 只用 CPU 路径（YUYV→RGB 软件转换 + memcpy 喂 TPU）。
+    Off,
 }
 
 /// 找模型：`--model` > 已知部署路径 > `/root` 下第一个 `*.cvimodel`。
@@ -207,26 +230,37 @@ fn main() {
     install_signals(&running);
 
     // 视觉：相机以模型需要的 YUYV422 打开，预览与检测同帧（vision.rs）。
-    let vision: Option<Arc<VisionStream>> = if cli.no_vision {
+    // `--vpss auto` 时优先走硬件 CSC 管线（vpss_stream.rs）：相机 YUYV 只 memcpy 一次
+    // 进 VB 块，VPSS 同时出 RGB 平面（零拷贝喂 TPU）与 NV12（VENC 硬编预览，
+    // `--scale` 由硬件缩放）；VPSS 不可用时自动回退 CPU 路径。
+    let preview: Option<Arc<dyn PreviewSource>> = if cli.no_vision {
         info!("  视觉：已关闭（--no-vision，自动模式不可用）");
         None
     } else {
         match find_model(cli.model.as_deref()) {
             Ok(model) => {
                 info!("  模型：{model}");
-                Some(Arc::new(VisionStream::start(
-                    VisionConfig {
-                        device: cli.camera.clone(),
-                        model,
-                        conf_threshold: cli.conf,
-                        iou_threshold: cli.iou,
-                        label: "tennis_ball".to_string(),
-                        quality: cli.quality,
-                        scale: usize::from(cli.scale).max(1),
-                        preview_fps: cli.video_fps,
-                    },
-                    Arc::clone(&running),
-                )))
+                let cfg = VisionConfig {
+                    device: cli.camera.clone(),
+                    model,
+                    conf_threshold: cli.conf,
+                    iou_threshold: cli.iou,
+                    label: "tennis_ball".to_string(),
+                    quality: cli.quality,
+                    scale: usize::from(cli.scale).max(1),
+                    preview_fps: cli.video_fps,
+                };
+                let mut stream: Option<Arc<dyn PreviewSource>> = None;
+                if cli.vpss == VpssMode::Auto {
+                    match VpssStream::try_start(cfg.clone(), Arc::clone(&running)) {
+                        Ok(vpss) => stream = Some(Arc::new(vpss) as Arc<dyn PreviewSource>),
+                        Err(e) => warn!("VPSS 管线不可用（{e}）；回退 CPU 路径"),
+                    }
+                }
+                stream.or_else(|| {
+                    Some(Arc::new(VisionStream::start(cfg, Arc::clone(&running)))
+                        as Arc<dyn PreviewSource>)
+                })
             }
             Err(e) => {
                 warn!("{e}；改为仅遥控（自动模式不可用）");
@@ -234,9 +268,6 @@ fn main() {
             }
         }
     };
-    let preview: Option<Arc<dyn PreviewSource>> = vision
-        .as_ref()
-        .map(|v| Arc::clone(v) as Arc<dyn PreviewSource>);
 
     let teleop = TeleopConfig {
         max_speed: cli.max_speed,
@@ -246,6 +277,8 @@ fn main() {
         ..TeleopConfig::default()
     };
     let target: Arc<dyn DriveTarget> = car.clone();
+    // 服务器接管 preview（用于推送），这里留一份用于退出时 stop。
+    let preview_handle = preview.as_ref().map(Arc::clone);
     let server = Server::bind(
         WebConfig {
             bind: cli.bind.clone(),
@@ -281,8 +314,8 @@ fn main() {
 
     // 先停控制线程（它会滑行停车），再关视觉，最后关链路。
     control.join().ok();
-    if let Some(vision) = &vision {
-        vision.stop();
+    if let Some(preview) = &preview_handle {
+        preview.stop();
     }
     car.shutdown();
     let c = car.counters();

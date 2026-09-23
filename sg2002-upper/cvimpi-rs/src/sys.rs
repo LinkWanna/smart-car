@@ -61,6 +61,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::decoder::{Decoder, DecoderConfig};
 use crate::encoder::{Encoder, EncoderConfig, Frame};
+use crate::vpss::{Vpss, VpssConfig};
 use crate::{Error, Result, check, ffi};
 
 /// 进程级归属标志：中间件只能被初始化一次。
@@ -237,6 +238,13 @@ impl Sys {
         cfg: &DecoderConfig,
     ) -> Result<Decoder<'a>> {
         Decoder::create(self, chn, cfg)
+    }
+
+    /// 创建并启动一个 VPSS 组（`CVI_VPSS_CreateGrp` → `StartGrp`，见 [`Vpss`]）。
+    ///
+    /// 组输出帧从 common VB 池分配，池 block 必须放得下最大的输出帧。
+    pub fn create_vpss<'a>(&'a self, cfg: &VpssConfig) -> Result<Vpss<'a>> {
+        Vpss::create(self, cfg)
     }
 
     /// 申请一个 VB block 并映射好，用作编码输入帧（平面 uncached，CPU 写入后免 flush）。

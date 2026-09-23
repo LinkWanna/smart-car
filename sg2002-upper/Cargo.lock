@@ -382,6 +382,9 @@ dependencies = [
 [[package]]
 name = "cvimpi-rs"
 version = "0.1.0"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "cviruntime-rs"

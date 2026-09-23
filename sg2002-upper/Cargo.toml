@@ -22,18 +22,15 @@ clap = { version = "4.6.7", features = ["derive"] }
 jpeg-encoder = "0.7.1"
 protocol = { path = "../protocol" }
 
-[[bin]]
-name = "pipeline"
-path = "src/bin/pipeline.rs"
-
-[[bin]]
-name = "webctl"
-path = "src/bin/webctl.rs"
-
 # 整合入口：视觉（相机 YUYV + TPU + 同帧预览）+ 网页遥控（手动/自动切换）。
 [[bin]]
 name = "smartcar"
 path = "src/bin/smartcar.rs"
+
+# Phase 0 探针：VPSS（YUYV → RGB 平面 + NV12）上板验证，只做验证不做业务。
+[[bin]]
+name = "vpss_probe"
+path = "src/bin/vpss_probe.rs"
 
 [profile.release]
 lto = true

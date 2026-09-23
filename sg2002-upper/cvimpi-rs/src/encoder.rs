@@ -413,6 +413,33 @@ impl<'a> Encoder<'a> {
         )
     }
 
+    /// 提交任意一帧 `VIDEO_FRAME_INFO_S`（例如 VPSS 通道输出帧）。
+    ///
+    /// 与 [`Encoder::send_frame`] 的区别：不经过 [`Frame`]，不做 flush ——
+    /// 帧内存由硬件写入时（VPSS/VDEC 输出）无需 CPU 侧缓存操作。
+    /// VENC 只在编码完成前引用这块 VB 内存，所以帧的持有者要等
+    /// `GetStream` 之后再释放（`send_frame_info` + `get_stream` 是同一个约定）。
+    pub fn send_frame_info(
+        &self,
+        frame: &ffi::VIDEO_FRAME_INFO_S,
+        timeout_ms: ffi::CVI_S32,
+    ) -> Result<()> {
+        check(
+            unsafe { ffi::CVI_VENC_SendFrame(self.chn, frame, timeout_ms) },
+            "CVI_VENC_SendFrame",
+        )
+    }
+
+    /// `send_frame_info` + `get_stream`。
+    pub fn encode_info(
+        &self,
+        frame: &ffi::VIDEO_FRAME_INFO_S,
+        timeout_ms: ffi::CVI_S32,
+    ) -> Result<Vec<u8>> {
+        self.send_frame_info(frame, timeout_ms)?;
+        self.get_stream(timeout_ms)
+    }
+
     /// 取出一帧编码后的 JPEG 码流（`CVI_VENC_GetStream` + `CVI_VENC_ReleaseStream`）。
     /// 每次调用消费一帧已提交的输入。
     pub fn get_stream(&self, timeout_ms: ffi::CVI_S32) -> Result<Vec<u8>> {

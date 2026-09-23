@@ -6,7 +6,7 @@
 //! 线程模型：控制线程按 `control_hz` 推进 —— 手动模式跑 [`Teleop::tick`]，
 //! 自动模式取 [`PreviewSource::latest_detections`]（超过 `AUTO_STALE` 视为
 //! 看不到，滑行），在本地做位置分析（[`PositionAnalyzer`]）后推进视觉伺服；
-//! 输出统一经 `apply` 落到 [`DriveTarget`]。
+//! 输出统一经 `apply` 落到 [`Car`]。
 //! 模式切换时重置伺服状态并清空手动输入（避免残留油门/锁存），退出前滑行。
 
 use std::fmt;
@@ -19,9 +19,9 @@ use log::info;
 
 use crate::preview::{DetectionFrame, PreviewSource};
 
+use super::car::{Car, LinkSnapshot};
 use super::position::{Observation, PositionAnalyzer};
 use super::servo::{Action as ServoAction, ControlConfig, ControlLoop};
-use super::target::{DriveTarget, LinkSnapshot};
 use super::teleop::{Action, Hud, Keys, Output, Teleop, TeleopConfig};
 
 /// 观测过期阈值：超过这个时间没有新帧，自动模式按“看不到”处理（滑行）。
@@ -83,7 +83,7 @@ pub struct ControlStatus {
 /// 自带停止标志与线程句柄（Car 风格）：[`spawn`](ControlSession::spawn) 启动
 /// 控制线程，[`stop`](ControlSession::stop) 置 false 并等它退出；只停自己。
 pub struct ControlSession {
-    target: Arc<dyn DriveTarget>,
+    target: Arc<Car>,
     teleop: Mutex<Teleop>,
     mode: Mutex<Mode>,
     /// 自动模式控制律参数。
@@ -100,7 +100,7 @@ pub struct ControlSession {
 impl ControlSession {
     /// 创建会话（不启动线程；见 [`ControlSession::spawn`]）。
     pub fn new(
-        target: Arc<dyn DriveTarget>,
+        target: Arc<Car>,
         teleop_cfg: TeleopConfig,
         vision: Option<Arc<dyn PreviewSource>>,
     ) -> Arc<Self> {
@@ -175,7 +175,7 @@ impl ControlSession {
             self.set_mode(Mode::Manual).ok();
         }
         let out = self.teleop.lock().unwrap().action(action);
-        apply(&*self.target, out);
+        apply(&self.target, out);
         out
     }
 
@@ -224,7 +224,7 @@ impl ControlSession {
                 Mode::Manual => self.teleop.lock().unwrap().tick(now),
                 Mode::Auto => self.auto_output(&mut servo, now),
             };
-            apply(&*self.target, out);
+            apply(&self.target, out);
             self.target.maybe_reinit();
             next += period;
             let now = Instant::now();
@@ -265,9 +265,9 @@ impl ControlSession {
 }
 
 /// 把控制律输出落到链路。
-fn apply(target: &dyn DriveTarget, out: Output) {
+fn apply(target: &Car, out: Output) {
     match out {
-        Output::Drive { left, right } => target.set_speeds(left, right),
+        Output::Drive { left, right } => target.set_desired(left, right),
         Output::Coast => target.coast(),
         Output::Brake => target.brake(),
         Output::Hold => {}

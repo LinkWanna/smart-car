@@ -103,6 +103,27 @@ pub struct Counters {
     pub watchdog_trips: u32,
 }
 
+/// 下位机链路快照（HUD 用）。
+#[derive(Debug, Clone, Default)]
+pub struct LinkSnapshot {
+    /// 最近是否收到过 `Status`（链路可用）。
+    pub link_ok: bool,
+    /// 最近一次 `Status` 距今的时间。
+    pub link_age: Option<Duration>,
+    /// 固件状态机（`Uninit`/`Ready`/`Running`），无应答为 `None`。
+    pub sys: Option<String>,
+    /// 双轮实测转速（RPM），`[左, 右]`。
+    pub rpm: [i16; 2],
+    /// 固件闭环运动是否运行中。
+    pub dist_active: bool,
+    /// 0 = 无/运行中，1 = 已到达目标。
+    pub dist_result: u8,
+    /// 链路计数。
+    pub counters: Counters,
+    /// 最近一帧应答的可读文本。
+    pub last_frame: String,
+}
+
 struct CarState {
     /// manual 模式：下发线程完全放手，只允许 [`Car::send_frame`] 直接发。
     manual: bool,
@@ -503,6 +524,21 @@ impl Car {
     /// 最近一帧应答的可读文本（HUD 用）。
     pub fn last_frame(&self) -> String {
         self.inner.state.lock().unwrap().last_frame.clone()
+    }
+
+    /// 当前链路快照（HUD 用；一次锁拿到全部）。
+    pub fn snapshot(&self) -> LinkSnapshot {
+        let status = self.status();
+        LinkSnapshot {
+            link_ok: self.link_ok(),
+            link_age: self.link_age(),
+            sys: status.map(|s| s.sys.to_string()),
+            rpm: status.map_or([0, 0], |s| s.rpm),
+            dist_active: status.is_some_and(|s| s.dist_active),
+            dist_result: status.map_or(0, |s| s.dist_result),
+            counters: self.counters(),
+            last_frame: self.last_frame(),
+        }
     }
 
     /// 是否已经到达 Ready/Running（收到过 `Init` 的 ACK，或状态允许驱动）。

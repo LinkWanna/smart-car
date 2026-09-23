@@ -13,7 +13,7 @@
 //! - 制动/复位动作会把输出锁存（`Latch`），直到有新按键或 Init。
 //!
 //! 本模块只做决策，不碰链路：输出 [`Output`] 由 [`crate::control::session`]
-//! 落地成 [`DriveTarget`](crate::control::DriveTarget) 调用，因此可以在主机上
+//! 落地成 [`Car`](crate::control::Car) 调用，因此可以在主机上
 //! 单独测试。
 
 use std::fmt;

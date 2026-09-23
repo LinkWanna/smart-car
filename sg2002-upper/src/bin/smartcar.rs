@@ -34,7 +34,7 @@ use std::time::Duration;
 
 use clap::Parser;
 use log::{error, info, warn};
-use sg2002_upper::control::{Car, CarConfig, ControlSession, DriveTarget, TeleopConfig};
+use sg2002_upper::control::{Car, CarConfig, ControlSession, TeleopConfig};
 use sg2002_upper::logging;
 use sg2002_upper::preview::PreviewSource;
 use sg2002_upper::vision::{VisionConfig, VisionStream, VpssStream};
@@ -277,8 +277,7 @@ fn main() {
         ..TeleopConfig::default()
     };
     // 控制会话：链路 + 手动控制律 + 视觉伺服（控制线程由它自己 spawn）。
-    let target: Arc<dyn DriveTarget> = car.clone();
-    let session = ControlSession::new(target, teleop, preview.clone());
+    let session = ControlSession::new(car.clone(), teleop, preview.clone());
     // 服务器接管 preview（用于推送），这里留一份用于退出时 stop。
     let preview_handle = preview.as_ref().map(Arc::clone);
     let server = Server::bind(

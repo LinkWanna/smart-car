@@ -6,11 +6,13 @@
 //!   - 采集线程把**模型真正消费的那一帧**（RGB 缓冲拷贝 + 检测快照）投给编码线程；
 //!   - 编码线程编码完把 `(JPEG, 同帧快照)` 发布给网页（[`PreviewSource`]）。
 //!
-//!   这样模型推理不被软件编码拖慢（C906 上 640x480 编码约 120ms），
-//!   而网页显示的仍是「模型看到的那一帧」，框与画面严格对齐。
+//!   这样模型推理不被预览编码拖慢（C906 上 640x480 软件编码约 120ms，
+//!   硬件 VENC 约 12ms），而网页显示的仍是「模型看到的那一帧」，
+//!   框与画面严格对齐。
 //!
 //! 相机必须以模型需要的 **YUYV422** 打开（`Preprocessor` 的输入格式），
-//! 预览 JPEG 由同一帧的 RGB 缓冲软件编码得到，因此不需要第二路相机。
+//! 预览 JPEG 由同一帧编码得到（优先 `hwjpeg` 的硬件 VENC，失败降级软件编码），
+//! 因此不需要第二路相机。
 //!
 //! 模型加载失败不致命：退化为「仅预览」（`model_ok == false`），手动遥控照常，
 //! 自动模式不可用（见 [`PreviewSource::auto_ready`]）。
@@ -481,7 +483,15 @@ impl VisionStream {
 
         let encoder_inner = Arc::clone(&inner);
         let encoder_running = Arc::clone(&running);
-        let encoder = thread::spawn(move || encoder_loop(packet_rx, encoder_inner, encoder_running));
+        // 编码线程先定下后端（hw 要 YUYV、sw 要 RGB 平面），再开采集线程，
+        // 避免首帧按错的格式拷贝数据（编码线程自己的初始化可能要几十毫秒）。
+        let (enc_ready_tx, enc_ready_rx) = mpsc::channel::<()>();
+        let encoder = thread::spawn(move || {
+            encoder_loop(packet_rx, encoder_inner, encoder_running, enc_ready_tx)
+        });
+        if enc_ready_rx.recv_timeout(Duration::from_secs(5)).is_err() {
+            eprintln!("[vision] 编码线程初始化超时");
+        }
 
         let thread_inner = Arc::clone(&inner);
         let thread_running = Arc::clone(&running);
@@ -743,6 +753,7 @@ fn encoder_loop(
     packets: mpsc::Receiver<EncodePacket>,
     inner: Arc<StreamInner>,
     running: Arc<AtomicBool>,
+    ready: mpsc::Sender<()>,
 ) {
     let (scale, quality) = (inner.cfg.scale, inner.cfg.quality);
 
@@ -765,6 +776,8 @@ fn encoder_loop(
     };
     inner.state.lock().unwrap().encode =
         if hw.is_some() { "hw".into() } else { "sw".into() };
+    // 采集线程在 `VisionStream::start` 里等这个信号，拿到后才开始采集
+    let _ = ready.send(());
 
     let mut packed = Vec::new();
     let mut jpeg = Vec::new();

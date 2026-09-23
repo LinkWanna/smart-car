@@ -9,14 +9,15 @@
 //! - 网页遥控：`web`（零依赖 HTTP/WebSocket、手动遥控控制律、MJPEG 预览、
 //!   手动/自动仲裁）、`preview`（预览与视觉之间的中性契约）。
 //! - 观测：`stats`（管线耗时统计）。
-//! - 硬件编码：`hwjpeg`（SG2002 VENC 硬件 JPEG；实现在 `csrc/hwjpeg.c`，
-//!   运行期 dlopen 厂商库，没有 SDK 时自动降级到软件编码）。
+//! - 硬件编解码：`hwjpeg`（SG2002 VENC 硬件 JPEG，封装在 `cvimpi-rs` 里，
+//!   编解码会话/通道/VB 池都由它管理；打不开硬件时上层降级到软件编码）。
 //!
 //! 入口 bin：`smartcar`（整合：视觉 + 网页 + 手动/自动）、`webctl`（只遥控）、
 //! `pipeline`（只视觉）、`carctl`（下位机调试）。
 //!
-//! `camera` / `tpu` / `position` 依赖板端 C 库与 V4L2，随 crate 无条件编译：
-//! 板端直接运行，主机上可用 `cargo check` 做编译检查。
+//! `camera` / `tpu` / `position` / `hwjpeg` 依赖板端 C 库与 V4L2，随 crate
+//! 无条件编译：板端直接运行，主机上可用 `cargo check` 做编译检查
+//! （链接/运行需要厂商库，只在板端进行）。
 
 pub mod camera;
 pub mod control;

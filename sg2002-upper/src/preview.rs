@@ -2,7 +2,7 @@
 //!
 //! 两个实现：
 //! - [`crate::web::video::CameraStream`]：相机 MJPG 直出，只有画面（`webctl` 用）；
-//! - [`crate::vision::VisionStream`]：相机 YUYV（模型输入格式）采集 + 软件编码，
+//! - [`crate::vision::VisionStream`]：相机 YUYV（模型输入格式）采集 + 编码，
 //!   画面与检测严格同帧（`smartcar` 用）。
 //!
 //! 网页层只依赖本模块的抽象，不关心相机是怎么打开的。

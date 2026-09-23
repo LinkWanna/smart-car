@@ -1,111 +1,58 @@
-//! 硬件 JPEG 编码（SG2002 VENC / `PT_JPEG`）的 Rust 封装。
+//! 硬件 JPEG 编码（SG2002 VENC / `PT_JPEG`），基于 [`cvimpi_rs`] 的安全封装。
 //!
-//! 实现在 `csrc/hwjpeg.c`：运行期 dlopen `/mnt/system/usr/lib/{libsys,libvenc}.so`，
-//! 用 VB（ION 物理连续内存）+ VENC 通道把 **YUYV422** 帧编码成 JPEG。
-//! 相比纯软件编码（C906 上 640x480 约 70~135ms），硬件路径约 15ms（含 YUYV→NV12 转换）。
+//! 相比纯软件编码（C906 上 640x480 约 70~135ms），硬件路径约 12ms（含转换）。
+//!
+//! 相机出的是 **YUYV422**，而 VENC 的 JPEG 通道只认 semi-planar YUV420
+//! （把 YUYV 直接交给驱动会被当成 NV12 解释，画面变成绿/品红条纹），
+//! 所以编码前在写 VB 块时做一次 YUYV422 → NV12 转换。输入帧用
+//! `cvimpi-rs` 的 cached 映射（`alloc_frame_cached`）：CPU 逐字节写 cached
+//! 内存比 uncached 快一个数量级（实测 460KB：25ms → 3.3ms），
+//! `Encoder::send_frame` 会在送硬件前自动 flush。
 //!
 //! 三个约定：
 //! - [`HwJpeg`] **不是 `Send`**：VENC 通道与线程绑定，`new`/`encode`/`Drop` 必须同一线程；
 //! - 输入固定 640x480 YUYV422（与相机一致）；
 //! - 任何失败都返回 `io::Error`，上层据此降级到软件编码。
+//!
+//! 编解码会话（`CVI_SYS_Init` + 公共 VB 池）由 `cvimpi-rs` 的
+//! [`Sys`] 持有；`HwJpeg` 析构时按 `Encoder` → `Frame` → `Sys` 的顺序
+//! 清理，不会给内核留下残留池。
 
-use std::ffi::{CStr, c_char, c_int, c_uint};
 use std::io;
 use std::marker::PhantomData;
 use std::sync::Arc;
+use std::time::Instant;
+
+use cvimpi_rs::encoder::{Encoder, EncoderConfig, Frame};
+use cvimpi_rs::ffi;
+use cvimpi_rs::sys::{Sys, VbPoolConfig};
+use cvimpi_rs::venc_input_layout;
 
 use crate::vision::{FRAME_H, FRAME_W};
 
-/// 与 C 封装约定的输出缓冲上限（640x480 高质量 JPEG 远小于此）。
-const OUT_CAPACITY: usize = 1 << 20;
-
-#[cfg(not(no_hwjpeg))]
-mod ffi {
-    use super::*;
-
-    unsafe extern "C" {
-        fn hwjpeg_init(width: c_uint, height: c_uint, quality: c_uint) -> c_int;
-        fn hwjpeg_encode(
-            yuyv: *const u8,
-            src_len: c_uint,
-            dst: *mut u8,
-            dst_cap: c_uint,
-            out_len: *mut c_uint,
-        ) -> c_int;
-        fn hwjpeg_exit();
-        fn hwjpeg_error() -> *const c_char;
-        fn hwjpeg_input_format() -> c_uint;
-    }
-
-    pub fn last_error() -> String {
-        unsafe {
-            CStr::from_ptr(hwjpeg_error())
-                .to_string_lossy()
-                .into_owned()
-        }
-    }
-
-    pub fn input_format() -> u32 {
-        unsafe { hwjpeg_input_format() }
-    }
-
-    pub fn init(width: u32, height: u32, quality: u32) -> io::Result<()> {
-        if unsafe { hwjpeg_init(width, height, quality) } == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::other(last_error()))
-        }
-    }
-
-    pub fn encode(input: &[u8], out: &mut [u8]) -> io::Result<usize> {
-        let mut len: c_uint = 0;
-        let ret = unsafe {
-            hwjpeg_encode(
-                input.as_ptr(),
-                input.len() as c_uint,
-                out.as_mut_ptr(),
-                out.len() as c_uint,
-                &mut len,
-            )
-        };
-        if ret == 0 {
-            Ok(len as usize)
-        } else {
-            Err(io::Error::other(last_error()))
-        }
-    }
-
-    pub fn exit() {
-        unsafe { hwjpeg_exit() }
-    }
-}
-
-#[cfg(no_hwjpeg)]
-mod ffi {
-    use super::*;
-
-    pub fn init(_width: u32, _height: u32, _quality: u32) -> io::Result<()> {
-        Err(io::Error::other(
-            "本次构建不含硬件编码（未找到 cvi_mpi SDK 头文件）",
-        ))
-    }
-
-    pub fn encode(_input: &[u8], _out: &mut [u8]) -> io::Result<usize> {
-        Err(io::Error::other("本次构建不含硬件编码"))
-    }
-
-    pub fn exit() {}
-
-    pub fn input_format() -> u32 {
-        0
-    }
-}
+/// 编码输入帧的像素格式：驱动只接受 semi-planar YUV420（见模块注释）。
+const INPUT_FORMAT: ffi::PIXEL_FORMAT_E = ffi::PIXEL_FORMAT_NV12;
+/// VB 公共池块数（与旧的 C 封装一致）。
+const VB_BLK_CNT: u32 = 4;
+/// 输入帧字节数（640x480 YUYV422，2 字节/像素）。
+const YUYV_LEN: usize = FRAME_W * 2 * FRAME_H;
 
 /// 硬件 JPEG 编码器句柄（与创建它的线程绑定）。
 pub struct HwJpeg {
-    out: Vec<u8>,
+    /// VENC 通道。字段声明顺序 = 析构顺序：`enc`/`frame` 先于 `_sys`，
+    /// 保证句柄不会在会话之后被拆掉（借用检查器看不到这一层，见 `new`）。
+    enc: Encoder<'static>,
+    /// 复用的编码输入帧（VB 块），避免每帧重新申请/映射。
+    frame: Frame<'static>,
+    /// 进程级编解码会话（`CVI_SYS_Init` + 公共 VB 池）。
+    ///
+    /// `Box` 让堆地址稳定：`enc`/`frame` 的 `'static` 借用实际指向这里，
+    /// 且移动 `HwJpeg` 不会移动它。
+    _sys: Box<Sys>,
     /// 保持 `!Send`：VENC 通道必须固定线程使用。
     _not_send: PhantomData<*const ()>,
+    /// `HWJPEG_DEBUG=1` 时逐帧打印转换/VENC 耗时（定位性能问题用）。
+    debug: bool,
 }
 
 impl HwJpeg {
@@ -116,30 +63,264 @@ impl HwJpeg {
                 "硬件编码只支持 {FRAME_W}x{FRAME_H}，收到 {width}x{height}"
             )));
         }
-        ffi::init(width, height, u32::from(quality))?;
+        // 50 是「用户量化表」的特殊值（需要调用方给出 u8YQt 等表），避开它。
+        let quality = if quality == 50 {
+            51
+        } else {
+            quality.clamp(1, 99)
+        };
+
+        let layout = venc_input_layout(width, height, INPUT_FORMAT)
+            .ok_or_else(|| io::Error::other("venc_input_layout 不支持 NV12"))?;
+        let sys = Box::new(
+            Sys::init(&[VbPoolConfig::new(layout.vb_size, VB_BLK_CNT).with_name("hwjpeg")])
+                .map_err(|e| io::Error::other(format!("JPEG 会话初始化失败: {e}")))?,
+        );
+
+        // SAFETY: `sys` 在堆上（移动 `HwJpeg` 不会移动它），而 `enc`/`frame` 按
+        // 字段顺序（也是局部变量逆序）先于 `sys` 析构，所以这里延长的 `'static`
+        // 借用不会真的超出会话；`session` 只在构造函数内部使用，不对外泄露。
+        let session: &'static Sys = unsafe { &*(&*sys as *const Sys) };
+
+        let enc = session
+            .create_encoder(
+                0,
+                &EncoderConfig::new(width, height, INPUT_FORMAT).with_quality(u32::from(quality)),
+            )
+            .map_err(|e| io::Error::other(format!("CVI_VENC 通道创建失败: {e}")))?;
+        let frame = session
+            .alloc_frame_cached(width, height, INPUT_FORMAT)
+            .map_err(|e| io::Error::other(format!("编码输入帧分配失败: {e}")))?;
+
         Ok(Self {
-            out: vec![0u8; OUT_CAPACITY],
+            enc,
+            frame,
+            _sys: sys,
             _not_send: PhantomData,
+            debug: std::env::var_os("HWJPEG_DEBUG").is_some(),
         })
     }
 
     /// 编码一帧 640x480 YUYV422，返回 JPEG 字节。
     pub fn encode(&mut self, yuyv: &[u8]) -> io::Result<Arc<[u8]>> {
-        let len = ffi::encode(yuyv, &mut self.out)?;
-        if len == 0 {
+        if yuyv.len() < YUYV_LEN {
+            return Err(io::Error::other(format!(
+                "输入长度不足: {} < {YUYV_LEN}",
+                yuyv.len()
+            )));
+        }
+        let t0 = Instant::now();
+        write_nv12(&mut self.frame, yuyv)
+            .map_err(|e| io::Error::other(format!("YUYV→NV12 转换失败: {e}")))?;
+        let t1 = Instant::now();
+        let jpeg = self
+            .enc
+            .encode(&self.frame, ffi::CVI_IO_BLOCK)
+            .map_err(|e| io::Error::other(format!("硬件编码失败: {e}")))?;
+        if self.debug {
+            eprintln!(
+                "[hwjpeg] 转换 {:.1}ms + VENC {:.1}ms = {:.1}ms（{} 字节）",
+                t1.duration_since(t0).as_secs_f64() * 1000.0,
+                t1.elapsed().as_secs_f64() * 1000.0,
+                t0.elapsed().as_secs_f64() * 1000.0,
+                jpeg.len()
+            );
+        }
+        if jpeg.is_empty() {
             return Err(io::Error::other("硬件编码输出为空"));
         }
-        Ok(Arc::from(&self.out[..len]))
+        Ok(Arc::from(jpeg))
     }
 
     /// 实际使用的输入像素格式（SDK 的 `PIXEL_FORMAT_E` 数值，日志用）。
     pub fn input_format(&self) -> u32 {
-        ffi::input_format()
+        INPUT_FORMAT as u32
     }
 }
 
-impl Drop for HwJpeg {
-    fn drop(&mut self) {
-        ffi::exit();
+/// 把 640x480 YUYV422 写进 NV12 输入帧（自动处理硬件 stride）。
+///
+/// 输入帧是 cached 映射（`Sys::alloc_frame_cached`），写完由
+/// `Encoder::send_frame` 统一 flush 给硬件。
+fn write_nv12(frame: &mut Frame<'_>, yuyv: &[u8]) -> cvimpi_rs::Result<()> {
+    let y_stride = frame.stride(0) as usize;
+    yuyv_to_y(yuyv, frame.plane_mut(0)?, y_stride);
+    let uv_stride = frame.stride(1) as usize;
+    yuyv_to_uv(yuyv, frame.plane_mut(1)?, uv_stride);
+    Ok(())
+}
+
+/// YUYV422 → NV12 的 Y 平面：每对像素取亮度，按 `stride` 逐行写。
+fn yuyv_to_y(yuyv: &[u8], dst: &mut [u8], stride: usize) {
+    let src_stride = FRAME_W * 2;
+    for y in 0..FRAME_H {
+        let src = &yuyv[y * src_stride..y * src_stride + src_stride];
+        let dst = &mut dst[y * stride..y * stride + FRAME_W];
+        for x in 0..FRAME_W / 2 {
+            dst[x * 2] = src[x * 4];
+            dst[x * 2 + 1] = src[x * 4 + 2];
+        }
+    }
+}
+
+/// YUYV422 → NV12 的交织 UV 平面：2x2 块取平均（与旧的 C 封装一致）。
+fn yuyv_to_uv(yuyv: &[u8], dst: &mut [u8], stride: usize) {
+    let src_stride = FRAME_W * 2;
+    for y in (0..FRAME_H).step_by(2) {
+        let r0 = &yuyv[y * src_stride..y * src_stride + src_stride];
+        let r1 = &yuyv[(y + 1) * src_stride..(y + 1) * src_stride + src_stride];
+        let dst = &mut dst[(y / 2) * stride..(y / 2) * stride + FRAME_W];
+        for x in 0..FRAME_W / 2 {
+            let u = (u16::from(r0[x * 4 + 1]) + u16::from(r1[x * 4 + 1])) / 2;
+            let v = (u16::from(r0[x * 4 + 3]) + u16::from(r1[x * 4 + 3])) / 2;
+            dst[x * 2] = u as u8;
+            dst[x * 2 + 1] = v as u8;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 构造「YUYV：U=10+行号%2、V=200-列号%2、Y=列号」的可区分测试图。
+    fn yuyv_pattern() -> Vec<u8> {
+        let mut buf = vec![0u8; YUYV_LEN];
+        for y in 0..FRAME_H {
+            let row = &mut buf[y * FRAME_W * 2..(y + 1) * FRAME_W * 2];
+            for pair in 0..FRAME_W / 2 {
+                let x = pair * 2;
+                row[pair * 4] = x as u8;
+                row[pair * 4 + 1] = 10;
+                row[pair * 4 + 2] = (x + 1) as u8;
+                row[pair * 4 + 3] = 200;
+            }
+        }
+        buf
+    }
+
+    #[test]
+    fn yuyv_to_y_takes_luma_and_respects_stride() {
+        let src = yuyv_pattern();
+        let stride = FRAME_W + 64; // 模拟驱动 stride padding
+        let mut dst = vec![0xAAu8; stride * FRAME_H];
+        yuyv_to_y(&src, &mut dst, stride);
+
+        for y in [0usize, 1, 239, 479] {
+            let row = &dst[y * stride..y * stride + FRAME_W];
+            for (i, &v) in row.iter().enumerate() {
+                assert_eq!(v as usize, i % 256, "第 {y} 行第 {i} 列");
+            }
+        }
+        // padding 不被写
+        assert_eq!(dst[FRAME_W], 0xAA);
+        assert_eq!(dst[stride * FRAME_H - 1], 0xAA);
+    }
+
+    #[test]
+    fn yuyv_to_uv_averages_2x2_blocks() {
+        let mut src = yuyv_pattern();
+        // 让 (0,0)-(1,1) 这 2x2 块取不同的 UV：行 0 的 U=10/V=200，行 1 的 U=30/V=100
+        for pair in 0..FRAME_W / 2 {
+            src[pair * 4 + 1] = 10;
+            src[pair * 4 + 3] = 200;
+            let r1 = FRAME_W * 2 + pair * 4;
+            src[r1 + 1] = 30;
+            src[r1 + 3] = 100;
+        }
+        let stride = FRAME_W + 64;
+        let mut dst = vec![0xAAu8; stride * (FRAME_H / 2)];
+        yuyv_to_uv(&src, &mut dst, stride);
+
+        assert_eq!(dst[0], 20, "U 取两行平均");
+        assert_eq!(dst[1], 150, "V 取两行平均");
+        assert_eq!(dst[2], 20);
+        assert_eq!(dst[3], 150);
+        // 第二行 UV（源的第 2/3 行仍是 10/200）
+        assert_eq!(dst[stride], 10);
+        assert_eq!(dst[stride + 1], 200);
+        // padding 不被写
+        assert_eq!(dst[FRAME_W], 0xAA);
+        assert_eq!(dst[stride * (FRAME_H / 2) - 1], 0xAA);
+    }
+
+    /// 输出指纹（校验缓存/刷写路径的编码结果）。
+    fn sum_bytes(b: &[u8]) -> u64 {
+        b.iter().map(|&x| u64::from(x)).sum()
+    }
+
+    /// 真机基准（需要厂商库）：`cargo test --release -- --ignored --nocapture`。
+    ///
+    /// 生产路径（cached 输入帧，`send_frame` 自动 flush）对比 uncached 直写；
+    /// 顺带校验两帧不同输入经 cached 路径编码结果确实不同（flush 生效）。
+    #[test]
+    #[ignore = "需要 SG2002 硬件（VENC + 厂商库）"]
+    fn bench_encode_on_board() {
+        use std::sync::atomic::{Ordering, fence};
+
+        let rounds = 30u32;
+        let yuyv = yuyv_pattern();
+        let mut hw = HwJpeg::new(FRAME_W as u32, FRAME_H as u32, 70).expect("硬件编码不可用");
+        let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+        let (w, h) = (FRAME_W as u32, FRAME_H as u32);
+        assert!(hw.frame.is_cached(), "生产路径应使用 cached 输入帧");
+
+        // 预热：首帧要等 VENC 起流，不参与统计
+        for _ in 0..3 {
+            write_nv12(&mut hw.frame, &yuyv).unwrap();
+            hw.enc.encode(&hw.frame, ffi::CVI_IO_BLOCK).unwrap();
+        }
+
+        // 生产路径：cached 输入帧（转换写 cached；flush 在 send_frame 里）
+        let (mut conv, mut venc) = (0.0f64, 0.0f64);
+        for _ in 0..rounds {
+            let t0 = Instant::now();
+            write_nv12(&mut hw.frame, &yuyv).unwrap();
+            let t1 = Instant::now();
+            hw.enc.encode(&hw.frame, ffi::CVI_IO_BLOCK).unwrap();
+            let t2 = Instant::now();
+            conv += ms(t1 - t0);
+            venc += ms(t2 - t1);
+        }
+        println!(
+            "cached 输入帧（生产）：转换 {:.1} + encode(含 flush) {:.1} = {:.1}ms/帧",
+            conv / rounds as f64,
+            venc / rounds as f64,
+            (conv + venc) / rounds as f64
+        );
+
+        // 对照：uncached 输入帧直写（store 是 posted 的，加 fence 才是真实耗时）
+        let mut uncached = hw._sys.alloc_frame(w, h, INPUT_FORMAT).unwrap();
+        let (mut conv, mut venc) = (0.0f64, 0.0f64);
+        for _ in 0..rounds {
+            fence(Ordering::SeqCst);
+            let t0 = Instant::now();
+            write_nv12(&mut uncached, &yuyv).unwrap();
+            fence(Ordering::SeqCst);
+            let t1 = Instant::now();
+            hw.enc.encode(&uncached, ffi::CVI_IO_BLOCK).unwrap();
+            let t2 = Instant::now();
+            conv += ms(t1 - t0);
+            venc += ms(t2 - t1);
+        }
+        println!(
+            "uncached 直写（对照） ：转换 {:.1} + VENC {:.1} = {:.1}ms/帧",
+            conv / rounds as f64,
+            venc / rounds as f64,
+            (conv + venc) / rounds as f64
+        );
+
+        // cached 路径的正确性：两帧差异极大的输入必须编出不同的 JPEG（flush 生效）
+        let yuyv_b: Vec<u8> = yuyv.iter().map(|b| !b).collect();
+        let mut sums = [0u64; 2];
+        for (i, src) in [&yuyv, &yuyv_b].into_iter().enumerate() {
+            write_nv12(&mut hw.frame, src).unwrap();
+            let jpeg = hw.enc.encode(&hw.frame, ffi::CVI_IO_BLOCK).unwrap();
+            sums[i] = sum_bytes(&jpeg);
+        }
+        assert_ne!(
+            sums[0], sums[1],
+            "cached 帧两帧输入不同却编码结果相同（flush 失效？）"
+        );
     }
 }

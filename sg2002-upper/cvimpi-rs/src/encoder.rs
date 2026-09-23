@@ -51,22 +51,50 @@ const MAX_STREAM_PACKS: usize = 8;
 
 /// 基于 VB 的帧，可直接交给 JPEG 编码器（也可以用于其他 `SendFrame` 接口）。
 ///
-/// 由 [`Sys::alloc_frame`] 创建；析构时归还给 VB 池。
+/// 由 [`Sys::alloc_frame`]（uncached，免 flush）或 [`Sys::alloc_frame_cached`]
+/// （`MmapCache`，CPU 写入快，发送前由 [`Encoder::send_frame`] 自动 flush）创建；
+/// 析构时归还给 VB 池。
 pub struct Frame<'a> {
     info: ffi::VIDEO_FRAME_INFO_S,
     layout: FrameLayout,
     blk: ffi::VB_BLK,
     maps: [Option<(*mut c_void, u32)>; 3],
+    /// 平面是否用 `CVI_SYS_MmapCache` 映射（见 [`Frame::flush`]）。
+    cached: bool,
     _session: SessionRef<'a>,
 }
 
 impl<'a> Frame<'a> {
-    /// 从 common VB 池申请一个 block 并映射各平面。
+    /// 从 common VB 池申请一个 block 并映射各平面（uncached）。
     pub(crate) fn alloc(
         _sys: &'a Sys,
         width: u32,
         height: u32,
         fmt: ffi::PIXEL_FORMAT_E,
+    ) -> Result<Frame<'a>> {
+        Self::alloc_with(_sys, width, height, fmt, false)
+    }
+
+    /// 同 [`Frame::alloc`]，但平面用 `CVI_SYS_MmapCache` 映射。
+    ///
+    /// CPU 逐字节写入 cached 内存比 uncached 快一个数量级（实测 YUYV→NV12
+    /// 写 460KB：25ms → 3.3ms）；代价是交给硬件前必须 [`Frame::flush`]，
+    /// [`Encoder::send_frame`] 会自动调用。
+    pub(crate) fn alloc_cached(
+        _sys: &'a Sys,
+        width: u32,
+        height: u32,
+        fmt: ffi::PIXEL_FORMAT_E,
+    ) -> Result<Frame<'a>> {
+        Self::alloc_with(_sys, width, height, fmt, true)
+    }
+
+    fn alloc_with(
+        _sys: &'a Sys,
+        width: u32,
+        height: u32,
+        fmt: ffi::PIXEL_FORMAT_E,
+        cached: bool,
     ) -> Result<Frame<'a>> {
         let layout = venc_input_layout(width, height, fmt)
             .ok_or_else(|| Error::invalid("venc_input_layout (unsupported pixel format)"))?;
@@ -94,6 +122,7 @@ impl<'a> Frame<'a> {
             layout,
             blk,
             maps: [None; 3],
+            cached,
             _session: PhantomData,
         };
 
@@ -123,12 +152,46 @@ impl<'a> Frame<'a> {
     }
 
     fn map_plane(&mut self, plane: usize, phy: u64, len: u32) -> Result<()> {
-        let ptr = unsafe { ffi::CVI_SYS_Mmap(phy, len) };
+        let ptr = unsafe {
+            if self.cached {
+                ffi::CVI_SYS_MmapCache(phy, len)
+            } else {
+                ffi::CVI_SYS_Mmap(phy, len)
+            }
+        };
         if ptr.is_null() {
             return Err(Error::invalid("CVI_SYS_Mmap"));
         }
         self.info.stVFrame.pu8VirAddr[plane] = ptr.cast();
         self.maps[plane] = Some((ptr, len));
+        Ok(())
+    }
+
+    /// 帧的平面是否为 cached 映射。
+    pub fn is_cached(&self) -> bool {
+        self.cached
+    }
+
+    /// 把 CPU 对平面的写入刷到内存（cached 帧交给硬件前必须调用）。
+    ///
+    /// uncached 帧是 no-op；[`Encoder::send_frame`] 会自动调用它。
+    pub fn flush(&self) -> Result<()> {
+        if !self.cached {
+            return Ok(());
+        }
+        let v = &self.info.stVFrame;
+        for p in 0..self.layout.plane_num as usize {
+            let vir = v.pu8VirAddr[p];
+            if vir.is_null() || v.u32Length[p] == 0 {
+                continue;
+            }
+            check(
+                unsafe {
+                    ffi::CVI_SYS_IonFlushCache(v.u64PhyAddr[p], vir.cast(), v.u32Length[p])
+                },
+                "CVI_SYS_IonFlushCache",
+            )?;
+        }
         Ok(())
     }
 
@@ -340,7 +403,10 @@ impl<'a> Encoder<'a> {
     }
 
     /// 提交一帧输入（`CVI_VENC_SendFrame`）。
+    ///
+    /// cached 帧会先 [`Frame::flush`]（uncached 帧 no-op）。
     pub fn send_frame(&self, frame: &Frame<'_>, timeout_ms: ffi::CVI_S32) -> Result<()> {
+        frame.flush()?;
         check(
             unsafe { ffi::CVI_VENC_SendFrame(self.chn, frame.info(), timeout_ms) },
             "CVI_VENC_SendFrame",

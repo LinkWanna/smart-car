@@ -239,7 +239,7 @@ impl Sys {
         Decoder::create(self, chn, cfg)
     }
 
-    /// 申请一个 VB block 并映射好，用作编码输入帧。
+    /// 申请一个 VB block 并映射好，用作编码输入帧（平面 uncached，CPU 写入后免 flush）。
     ///
     /// 池的 block 必须不小于 `venc_input_layout(width, height, fmt).vb_size`。
     pub fn alloc_frame<'a>(
@@ -249,6 +249,20 @@ impl Sys {
         fmt: ffi::PIXEL_FORMAT_E,
     ) -> Result<Frame<'a>> {
         Frame::alloc(self, width, height, fmt)
+    }
+
+    /// 同 [`Sys::alloc_frame`]，但平面用 `CVI_SYS_MmapCache` 映射。
+    ///
+    /// 适合 CPU 大量写入输入帧的场景（如相机 YUYV → NV12 转换）：
+    /// CPU 写入快一个数量级，代价是交给硬件前要 flush——[`Encoder::send_frame`]
+    /// 会自动调用 [`Frame::flush`]，手动调 `CVI_VENC_SendFrame` 时需自行 flush。
+    pub fn alloc_frame_cached<'a>(
+        &'a self,
+        width: u32,
+        height: u32,
+        fmt: ffi::PIXEL_FORMAT_E,
+    ) -> Result<Frame<'a>> {
+        Frame::alloc_cached(self, width, height, fmt)
     }
 }
 

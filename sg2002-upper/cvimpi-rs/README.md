@@ -62,6 +62,8 @@ let enc = sys.create_encoder(0,
 let mut frame = sys.alloc_frame(1920, 1080, ffi::PIXEL_FORMAT_YUV_PLANAR_420)?;
 frame.write_tight(&yuv420_bytes)?;                    // 自动处理 stride
 let jpeg_data: Vec<u8> = enc.encode(&frame, ffi::CVI_IO_BLOCK)?;  // SendFrame + GetStream
+// CPU 写入量大时改 `sys.alloc_frame_cached(...)`：写 cached 内存快一个数量级，
+// `send_frame` 会自动 flush（见下方要点）。
 
 // ---- 解码 ----
 let dec = sys.create_decoder(0,
@@ -84,6 +86,11 @@ let yuv = out.copy_tight()?;                          // DecodedFrame Drop 时�
 * `DecodedFrame` 期间可以 `plane(i)` 直接读（driver 已映射好虚拟地址），
   `copy_tight()` 会按格式拼成紧凑 YUV。
 * `Frame::write_tight` / `DecodedFrame::copy_tight` 支持 `yuv420p/422p/444p`、`nv12/nv21/nv16/nv61`、`yuyv/uyvy/yvyu/vyuy`。
+* 编码输入帧默认 uncached（`CVI_SYS_Mmap`，写完免 flush）；CPU 要大量写入时用
+  `Sys::alloc_frame_cached`（`CVI_SYS_MmapCache`），**写 cached 内存快一个数量级**。
+  cached 帧由 `Encoder::send_frame` 在送硬件前自动 `CVI_SYS_IonFlushCache`；
+  手动调 `CVI_VENC_SendFrame` 时用 `Frame::flush`（uncached 帧是 no-op）。
+  实测 SG2002 写 640x480 NV12（460KB）：uncached 25ms → cached 3.3ms。
 
 ## 缓冲池大小怎么算
 
@@ -145,6 +152,8 @@ VB 池 block 取二者最大值即可同时服务编码与解码。
   新代码能检测到不一致（`pools_match_request() == Some(false)`）并按内核实际池解码成功；
   输出与干净状态逐字节一致（编码 JPEG md5 相同、解码 PSNR 75.5 dB）。
   同一进程内编码+解码交替 10 轮的共享池测试通过（编 14.6ms / 解 13.6ms 每帧）。
+* 真机 `alloc_frame_cached`：640x480 YUYV→NV12 转换写 460KB，uncached 25ms → cached 3.3ms
+  （`send_frame` 自动 flush；两帧不同输入编码结果不同，证明 DMA 读到了新数据）。
 * `cargo check`：通过（含全部 ABI 断言），无 warning。
 * `cargo build --release --target riscv64gc-unknown-linux-musl`：链接成功，
   `NEEDED` 为 `libsys.so / libvenc.so / libvdec.so / libatomic.so.1 / libc.so`。
@@ -159,5 +168,6 @@ VB 池 block 取二者最大值即可同时服务编码与解码。
 * 只使用 global common VB 池（`VB_SOURCE_COMMON`），未封装 `CVI_VDEC_AttachVbPool`
   的 per-channel 池模式（`--vbMode=user`）。
 * 硬件 JPEG 解码器一般只支持 baseline；progressive JPEG 请先在设备上用 sample 验证。
-* 输入帧内存通过 `CVI_SYS_Mmap`（uncached）映射，CPU 写入后无需 flush；
-  解码输出读取前会调用一次 `CVI_SYS_IonInvalidateCache`（与 C sample 一致）。
+* 编码输入帧默认 uncached 映射（`CVI_SYS_Mmap`，写完免 flush）；CPU 密集写入时用
+  `Sys::alloc_frame_cached`（cached，`send_frame` 自动 flush）。解码输出读取前会
+  调用一次 `CVI_SYS_IonInvalidateCache`（与 C sample 一致）。

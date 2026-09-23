@@ -371,6 +371,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "cvimpi-rs"
+version = "0.1.0"
+
+[[package]]
 name = "cviruntime-rs"
 version = "0.1.0"
 dependencies = [
@@ -1199,8 +1203,8 @@ dependencies = [
 name = "sg2002-upper"
 version = "0.1.0"
 dependencies = [
- "cc",
  "clap",
+ "cvimpi-rs",
  "cviruntime-rs",
  "jpeg-decoder",
  "jpeg-encoder",

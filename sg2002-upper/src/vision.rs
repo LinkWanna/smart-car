@@ -17,7 +17,7 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -25,6 +25,7 @@ use std::time::{Duration, Instant};
 use jpeg_encoder::{ColorType, Encoder};
 
 use crate::camera::Camera;
+use crate::hwjpeg::HwJpeg;
 use crate::position::{PositionAnalyzer, PositionResult};
 use crate::preview::{
     CameraStatus, DetectionBox, PreviewFrame, PreviewSource, TargetInfo, VisionSnapshot,
@@ -88,9 +89,20 @@ pub struct VisionStep {
     pub seq: u64,
     pub at: Instant,
     pub result: PositionResult,
-    /// RGB 平面缓冲的拷贝（`want_rgb = true` 时给编码线程用）。
-    pub rgb: Option<Vec<u8>>,
+    /// 给预览线程的数据（按 [`PreviewCopy`] 拷贝，`None` = 不带）。
+    pub preview: Option<Vec<u8>>,
     pub timings: VisionTimings,
+}
+
+/// 预览线程需要的数据格式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreviewCopy {
+    /// 不带数据（`pipeline` 等无预览场景）。
+    None,
+    /// RGB 平面 CHW（软件编码用；来自预处理缓冲）。
+    RgbPlanar,
+    /// 相机原始 YUYV422（硬件编码用；直接来自相机缓冲）。
+    Yuyv,
 }
 
 /// 单帧步进的视觉核心。
@@ -174,8 +186,8 @@ impl Vision {
         &self.cfg.model
     }
 
-    /// 采集并处理一帧；`want_rgb` 为 true 时额外拷一份 RGB 缓冲（预览编码用）。
-    pub fn step(&mut self, want_rgb: bool) -> io::Result<VisionStep> {
+    /// 采集并处理一帧；`copy` 决定给预览线程带哪份数据（硬件编码要 YUYV，软件编码要 RGB）。
+    pub fn step(&mut self, copy: PreviewCopy) -> io::Result<VisionStep> {
         let t_frame = Instant::now();
 
         // 1) 采集（零拷贝）
@@ -186,6 +198,12 @@ impl Vision {
         // 2) 预处理：YUYV422 → RGB 平面 CHW（模型输入）
         let t1 = Instant::now();
         let planar = self.pp.process_yuyv(frame.as_slice(), FRAME_W, FRAME_H);
+        // 预览线程要的数据在这里拷（YUYV 需要在归还相机缓冲前取）
+        let preview = match copy {
+            PreviewCopy::None => None,
+            PreviewCopy::RgbPlanar => Some(planar.to_vec()),
+            PreviewCopy::Yuyv => Some(frame.as_slice().to_vec()),
+        };
         // 立即归还相机缓冲，让驱动尽早复用（planar 借的是预处理缓冲，不受影响）
         frame.release()?;
         let preprocess_ms = elapsed_ms(t1);
@@ -215,16 +233,14 @@ impl Vision {
         let result = self.pos.analyze(&dets);
         let position_ms = elapsed_ms(t2);
 
-        // 5) 需要预览时拷一份 RGB（编码在另一个线程做）
-        let rgb = want_rgb.then(|| planar.to_vec());
-
+        // 5) 位置分析后的预览数据已在第 2 步拷好
         let seq = self.seq;
         self.seq += 1;
         Ok(VisionStep {
             seq,
             at: t_frame,
             result,
-            rgb,
+            preview,
             timings: VisionTimings {
                 capture_ms,
                 preprocess_ms,
@@ -375,11 +391,15 @@ fn elapsed_ms(since: Instant) -> f64 {
 // 后台线程版：采集/推理 + 编码线程 + PreviewSource
 // ---------------------------------------------------------------------------
 
-/// 投给编码线程的一帧：RGB 拷贝 + 同帧快照。
+/// 投给预览线程的一帧：数据（YUYV 或 RGB 平面）+ 同帧快照。
 struct EncodePacket {
-    rgb: Vec<u8>,
+    data: Vec<u8>,
     snapshot: Arc<VisionSnapshot>,
 }
+
+/// `preview_format`：预览线程要的数据格式。
+const PREVIEW_RGB_PLANAR: u8 = 0;
+const PREVIEW_YUYV: u8 = 1;
 
 /// 线程共享状态（一次锁拿到全部，避免撕裂读）。
 #[derive(Default)]
@@ -389,11 +409,18 @@ struct StreamState {
     fps: f64,
     last_at: Option<Instant>,
     latest_snapshot: Option<Arc<VisionSnapshot>>,
+    /// 预览投递计数（诊断：模型帧 → 预览线程）。
+    preview_sent: u64,
+    preview_dropped: u64,
+    preview_published: u64,
+    encode_ms_avg: f64,
     /// 预览（JPEG）统计；`frame_if_new` 只认它。
     preview: Option<Arc<PreviewFrame>>,
     preview_at: Option<Instant>,
     preview_fps: f64,
     encode_ms: f64,
+    /// 预览编码后端（`hw` / `sw`）。
+    encode: String,
     /// 实际使用的相机节点（USB 重新枚举后会变）。
     device: String,
     camera_format: String,
@@ -422,6 +449,18 @@ impl StreamState {
 struct StreamInner {
     cfg: VisionConfig,
     state: Mutex<StreamState>,
+    /// 预览线程要的数据格式（见 `PREVIEW_*`；硬件编码要 YUYV，软件编码要 RGB 平面）。
+    preview_format: AtomicU8,
+}
+
+impl StreamInner {
+    fn new(cfg: VisionConfig) -> Self {
+        Self {
+            cfg,
+            state: Mutex::new(StreamState::default()),
+            preview_format: AtomicU8::new(PREVIEW_RGB_PLANAR),
+        }
+    }
 }
 
 /// 后台视觉源：采集/推理线程 + 预览编码线程，实现 [`PreviewSource`]。
@@ -435,10 +474,7 @@ pub struct VisionStream {
 impl VisionStream {
     /// 打开相机/模型并启动线程；函数返回时状态已确定（同 `CameraStream`）。
     pub fn start(cfg: VisionConfig, running: Arc<AtomicBool>) -> Self {
-        let inner = Arc::new(StreamInner {
-            cfg,
-            state: Mutex::new(StreamState::default()),
-        });
+        let inner = Arc::new(StreamInner::new(cfg));
         let (ready_tx, ready_rx) = mpsc::channel::<Result<String, String>>();
         // 容量 2：编码线程忙时允许排一帧，避免节拍量化导致预览帧率减半
         let (packet_tx, packet_rx) = mpsc::sync_channel::<EncodePacket>(2);
@@ -533,6 +569,11 @@ impl PreviewSource for VisionStream {
             model_ok: state.model_ok,
             model: state.model.clone(),
             input: state.model_input.clone(),
+            encode: state.encode.clone(),
+            sent: state.preview_sent,
+            dropped: state.preview_dropped,
+            published: state.preview_published,
+            encode_avg_ms: state.encode_ms_avg,
             fps: state.fps,
             age_ms: state.model_age_ms(),
             infer_ms: state.infer_ms,
@@ -617,14 +658,26 @@ fn capture_loop(
         .unwrap_or_else(Instant::now);
 
     while running.load(Ordering::Relaxed) {
-        let want_preview = preview_period.is_zero() || last_preview.elapsed() >= preview_due;
-        match vision.step(want_preview) {
+        let preview_due_now = preview_period.is_zero() || last_preview.elapsed() >= preview_due;
+        if preview_due_now {
+            // 立刻记账：本帧要处理（拷贝+推理）几十毫秒，
+            // 若等发送完再记，下一帧的 elapsed 会被吃掉一半 → 预览帧率减半
+            last_preview = Instant::now();
+        }
+        let copy = if !preview_due_now {
+            PreviewCopy::None
+        } else if inner.preview_format.load(Ordering::Relaxed) == PREVIEW_YUYV {
+            PreviewCopy::Yuyv
+        } else {
+            PreviewCopy::RgbPlanar
+        };
+        match vision.step(copy) {
             Ok(step) => {
                 let now = Instant::now();
                 let dt = now.saturating_duration_since(last_at).as_secs_f64();
                 last_at = now;
                 let snap = Arc::new(snapshot(&step));
-                let send_preview = want_preview && step.rgb.is_some();
+                let has_preview = step.preview.is_some();
                 {
                     let mut state = inner.state.lock().unwrap();
                     state.frames += 1;
@@ -643,15 +696,22 @@ fn capture_loop(
                     state.error = vision.model_error().map(str::to_string);
                     state.latest_snapshot = Some(Arc::clone(&snap));
                 }
-                if send_preview {
+                if has_preview {
                     let packet = EncodePacket {
-                        rgb: step.rgb.expect("want_preview 时应有 RGB 拷贝"),
+                        data: step.preview.expect("has_preview 时应有数据"),
                         snapshot: snap,
                     };
-                    // 编码线程忙（容量 1）就跳过本帧预览，不阻塞模型
-                    if packets.try_send(packet).is_ok() {
-                        last_preview = Instant::now();
+                    // 预览线程忙（容量 2）就跳过本帧预览，不阻塞模型
+                    let ok = packets.try_send(packet).is_ok();
+                    {
+                        let mut state = inner.state.lock().unwrap();
+                        if ok {
+                            state.preview_sent += 1;
+                        } else {
+                            state.preview_dropped += 1;
+                        }
                     }
+                    let _ = ok; // 预览成功与否由 try_send 的返回值决定，节拍已在上面记账
                 }
                 if let Some(err) = last_error.take() {
                     eprintln!("[vision] 采集恢复：{err}");
@@ -677,13 +737,35 @@ fn capture_loop(
     eprintln!("[vision] 视觉线程退出");
 }
 
-/// 编码循环：把一帧 RGB 编码成 JPEG，与**同帧**快照一起发布。
+/// 预览编码循环：优先硬件 VENC（输入 YUYV），不可用时退纯 Rust（输入 RGB 平面），
+/// 编码结果与**同帧**快照一起发布。
 fn encoder_loop(
     packets: mpsc::Receiver<EncodePacket>,
     inner: Arc<StreamInner>,
     running: Arc<AtomicBool>,
 ) {
     let (scale, quality) = (inner.cfg.scale, inner.cfg.quality);
+
+    // 优先尝试硬件编码；失败则软件编码（数据格式要求不同，要告诉采集线程）
+    let mut hw = match HwJpeg::new(FRAME_W as u32, FRAME_H as u32, quality) {
+        Ok(enc) => {
+            eprintln!(
+                "[vision] 预览编码：硬件 VENC（输入像素格式 {}，qfactor {}）",
+                enc.input_format(),
+                quality
+            );
+            inner.preview_format.store(PREVIEW_YUYV, Ordering::Relaxed);
+            Some(enc)
+        }
+        Err(e) => {
+            eprintln!("[vision] 硬件编码不可用（{e}）；改用纯 Rust 编码");
+            inner.preview_format.store(PREVIEW_RGB_PLANAR, Ordering::Relaxed);
+            None
+        }
+    };
+    inner.state.lock().unwrap().encode =
+        if hw.is_some() { "hw".into() } else { "sw".into() };
+
     let mut packed = Vec::new();
     let mut jpeg = Vec::new();
     while running.load(Ordering::Relaxed) {
@@ -691,15 +773,45 @@ fn encoder_loop(
             continue;
         };
         let t0 = Instant::now();
-        if let Err(e) = encode_jpeg(&packet.rgb, scale, quality, &mut packed, &mut jpeg) {
-            eprintln!("[vision] 预览编码失败：{e}");
-            continue;
-        }
+        let encoded: io::Result<Arc<[u8]>> = match &mut hw {
+            Some(enc) => enc.encode(&packet.data),
+            None => encode_jpeg(&packet.data, scale, quality, &mut packed, &mut jpeg)
+                .map(|()| Arc::from(jpeg.as_slice())),
+        };
+        let jpeg_bytes = match encoded {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                // 硬件中途失败：降级软件编码（下一帧起）
+                if hw.is_some() {
+                    eprintln!("[vision] 硬件编码失败（{e}）；降级纯 Rust 编码");
+                    hw = None;
+                    inner.preview_format.store(PREVIEW_RGB_PLANAR, Ordering::Relaxed);
+                    inner.state.lock().unwrap().encode = "sw".into();
+                } else {
+                    eprintln!("[vision] 预览编码失败：{e}");
+                }
+                continue;
+            }
+        };
         let encode_ms = elapsed_ms(t0);
         let seq = packet.snapshot.seq;
+        {
+            let mut state = inner.state.lock().unwrap();
+            state.preview_published += 1;
+            state.encode_ms_avg = if state.encode_ms_avg > 0.0 {
+                state.encode_ms_avg * 0.9 + encode_ms * 0.1
+            } else {
+                encode_ms
+            };
+            if state.preview_published % 100 == 0 {
+                let (avg, pubs) = (state.encode_ms_avg, state.preview_published);
+                drop(state);
+                eprintln!("[vision] 预览已发布 {pubs} 帧，平均编码 {avg:.1}ms");
+            }
+        }
         let frame = Arc::new(PreviewFrame {
             seq,
-            jpeg: Some(Arc::from(jpeg.as_slice())),
+            jpeg: Some(jpeg_bytes),
             vision: Some(packet.snapshot),
         });
         let now = Instant::now();
@@ -820,7 +932,7 @@ mod tests {
             seq: 7,
             at: Instant::now(),
             result,
-            rgb: None,
+            preview: None,
             timings: VisionTimings::default(),
         };
         let snap = snapshot(&step);

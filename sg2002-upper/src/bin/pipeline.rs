@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use sg2002_upper::control::{Action, Car, CarConfig, ControlConfig, ControlLoop, Observation};
 use sg2002_upper::stats::Stats;
-use sg2002_upper::vision::{Vision, VisionConfig};
+use sg2002_upper::vision::{PreviewCopy, Vision, VisionConfig};
 
 /// 板端模型路径（与 sg2002_inference 部署一致）。
 const MODEL_PATH: &str = "/akars_tennis/model/yolov8n_tennis_v3.cvimodel";
@@ -108,7 +108,7 @@ fn main() {
         let t_frame = Instant::now();
 
         // 采集 + 预处理 + 推理 + 位置分析（无预览编码）
-        let step = match vision.step(false) {
+        let step = match vision.step(PreviewCopy::None) {
             Ok(step) => step,
             Err(e) => panic!("采集失败: {e}"),
         };

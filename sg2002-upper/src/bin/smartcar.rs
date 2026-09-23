@@ -76,8 +76,8 @@ struct Cli {
     #[arg(long, value_parser = clap::value_parser!(u8).range(1..=8), default_value_t = 2)]
     scale: u8,
 
-    /// 预览帧率上限（编码线程节拍，也是网页推送上限）
-    #[arg(long, value_parser = fps, default_value_t = 8.0)]
+    /// 预览帧率上限（软上限：编码线程节拍，也是网页推送上限）
+    #[arg(long, value_parser = fps, default_value_t = 15.0)]
     video_fps: f32,
 
     /// 检测置信度阈值

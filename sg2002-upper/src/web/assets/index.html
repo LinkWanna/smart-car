@@ -382,7 +382,7 @@ function renderStatus(st) {
     $("h-model").textContent = vis.model_ok ? (vis.input || "就绪") : "不可用";
     $("h-vis").textContent =
       vis.fps.toFixed(1) + " fps · " + vis.infer_ms.toFixed(0) + " ms" +
-      (vis.encode_ms ? " · 编码 " + vis.encode_ms.toFixed(0) + " ms" : "");
+      (vis.encode_ms ? " · " + (vis.encode || "sw") + " " + vis.encode_ms.toFixed(0) + " ms" : "");
     $("h-dets").textContent =
       vis.dets + " 个" + (auto && st.auto && st.auto.action ? " · " + st.auto.action : "");
     const visErr = $("h-vis-error");

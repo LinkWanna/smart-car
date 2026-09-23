@@ -139,13 +139,20 @@ for bin in "${BINS[@]}"; do
     CHMOD_LIST="$CHMOD_LIST'$DEST/$bin' "
 done
 
-# 先搬到 DEST 再删临时目录：即使后续 chmod 失败也不留垃圾
+# 先搬到 DEST 再删临时目录：即使后续 chmod 失败也不留垃圾；
+# 顺带补厂商 MMF 库的符号链接（硬件 JPEG：libvenc 按名字依赖 libsys）
 ssh "${SSH_OPTS[@]}" "${TTY_ARGS[@]}" "$BOARD" "
     set -e
     mkdir -p '$DEST'
     $SUDO mv -f '$REMOTE_TMP'/* '$DEST'/
     rm -rf '$REMOTE_TMP'
     $SUDO chmod 755 $CHMOD_LIST
+    for lib in libsys.so libvenc.so; do
+        if [ -e \"/mnt/system/usr/lib/\$lib\" ] && [ ! -e \"/usr/lib/\$lib\" ]; then
+            $SUDO ln -sf \"/mnt/system/usr/lib/\$lib\" \"/usr/lib/\$lib\" \
+                && echo \"  已链接 \$lib → /usr/lib（硬件编码用）\"
+        fi
+    done
 "
 
 # --- 校验 -------------------------------------------------------------------

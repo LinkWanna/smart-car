@@ -9,6 +9,8 @@
 //! - 网页遥控：`web`（零依赖 HTTP/WebSocket、手动遥控控制律、MJPEG 预览、
 //!   手动/自动仲裁）、`preview`（预览与视觉之间的中性契约）。
 //! - 观测：`stats`（管线耗时统计）。
+//! - 硬件编码：`hwjpeg`（SG2002 VENC 硬件 JPEG；实现在 `csrc/hwjpeg.c`，
+//!   运行期 dlopen 厂商库，没有 SDK 时自动降级到软件编码）。
 //!
 //! 入口 bin：`smartcar`（整合：视觉 + 网页 + 手动/自动）、`webctl`（只遥控）、
 //! `pipeline`（只视觉）、`carctl`（下位机调试）。
@@ -18,6 +20,7 @@
 
 pub mod camera;
 pub mod control;
+pub mod hwjpeg;
 pub mod position;
 pub mod preprocess;
 pub mod preview;

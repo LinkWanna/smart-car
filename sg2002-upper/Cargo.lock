@@ -1199,6 +1199,7 @@ dependencies = [
 name = "sg2002-upper"
 version = "0.1.0"
 dependencies = [
+ "cc",
  "clap",
  "cviruntime-rs",
  "jpeg-decoder",

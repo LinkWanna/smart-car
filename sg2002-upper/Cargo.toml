@@ -40,3 +40,10 @@ codegen-units = 1
 [dev-dependencies]
 tungstenite = "0.30.0"
 jpeg-decoder = "0.3.2"
+
+[build-dependencies]
+cc = "1"
+
+[lints.rust]
+# build.rs 在找不到 cvi_mpi 头文件时会置 `no_hwjpeg`（硬件 JPEG 不参与编译）
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(no_hwjpeg)'] }

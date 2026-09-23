@@ -808,6 +808,12 @@ const _: () = {
     assert!(size_of::<vpss_chn_align_cfg>() == 12);
     assert!(size_of::<vpss_chn_rot_cfg>() == 12);
     assert!(
+        size_of::<MMF_CHN_S>() == 12
+            && offset_of!(MMF_CHN_S, enModId) == 0
+            && offset_of!(MMF_CHN_S, s32DevId) == 4
+            && offset_of!(MMF_CHN_S, s32ChnId) == 8
+    );
+    assert!(
         size_of::<vpss_grp_csc_cfg>() == 48
             && offset_of!(vpss_grp_csc_cfg, proc_amp) == 4
             && offset_of!(vpss_grp_csc_cfg, coef) == 20
@@ -836,6 +842,35 @@ const _: () = {
 };
 
 /* ------------------------------------------------------------------ */
+/* 通道绑定（CVI_SYS_Bind）                                            */
+/* ------------------------------------------------------------------ */
+
+/// `MOD_ID_E` 里用到的几个（linux/cvi_common.h）。
+pub type MOD_ID_E = c_int;
+pub const CVI_ID_SYS: MOD_ID_E = 2;
+pub const CVI_ID_VDEC: MOD_ID_E = 5;
+pub const CVI_ID_VPSS: MOD_ID_E = 6;
+pub const CVI_ID_VENC: MOD_ID_E = 7;
+
+/// `MMF_CHN_S`：一个模块的通道标识（bind 的源/目的）。
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MMF_CHN_S {
+    pub enModId: MOD_ID_E,
+    pub s32DevId: CVI_S32,
+    pub s32ChnId: CVI_S32,
+}
+
+/// 构造 [`MMF_CHN_S`] 的 const 辅助函数。
+pub const fn mmf_chn(mod_id: MOD_ID_E, dev: CVI_S32, chn: CVI_S32) -> MMF_CHN_S {
+    MMF_CHN_S {
+        enModId: mod_id,
+        s32DevId: dev,
+        s32ChnId: chn,
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /* 函数                                                                */
 /* ------------------------------------------------------------------ */
 
@@ -849,6 +884,12 @@ unsafe extern "C" {
     pub fn CVI_SYS_GetVPSSModeEx(pstVPSSMode: *mut VPSS_MODE_S) -> CVI_S32;
     pub fn CVI_SYS_SetVIVPSSMode(pstVIVPSSMode: *const VI_VPSS_MODE_S) -> CVI_S32;
     pub fn CVI_SYS_GetVIVPSSMode(pstVIVPSSMode: *mut VI_VPSS_MODE_S) -> CVI_S32;
+    pub fn CVI_SYS_Bind(pstSrcChn: *const MMF_CHN_S, pstDestChn: *const MMF_CHN_S) -> CVI_S32;
+    pub fn CVI_SYS_UnBind(pstSrcChn: *const MMF_CHN_S, pstDestChn: *const MMF_CHN_S) -> CVI_S32;
+    pub fn CVI_SYS_GetBindbyDest(
+        pstDestChn: *const MMF_CHN_S,
+        pstSrcChn: *mut MMF_CHN_S,
+    ) -> CVI_S32;
     pub fn CVI_SYS_Mmap(u64PhyAddr: CVI_U64, u32Size: CVI_U32) -> *mut CVI_VOID;
     pub fn CVI_SYS_MmapCache(u64PhyAddr: CVI_U64, u32Size: CVI_U32) -> *mut CVI_VOID;
     pub fn CVI_SYS_Munmap(pVirAddr: *mut CVI_VOID, u32Size: CVI_U32) -> CVI_S32;

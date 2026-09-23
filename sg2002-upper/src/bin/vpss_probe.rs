@@ -95,6 +95,11 @@ struct Cli {
     #[arg(long, default_value_t = 1)]
     chn1_scale: u32,
 
+    /// 跑 `CVI_SYS_Bind` 把 VPSS chn1 直连到 VENC（B 方案）：预览帧不落用户态，
+    /// 只 `GetStream`；chn1 的 depth 自动设 0
+    #[arg(long)]
+    bind: bool,
+
     /// 模型路径：额外做 TPU 零拷贝对比
     #[arg(long)]
     model: Option<String>,
@@ -178,7 +183,8 @@ fn run(cli: &Cli) {
                 FRAME_H as u32 / cli.chn1_scale.max(1),
                 ffi::PIXEL_FORMAT_NV12,
             )
-            .with_depth(cli.depth),
+            // bind 模式下帧直接进 VENC，不落用户态队列
+            .with_depth(if cli.bind { 0 } else { cli.depth }),
         ],
     };
     if cli.step == "twice" {
@@ -210,8 +216,9 @@ fn run(cli: &Cli) {
         sys.create_vpss(&cfg),
     );
     say(&format!(
-        "  建组耗时 {:.1}ms",
-        t0.elapsed().as_secs_f64() * 1000.0
+        "  建组耗时 {:.1}ms（grp={}）",
+        t0.elapsed().as_secs_f64() * 1000.0,
+        vpss.group()
     ));
 
     if cli.align != 0 {
@@ -258,6 +265,43 @@ fn run(cli: &Cli) {
     must("Frame::flush", frame.flush());
     say(&format!("  写 VB + flush：{:.2}ms", ms_since(t0)));
 
+    /* 4b) 编码器 +（可选）bind：必须在送帧之前建立。
+     *     bind 的顺序是「建通道 → bind → StartRecvFrame」（SDK sample 同款），
+     *     否则绑定后 GetStream 报 EN_ERR_BUSY。 */
+    let enc = if cli.venc || cli.bind {
+        if cli.bind {
+            let enc = must(
+                "CVI_VENC_CreateChn(PT_JPEG, NV12, 先不收帧)",
+                sys.create_encoder_pending(
+                    0,
+                    &EncoderConfig::new(FRAME_W as u32, FRAME_H as u32, ffi::PIXEL_FORMAT_NV12)
+                        .with_quality(u32::from(cli.quality)),
+                ),
+            );
+            must("CVI_SYS_Bind(VPSS chn1 → VENC 0)", vpss.bind_chn_to_venc(1, 0));
+            match cvimpi_rs::vpss::venc_bind_source(0) {
+                Some(src) => say(&format!(
+                    "  查回绑定：src mod={} dev={} chn={}",
+                    src.enModId, src.s32DevId, src.s32ChnId
+                )),
+                None => say("  ⚠ 查不回绑定（GetBindbyDest 没返回）"),
+            }
+            must("CVI_VENC_StartRecvFrame", enc.start_recv_frame(-1));
+            Some(enc)
+        } else {
+            Some(must(
+                "CVI_VENC_CreateChn(PT_JPEG, NV12)",
+                sys.create_encoder(
+                    0,
+                    &EncoderConfig::new(FRAME_W as u32, FRAME_H as u32, ffi::PIXEL_FORMAT_NV12)
+                        .with_quality(u32::from(cli.quality)),
+                ),
+            ))
+        }
+    } else {
+        None
+    };
+
     let t0 = Instant::now();
     must(
         "CVI_VPSS_SendFrame",
@@ -272,13 +316,16 @@ fn run(cli: &Cli) {
     dump_frame("chn0", &rgb);
     let rgb_tight = must("copy_tight(chn0)", rgb.copy_tight());
 
-    let t0 = Instant::now();
-    let mut nv12 = must("GetChnFrame(chn1)", vpss.get_chn_frame(1, cli.timeout));
-    say(&format!("  GetChnFrame(chn1)：{:.2}ms", ms_since(t0)));
-    dump_frame("chn1", &nv12);
-    let (nw, nh) = (nv12.width(), nv12.height());
-    let nv12_tight = must("copy_tight(chn1)", nv12.copy_tight());
-    nv12_stats(&nv12_tight, nw, nh);
+    let mut nv12 = if cli.bind {
+        say("  bind 模式：chn1 直接进 VENC，不落用户态（跳过 GetChnFrame）");
+        None
+    } else {
+        let t0 = Instant::now();
+        let f = must("GetChnFrame(chn1)", vpss.get_chn_frame(1, cli.timeout));
+        say(&format!("  GetChnFrame(chn1)：{:.2}ms", ms_since(t0)));
+        dump_frame("chn1", &f);
+        Some(f)
+    };
 
     /* 6) 与 CPU 参考对比 + 落盘 */
     let mut reference = vec![0u8; FRAME_W * FRAME_H * 3];
@@ -287,37 +334,40 @@ fn run(cli: &Cli) {
 
     let out = cli.out_dir.trim_end_matches('/');
     write_file(&format!("{out}/vpss_chn0_rgb.planar"), &rgb_tight);
-    write_file(&format!("{out}/vpss_chn1_nv12.yuv"), &nv12_tight);
     write_file(&format!("{out}/ref_cpu_rgb.planar"), &reference);
+    if let Some(f) = nv12.as_mut() {
+        let (nw, nh) = (f.width(), f.height());
+        let nv12_tight = must("copy_tight(chn1)", f.copy_tight());
+        nv12_stats(&nv12_tight, nw, nh);
+        write_file(&format!("{out}/vpss_chn1_nv12.yuv"), &nv12_tight);
+    }
 
-    /* 7) NV12 → VENC(PT_JPEG) */
-    let enc = if cli.venc {
-        Some(must(
-            "CVI_VENC_CreateChn(PT_JPEG, NV12)",
-            sys.create_encoder(
-                0,
-                &EncoderConfig::new(FRAME_W as u32, FRAME_H as u32, ffi::PIXEL_FORMAT_NV12)
-                    .with_quality(u32::from(cli.quality)),
-            ),
-        ))
-    } else {
-        None
-    };
+    /* 7) JPEG：bind 模式只 GetStream；否则用户态取帧 + SendFrame */
     if let Some(enc) = &enc {
         let t0 = Instant::now();
-        let jpeg = must(
-            "VENC SendFrame+GetStream(VPSS NV12)",
-            enc.encode_info(nv12.info(), cli.timeout),
-        );
+        let (jpeg, meta) = if cli.bind {
+            must("VENC GetStream(bind)", enc.get_stream_meta(cli.timeout))
+        } else {
+            let f = nv12.as_ref().expect("非 bind 模式应有 chn1 帧");
+            let jpeg = must(
+                "VENC SendFrame+GetStream(VPSS NV12)",
+                enc.encode_info(f.info(), cli.timeout),
+            );
+            let meta = cvimpi_rs::encoder::StreamMeta::default();
+            (jpeg, meta)
+        };
         say(&format!(
-            "  JPEG：{} 字节，{:.2}ms，SOI={} EOI={}",
+            "  JPEG：{} 字节，{:.2}ms，SOI={} EOI={}，seq={} pts={}",
             jpeg.len(),
             ms_since(t0),
             jpeg.starts_with(&[0xFF, 0xD8]),
-            jpeg.ends_with(&[0xFF, 0xD9])
+            jpeg.ends_with(&[0xFF, 0xD9]),
+            meta.seq,
+            meta.pts
         ));
         write_file(&format!("{out}/vpss_chn1.jpg"), &jpeg);
     }
+    drop(nv12);
 
     /* 8) TPU：零拷贝 vs memcpy（同一帧），顺带比较 VPSS/CPU 两种 RGB */
     if let Some(model_path) = &cli.model {
@@ -325,8 +375,18 @@ fn run(cli: &Cli) {
     }
 
     /* 9) 多帧吞吐（可选） */
+    let mut frames_ok = true;
     if cli.frames > 1 {
-        run_frames(cli, &sys, &vpss, &mut frame, &yuyv, enc.as_ref());
+        frames_ok = run_frames(cli, &sys, &vpss, &mut frame, &yuyv, enc.as_ref());
+    }
+    if cli.bind {
+        must(
+            "CVI_SYS_UnBind(VPSS chn1 → VENC 0)",
+            vpss.unbind_chn_from_venc(1, 0),
+        );
+    }
+    if !frames_ok {
+        fail("bind 链路", "GetStream 在 bind 模式下失败（详见上面日志）");
     }
     say("== 全部完成 ==");
 }
@@ -339,7 +399,7 @@ fn run_frames(
     frame: &mut cvimpi_rs::encoder::Frame<'_>,
     yuyv: &[u8],
     enc: Option<&cvimpi_rs::encoder::Encoder<'_>>,
-) {
+) -> bool {
     let n = cli.frames;
     say(&format!("== 多帧吞吐：{n} 帧 =="));
     // `--model` 给了就每帧跑一次零拷贝推理（应用的真实形态：模型 + 预览）
@@ -353,6 +413,8 @@ fn run_frames(
     });
     let (mut t_write, mut t_send, mut t_get0, mut t_get1, mut t_venc) = (0.0, 0.0, 0.0, 0.0, 0.0);
     let mut t_model = 0.0;
+    let mut pts_check = (0u64, 0u64); // (输入 PTS, 码流 PTS) 抽样对比
+    let mut bind_failed = false;
     let t_all = Instant::now();
     for i in 0..n {
         // 每帧都重写输入（模拟相机 memcpy），并做一点变化避免内容完全相同
@@ -365,6 +427,9 @@ fn run_frames(
         must("write_tight", frame.write_tight(&buf));
         must("flush", frame.flush());
         t_write += ms_since(t0);
+
+        // bind 链路上用户态看不到输入帧，给帧打 PTS 便于和码流对齐
+        frame.set_pts(u64::from(i));
 
         let t0 = Instant::now();
         must("SendFrame", vpss.send_frame(frame.info(), cli.send_timeout));
@@ -382,15 +447,44 @@ fn run_frames(
         }
         must("ReleaseChnFrame(chn0)", f0.release());
 
-        let t0 = Instant::now();
-        let f1 = must("GetChnFrame(chn1)", vpss.get_chn_frame(1, cli.timeout));
-        t_get1 += ms_since(t0);
-        if let Some(enc) = enc {
+        if cli.bind {
+            // bind 模式：每帧都必须把码流取走，否则 VENC 队列会顶住整条链路。
+            // 失败不直接 exit：走完收尾（unbind/销毁）再退出，免得残留 bind 污染下一次。
             let t0 = Instant::now();
-            must("VENC encode", enc.encode_info(f1.info(), cli.timeout));
-            t_venc += ms_since(t0);
+            let enc = enc.expect("bind 需要 --venc");
+            match enc.get_stream_meta(cli.timeout) {
+                Ok((jpeg, meta)) => {
+                    t_venc += ms_since(t0);
+                    if i < 3 || i + 1 == n {
+                        say(&format!(
+                            "  帧 {i}: {} 字节 GetStream {:.2}ms seq={} pts={}（输入 pts={i}）",
+                            jpeg.len(),
+                            ms_since(t0),
+                            meta.seq,
+                            meta.pts
+                        ));
+                    }
+                    if i + 1 == n {
+                        pts_check = (u64::from(i), meta.pts);
+                    }
+                }
+                Err(e) => {
+                    t_venc += ms_since(t0);
+                    say(&format!("  ⚠ 帧 {i} GetStream 失败：{e}"));
+                    bind_failed = true;
+                }
+            }
+        } else {
+            let t0 = Instant::now();
+            let f1 = must("GetChnFrame(chn1)", vpss.get_chn_frame(1, cli.timeout));
+            t_get1 += ms_since(t0);
+            if let Some(enc) = enc {
+                let t0 = Instant::now();
+                must("VENC encode", enc.encode_info(f1.info(), cli.timeout));
+                t_venc += ms_since(t0);
+            }
+            must("ReleaseChnFrame(chn1)", f1.release());
         }
-        must("ReleaseChnFrame(chn1)", f1.release());
     }
     let total = ms_since(t_all);
     let per = |v: f64| v / f64::from(n);
@@ -403,10 +497,17 @@ fn run_frames(
         per(t_get1),
         per(t_venc)
     ));
+    if cli.bind {
+        let (in_pts, out_pts) = pts_check;
+        say(&format!(
+            "  末帧 PTS 对比：输入 {in_pts} / 码流 {out_pts}（相等 = 驱动透传，可按 PTS 对帧）"
+        ));
+    }
     say(&format!(
         "  总计 {total:.1}ms / {n} 帧 = {:.1} fps（含取帧后的业务处理）",
         f64::from(n) / (total / 1000.0)
     ));
+    !bind_failed
 }
 
 /// 用同一帧比较「memcpy 进张量」与「`SetTensorPhysicalAddr` 零拷贝」的输出，

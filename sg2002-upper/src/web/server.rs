@@ -34,6 +34,10 @@ use crate::preview::{PreviewSource, VisionSnapshot};
 
 /// 观测过期阈值：超过这个时间没有新帧，自动模式按“看不到”处理（滑行）。
 const AUTO_STALE: Duration = Duration::from_millis(500);
+/// WebSocket 每轮主动推送的时长（略小于页面 100ms 的按键心跳间隔）。
+const PUSH_WINDOW: Duration = Duration::from_millis(90);
+/// 推送窗口内的检查粒度。
+const PUSH_TICK: Duration = Duration::from_millis(5);
 
 /// 输入来源：手动遥控（网页按键）或自动视觉（追踪目标）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,7 +86,7 @@ pub struct WebConfig {
     pub port: u16,
     /// 状态 JSON 推送频率（Hz）。
     pub status_hz: f32,
-    /// JPEG 预览帧率上限（Hz）。
+    /// JPEG 预览帧率上限（Hz）；`0` = 不锁帧（有新帧就推）。
     pub video_fps: f32,
 }
 
@@ -92,7 +96,7 @@ impl Default for WebConfig {
             bind: "0.0.0.0".to_string(),
             port: 80,
             status_hz: 10.0,
-            video_fps: 10.0,
+            video_fps: 0.0,
         }
     }
 }
@@ -542,14 +546,23 @@ fn vision_frame_value(seq: u64, snap: &VisionSnapshot) -> Value {
     })
 }
 
-/// WebSocket 会话：阻塞读客户端消息，收到消息后按节拍推送状态与预览帧。
+/// WebSocket 会话：阻塞读客户端消息，期间按节拍推送状态与预览帧。
+///
+/// 注意推送**不能只依赖客户端心跳**：页面的按键心跳是 100ms 一次，如果每收到
+/// 一条消息才推一帧，预览就被锁在 10fps。所以每轮先跑一个 [`PUSH_WINDOW`]
+/// 长的推送窗口（每 [`PUSH_TICK`] 检查一次有没有新帧），再阻塞等消息。
 fn websocket_session(mut socket: Websocket, shared: Arc<Shared>) {
     let id = shared.next_client_id.fetch_add(1, Ordering::Relaxed) + 1;
     shared.clients.fetch_add(1, Ordering::Relaxed);
     info!("WebSocket #{id} 已连接");
 
     let status_period = Duration::from_secs_f32(1.0 / shared.cfg.status_hz.max(0.5));
-    let video_period = Duration::from_secs_f32(1.0 / shared.cfg.video_fps.max(0.5));
+    // `video_fps = 0` → 不锁帧：有新帧就推
+    let video_period = if shared.cfg.video_fps > 0.0 {
+        Duration::from_secs_f32(1.0 / shared.cfg.video_fps)
+    } else {
+        Duration::ZERO
+    };
     let mut last_status = Instant::now()
         .checked_sub(status_period)
         .unwrap_or_else(Instant::now);
@@ -560,25 +573,33 @@ fn websocket_session(mut socket: Websocket, shared: Arc<Shared>) {
     let mut alive = send_json(&mut socket, &shared.hello_value());
 
     while alive && shared.running.load(Ordering::Relaxed) {
-        let now = Instant::now();
-        if now.saturating_duration_since(last_status) >= status_period {
-            alive = send_json(&mut socket, &shared.status_value());
-            last_status = now;
-        }
-        if alive && now.saturating_duration_since(last_video) >= video_period {
-            last_video = now;
-            if let Some(preview) = &shared.preview
-                && let Some(frame) = preview.frame_if_new(video_seq)
-            {
-                video_seq = frame.seq;
-                if let Some(jpeg) = &frame.jpeg {
-                    alive = socket.send_binary(jpeg).is_ok();
-                }
-                // 紧跟同帧的检测结果：页面据此画覆盖框（与画面严格对齐）
-                if alive && let Some(snap) = &frame.vision {
-                    alive = send_json(&mut socket, &vision_frame_value(frame.seq, snap));
+        // 推送窗口：不等客户端心跳，把状态/新帧按节拍推出去。
+        let until = Instant::now() + PUSH_WINDOW;
+        while alive && Instant::now() < until {
+            let now = Instant::now();
+            if now.saturating_duration_since(last_status) >= status_period {
+                alive = send_json(&mut socket, &shared.status_value());
+                last_status = now;
+            }
+            if alive && now.saturating_duration_since(last_video) >= video_period {
+                last_video = now;
+                if let Some(preview) = &shared.preview
+                    && let Some(frame) = preview.frame_if_new(video_seq)
+                {
+                    video_seq = frame.seq;
+                    if let Some(jpeg) = &frame.jpeg {
+                        alive = socket.send_binary(jpeg).is_ok();
+                    }
+                    // 紧跟同帧的检测结果：页面据此画覆盖框（与画面严格对齐）
+                    if alive && let Some(snap) = &frame.vision {
+                        alive = send_json(&mut socket, &vision_frame_value(frame.seq, snap));
+                    }
                 }
             }
+            if !alive {
+                break;
+            }
+            thread::sleep(PUSH_TICK);
         }
         if !alive {
             break;

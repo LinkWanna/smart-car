@@ -132,6 +132,21 @@ let jpeg_input = vpss.get_chn_frame(1, 1000)?;
   第二次用同一个组号 `CreateGrp` 稳定返回 `-ENOSYS`（Function not implemented），
   换一个没用过的组号立刻正常。所以 `grp` 用 `VPSS_GRP_AUTO`（进程级计数器往后找）；
   16 个组用完后 VPSS 不可用（重启板子恢复），调用方要能降级到 CPU 路径。
+* **预览交接可以走内核 bind**（省掉用户态取帧/送帧，编码与 TPU 并行）：
+  ```rust
+  let enc = sys.create_encoder_pending(0, &cfg)?;   // 先只建通道，不收帧
+  vpss.bind_chn_to_venc(1, enc.channel())?;         // 再 bind
+  enc.start_recv_frame(-1)?;                        // 最后 StartRecvFrame
+  ```
+  顺序**不能反**：先 `StartRecvFrame` 再 bind，`GetStream` 会一直报
+  `EN_ERR_BUSY`（`0xc0078012`）。绑定后 chn1 的 `u32Depth` 设 0；每一帧都要
+  `GetStream` 取走码流，否则 VENC 队列会顶住整条链路。退出前记得 `UnBind`。
+* **PTS 透传**：`Frame::set_pts()` 写进输入帧的 PTS 会原样出现在
+  `Encoder::get_stream_meta()` 的 `StreamMeta.pts` 里（真机实测逐帧相等），
+  所以 bind 链路上可以用 PTS 把码流和采集帧精确对上。
+* **残留 bind 很坑**：进程被 `kill -9` 时 bind 节点留在内核里，之后新的
+  `CVI_SYS_Bind` 会返回成功但数据不通（`GetStream` 一直 BUSY、VPSS 整组堵死）。
+  绑定前先 `vpss::clear_venc_bind(0)` 清一次残留。
 * **CSC 量程**：驱动默认矩阵是 full range（`R = Y + 1.402(V-128)`），而 UVC 相机
   出的是 BT.601 limited（Y 16~235），直接用画面偏灰、模型置信度下降（实测
   0.61 vs 0.71）。`Vpss::set_yuv601_limited_to_full()` 换上 limited→full 的矩阵后，

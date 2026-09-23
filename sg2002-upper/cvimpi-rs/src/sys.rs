@@ -231,6 +231,16 @@ impl Sys {
         Encoder::create(self, chn, cfg)
     }
 
+    /// 同 [`Sys::create_encoder`]，但**不**开始收帧：给 `VPSS→VENC` bind 场景用，
+    /// 顺序必须是「建通道 → bind → [`Encoder::start_recv_frame`]」。
+    pub fn create_encoder_pending<'a>(
+        &'a self,
+        chn: ffi::VENC_CHN,
+        cfg: &EncoderConfig,
+    ) -> Result<Encoder<'a>> {
+        Encoder::create_pending(self, chn, cfg)
+    }
+
     /// `CVI_VDEC_CreateChn` + `CVI_VDEC_SetChnParam` + `CVI_VDEC_StartRecvStream`。
     pub fn create_decoder<'a>(
         &'a self,

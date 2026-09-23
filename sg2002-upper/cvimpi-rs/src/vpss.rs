@@ -270,7 +270,12 @@ impl<'a> Vpss<'a> {
             stVideoFrame: *frame,
             s32MilliSec: timeout_ms,
         };
-        ioctl_write(self.fd, ffi::CVI_VPSS_SEND_FRAME, &cfg, "CVI_VPSS_SendFrame")
+        ioctl_write(
+            self.fd,
+            ffi::CVI_VPSS_SEND_FRAME,
+            &cfg,
+            "CVI_VPSS_SendFrame",
+        )
     }
 
     /// 取一帧通道输出（`CVI_VPSS_GetChnFrame`）；返回的 [`VpssFrame`]
@@ -336,20 +341,41 @@ impl<'a> Vpss<'a> {
         )
     }
 
+    /// 把本组的一个通道绑到 VENC 通道（内核内交接）：
+    /// VPSS 的输出帧直接进编码器，用户态不再需要 `GetChnFrame`/`SendFrame`。
+    ///
+    /// 对应 SDK sample 的 `SAMPLE_COMM_VPSS_Bind_VENC`（VENC 的 `DevId` 固定为 0）。
+    /// 绑定后该通道的 `u32Depth` 建议设 0（帧不落用户态队列）；
+    /// 不管 `depth` 多少，**每一帧都要把码流取走**（`GetStream`），否则
+    /// VENC 的码流队列会顶住整条链路。
+    pub fn bind_chn_to_venc(&self, chn: ffi::VPSS_CHN, venc_chn: ffi::VENC_CHN) -> Result<()> {
+        let src = ffi::mmf_chn(ffi::CVI_ID_VPSS, self.grp, chn);
+        let dst = ffi::mmf_chn(ffi::CVI_ID_VENC, 0, venc_chn);
+        check(
+            unsafe { ffi::CVI_SYS_Bind(&src, &dst) },
+            "CVI_SYS_Bind(VPSS→VENC)",
+        )
+    }
+
+    /// 解除 [`Vpss::bind_chn_to_venc`] 建立的绑定（退出前应当调用）。
+    pub fn unbind_chn_from_venc(&self, chn: ffi::VPSS_CHN, venc_chn: ffi::VENC_CHN) -> Result<()> {
+        let src = ffi::mmf_chn(ffi::CVI_ID_VPSS, self.grp, chn);
+        let dst = ffi::mmf_chn(ffi::CVI_ID_VENC, 0, venc_chn);
+        check(
+            unsafe { ffi::CVI_SYS_UnBind(&src, &dst) },
+            "CVI_SYS_UnBind(VPSS→VENC)",
+        )
+    }
+
     /// 直接写组的 CSC 矩阵（内部 ioctl `CVI_VPSS_SET_GRP_CSC_CFG`，
     /// 官方的 `CVI_VPSS_SetGrpProcAmp` 底层走的就是它）。
     ///
     /// 硬件公式：`out_i = Σ_j coef[i][j] * (in_j - sub[j]) + add[i]`，
     /// 其中 `in = Y/U/V`、`out = R/G/B`。实测驱动默认给的是
     /// **full range** 矩阵（`R = Y + 1.402(V-128)`），而 UVC 相机出的是
-    /// BT.601 limited（Y 16~235），直接用会让画面偏灰、模型置信度下降 —— 
+    /// BT.601 limited（Y 16~235），直接用会让画面偏灰、模型置信度下降 ——
     /// 用 [`Vpss::set_yuv601_limited_to_full`] 换成 limited→full 的矩阵。
-    pub fn set_grp_csc(
-        &self,
-        coef: [[f32; 3]; 3],
-        sub: [u8; 3],
-        add: [u8; 3],
-    ) -> Result<()> {
+    pub fn set_grp_csc(&self, coef: [[f32; 3]; 3], sub: [u8; 3], add: [u8; 3]) -> Result<()> {
         let cfg = ffi::vpss_grp_csc_cfg {
             VpssGrp: self.grp,
             proc_amp: [50, 50, 50, 50], // 与 `_vpss_proamp_2_csc` 的基准一致
@@ -382,6 +408,31 @@ impl<'a> Vpss<'a> {
             [0, 0, 0],
         )
     }
+}
+
+/// 查询某个 VENC 通道当前绑定的源（诊断用；没有绑定时返回 `None`）。
+pub fn venc_bind_source(venc_chn: ffi::VENC_CHN) -> Option<ffi::MMF_CHN_S> {
+    let dst = ffi::mmf_chn(ffi::CVI_ID_VENC, 0, venc_chn);
+    let mut src = ffi::mmf_chn(ffi::CVI_ID_VPSS, -1, -1);
+    let ret = unsafe { ffi::CVI_SYS_GetBindbyDest(&dst, &mut src) };
+    (ret == ffi::CVI_SUCCESS).then_some(src)
+}
+
+/// 清掉 VENC 通道上可能残留的绑定（上次进程崩溃 / `kill -9` 留下的 bind 节点）。
+///
+/// 残留节点很坑：新的 `CVI_SYS_Bind` 会返回成功，但数据不通 —— `GetStream` 一直报
+/// `EN_ERR_BUSY`，VPSS 的 chn1 输出被堵死，最后整组（包括 chn0）都停止出帧。
+/// 所以绑定前先查一次，有残留就先解绑。返回 `true` 表示清掉了残留。
+pub fn clear_venc_bind(venc_chn: ffi::VENC_CHN) -> Result<bool> {
+    let Some(src) = venc_bind_source(venc_chn) else {
+        return Ok(false);
+    };
+    let dst = ffi::mmf_chn(ffi::CVI_ID_VENC, 0, venc_chn);
+    check(
+        unsafe { ffi::CVI_SYS_UnBind(&src, &dst) },
+        "CVI_SYS_UnBind(残留绑定)",
+    )?;
+    Ok(true)
 }
 
 /// 浮点系数 → 硬件的 13 位有符号定点（10 位小数，负数用 `BIT(13)` 标记）。

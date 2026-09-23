@@ -200,6 +200,12 @@ impl<'a> Frame<'a> {
         &self.info
     }
 
+    /// 设置帧的 PTS。某些链路（VPSS→VENC bind）会把它透传进码流，
+    /// 便于把编码结果和采集帧对齐（见 `Encoder::get_stream_meta`）。
+    pub fn set_pts(&mut self, pts: u64) {
+        self.info.stVFrame.u64PTS = pts;
+    }
+
     pub fn layout(&self) -> &FrameLayout {
         &self.layout
     }
@@ -335,9 +341,33 @@ pub struct Encoder<'a> {
     _session: SessionRef<'a>,
 }
 
+/// `CVI_VENC_GetStream` 的元信息（诊断 / 对帧用）。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StreamMeta {
+    /// VENC 内部的编码序号（每编一帧 +1）。
+    pub seq: u32,
+    /// 第一个 pack 的 PTS（bind 链路上等于源帧的 PTS，如果驱动透传）。
+    pub pts: u64,
+}
+
 impl<'a> Encoder<'a> {
     /// 创建通道、设置 JPEG 质量并开始接收帧。
+    ///
+    /// bind 场景（VPSS→VENC）请用 [`Sys::create_encoder_pending`] +
+    /// [`Encoder::start_recv_frame`]：SDK sample 要求**先 bind 再开始收帧**，
+    /// 顺序反了绑定后 `GetStream` 会报 `EN_ERR_BUSY`。
     pub(crate) fn create(
+        _sys: &'a Sys,
+        chn: ffi::VENC_CHN,
+        cfg: &EncoderConfig,
+    ) -> Result<Encoder<'a>> {
+        let enc = Self::create_pending(_sys, chn, cfg)?;
+        enc.start_recv_frame(cfg.recv_pic_num)?;
+        Ok(enc)
+    }
+
+    /// 只创建通道并设置 JPEG 质量，**不**开始收帧（见 [`Encoder::start_recv_frame`]）。
+    pub(crate) fn create_pending(
         _sys: &'a Sys,
         chn: ffi::VENC_CHN,
         cfg: &EncoderConfig,
@@ -367,15 +397,18 @@ impl<'a> Encoder<'a> {
         if let Some(q) = cfg.quality {
             enc.set_quality(q)?;
         }
+        Ok(enc)
+    }
 
+    /// 开始接收帧（`CVI_VENC_StartRecvFrame`）。`-1` 表示不限帧数。
+    pub fn start_recv_frame(&self, recv_pic_num: i32) -> Result<()> {
         let recv = ffi::VENC_RECV_PIC_PARAM_S {
-            s32RecvPicNum: cfg.recv_pic_num,
+            s32RecvPicNum: recv_pic_num,
         };
         check(
-            unsafe { ffi::CVI_VENC_StartRecvFrame(chn, &recv) },
+            unsafe { ffi::CVI_VENC_StartRecvFrame(self.chn, &recv) },
             "CVI_VENC_StartRecvFrame",
-        )?;
-        Ok(enc)
+        )
     }
 
     pub fn channel(&self) -> ffi::VENC_CHN {
@@ -443,6 +476,12 @@ impl<'a> Encoder<'a> {
     /// 取出一帧编码后的 JPEG 码流（`CVI_VENC_GetStream` + `CVI_VENC_ReleaseStream`）。
     /// 每次调用消费一帧已提交的输入。
     pub fn get_stream(&self, timeout_ms: ffi::CVI_S32) -> Result<Vec<u8>> {
+        self.get_stream_meta(timeout_ms).map(|(jpeg, _)| jpeg)
+    }
+
+    /// 同 [`Encoder::get_stream`]，但额外返回码流元信息（VENC 序号 + PTS），
+    /// 用于把编码结果和输入帧对齐（bind 链路上用户态看不到输入帧）。
+    pub fn get_stream_meta(&self, timeout_ms: ffi::CVI_S32) -> Result<(Vec<u8>, StreamMeta)> {
         let mut packs: [ffi::VENC_PACK_S; MAX_STREAM_PACKS] = unsafe { mem::zeroed() };
         let mut stream: ffi::VENC_STREAM_S = unsafe { mem::zeroed() };
         stream.pstPack = packs.as_mut_ptr();
@@ -453,12 +492,19 @@ impl<'a> Encoder<'a> {
         )?;
 
         let mut out = Vec::new();
+        let mut meta = StreamMeta {
+            seq: stream.u32Seq,
+            pts: 0,
+        };
         if !stream.pstPack.is_null() {
             // SAFETY: 中间件已把 `pstPack`（指向上面的 `packs`）填成
             // `u32PackCount` 个有效的 `VENC_PACK_S`，这些数据归码流缓冲所有。
             unsafe {
                 for i in 0..stream.u32PackCount.min(MAX_STREAM_PACKS as u32) as usize {
                     let pack = &*stream.pstPack.add(i);
+                    if i == 0 {
+                        meta.pts = pack.u64PTS;
+                    }
                     if pack.pu8Addr.is_null() || pack.u32Len == 0 {
                         continue;
                     }
@@ -474,7 +520,7 @@ impl<'a> Encoder<'a> {
             unsafe { ffi::CVI_VENC_ReleaseStream(self.chn, &mut stream) },
             "CVI_VENC_ReleaseStream",
         )?;
-        Ok(out)
+        Ok((out, meta))
     }
 
     /// `send_frame` + `get_stream`。

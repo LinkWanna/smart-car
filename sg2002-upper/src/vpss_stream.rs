@@ -21,6 +21,7 @@
 //!   的 NCHW 布局，可以 `Model::forward_physical` 零拷贝；
 //! - 组号用一个少一个（驱动限制），所以 `VpssConfig::grp` 用 `VPSS_GRP_AUTO`。
 
+use std::collections::VecDeque;
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -46,11 +47,29 @@ use crate::vision::{
 };
 
 /// 预览队列深度（chn1 用户态取帧队列）。
+///
+/// bind 路由下这个队列没人取（帧直接进 VENC），只会挂住一个 VB 块；
+/// 保留 depth=1 是为了 bind 失败/降级时还能走用户态取帧。
 const PREVIEW_DEPTH: u32 = 1;
-/// `GetChnFrame` 超时（ms）。
+/// `GetChnFrame` / `GetStream` 超时（ms）。
 const GET_FRAME_TIMEOUT_MS: i32 = 1000;
 /// 采集失败后的退避。
 const RETRY_BACKOFF: Duration = Duration::from_millis(200);
+/// bind 路由连续失败多少次后降级到用户态取帧。
+const BIND_ERROR_LIMIT: u32 = 5;
+/// bind 路由保留多少个待匹配快照（按 PTS 对帧）。
+const SNAPSHOT_QUEUE: usize = 4;
+
+/// 预览通道的交接方式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreviewRoute {
+    /// VPSS chn1 直连 VENC（`CVI_SYS_Bind`）：内核内交接，用户态只 `GetStream`，
+    /// 编码与 TPU 天然并行；用帧 PTS 精确对帧。
+    Bind,
+    /// 用户态 `GetChnFrame` + `SendFrame`，`GetStream` 延迟到下一轮
+    /// （编码同样与 TPU 重叠，靠"一送一取"的顺序精确对帧）。
+    User,
+}
 
 /// VPSS 视觉管线（实现 [`PreviewSource`]）。
 pub struct VpssStream {
@@ -66,11 +85,9 @@ impl VpssStream {
         let inner = Arc::new(StreamInner::new(cfg.clone()));
         let pipeline = VpssPipeline::new(cfg.clone())?;
         info!(
-            "视觉：VPSS 管线（{}，{}，chn0 RGB 平面零拷贝 + chn1 NV12 硬编 → {}x{} 预览）",
+            "视觉：VPSS 管线（{}，{}，chn0 RGB 平面零拷贝 + chn1 NV12 全尺寸硬编预览）",
             pipeline.camera.device(),
             pipeline.camera.pixel_format(),
-            config_scale_w(&cfg),
-            config_scale_h(&cfg),
         );
         let thread_inner = Arc::clone(&inner);
         let thread_running = Arc::clone(&running);
@@ -131,15 +148,6 @@ impl PreviewSource for VpssStream {
     }
 }
 
-/// 预览通道的宽度（`--scale` 的整数倍降采样由 VPSS 硬件完成）。
-fn config_scale_w(cfg: &VisionConfig) -> u32 {
-    (FRAME_W as u32 / cfg.scale.max(1) as u32).max(16)
-}
-
-fn config_scale_h(cfg: &VisionConfig) -> u32 {
-    (FRAME_H as u32 / cfg.scale.max(1) as u32).max(16)
-}
-
 /* ------------------------------------------------------------------ */
 /* 管线（线程内）                                                       */
 /* ------------------------------------------------------------------ */
@@ -163,6 +171,14 @@ struct VpssPipeline {
     pos: PositionAnalyzer,
     cfg: VisionConfig,
     seq: u64,
+    /// 预览交接方式（见 [`PreviewRoute`]）。
+    route: PreviewRoute,
+    /// user 路由：已 `SendFrame` 进 VENC、等着下一轮 `GetStream` 的快照。
+    pending: Option<Arc<VisionSnapshot>>,
+    /// bind 路由：`(pts, 快照)`，等码流按 PTS 来取。
+    snapshots: VecDeque<(u64, Arc<VisionSnapshot>)>,
+    /// bind 路由连续失败计数（超限降级到 user）。
+    bind_errors: u32,
     /// 会话（堆上，地址稳定）。
     _sys: Box<Sys>,
 }
@@ -189,10 +205,9 @@ impl VpssPipeline {
         // `vpss`/`enc`/`input` 先于 `_sys` 析构，所以延长的 `'static` 不会真的越界。
         let session: &'static Sys = unsafe { &*(&*sys as *const Sys) };
 
-        // 3) VPSS 组：YUYV 进 → chn0 RGB 平面（给 TPU）+ chn1 NV12（给 VENC，可缩放）
-        let scale = cfg.scale.max(1) as u32;
-        let chn1_w = (FRAME_W as u32 / scale).max(16);
-        let chn1_h = (FRAME_H as u32 / scale).max(16);
+        // 3) VPSS 组：YUYV 进 → chn0 RGB 平面（给 TPU）+ chn1 NV12（给 VENC）
+        //    预览通道不缩放（640x480 原尺寸）：硬件 VENC 完全扛得住，
+        //    全分辨率画质优先。
         let vpss = session
             .create_vpss(&VpssConfig {
                 grp: VPSS_GRP_AUTO, // 组号一个 boot 只能建一次，自动往后取
@@ -206,7 +221,7 @@ impl VpssPipeline {
                         FRAME_H as u32,
                         ffi::PIXEL_FORMAT_RGB_888_PLANAR,
                     ),
-                    VpssChnConfig::new(1, chn1_w, chn1_h, ffi::PIXEL_FORMAT_NV12)
+                    VpssChnConfig::new(1, FRAME_W as u32, FRAME_H as u32, ffi::PIXEL_FORMAT_NV12)
                         .with_depth(PREVIEW_DEPTH),
                 ],
             })
@@ -216,21 +231,57 @@ impl VpssPipeline {
             .map_err(|e| io::Error::other(format!("VPSS CSC 配置失败: {e}")))?;
 
         // 4) VENC（PT_JPEG，NV12；qfactor 50 是"用自定义量化表"的特殊值，避开）
+        //    先只建通道不收帧：bind 的顺序必须是「建通道 → bind → StartRecvFrame」，
+        //    否则绑定后 GetStream 会报 EN_ERR_BUSY（SDK sample 同款顺序）。
         let quality = if cfg.quality == 50 { 51 } else { cfg.quality };
         let enc = session
-            .create_encoder(
+            .create_encoder_pending(
                 0,
-                &EncoderConfig::new(chn1_w, chn1_h, ffi::PIXEL_FORMAT_NV12)
+                &EncoderConfig::new(FRAME_W as u32, FRAME_H as u32, ffi::PIXEL_FORMAT_NV12)
                     .with_quality(u32::from(quality)),
             )
             .map_err(|e| io::Error::other(format!("VENC 通道创建失败: {e}")))?;
 
-        // 5) 输入帧
+        // 5) 预览交接：优先 bind（内核直连），失败退回用户态取帧。
+        //    `SMARTCAR_VPSS_ROUTE=user|bind` 可以强制指定（对联调/A-B 有用）。
+        let forced = std::env::var("SMARTCAR_VPSS_ROUTE").unwrap_or_default();
+        // 上次进程崩溃时可能留下 bind 节点：先清掉，否则新 bind "成功"但数据不通。
+        match cvimpi_rs::vpss::clear_venc_bind(0) {
+            Ok(true) => warn!("发现 VENC 0 上的残留绑定（上次进程异常退出），已清理"),
+            Ok(false) => {}
+            Err(e) => warn!("清理残留绑定失败（忽略，继续）：{e}"),
+        }
+        let route = if forced == "user" {
+            info!("预览交接：按 SMARTCAR_VPSS_ROUTE=user 强制用户态取帧");
+            PreviewRoute::User
+        } else {
+            match vpss.bind_chn_to_venc(1, enc.channel()) {
+                Ok(()) => {
+                    if forced == "bind" {
+                        info!("预览交接：按 SMARTCAR_VPSS_ROUTE=bind 强制内核直连");
+                    }
+                    PreviewRoute::Bind
+                }
+                Err(e) => {
+                    if forced == "bind" {
+                        return Err(io::Error::other(format!(
+                            "SMARTCAR_VPSS_ROUTE=bind 但 bind 失败: {e}"
+                        )));
+                    }
+                    warn!("VPSS→VENC bind 不可用（{e}）；改用用户态取帧 + 延迟取流");
+                    PreviewRoute::User
+                }
+            }
+        };
+        enc.start_recv_frame(-1)
+            .map_err(|e| io::Error::other(format!("CVI_VENC_StartRecvFrame 失败: {e}")))?;
+
+        // 6) 输入帧
         let input = session
             .alloc_frame_cached(FRAME_W as u32, FRAME_H as u32, ffi::PIXEL_FORMAT_YUYV)
             .map_err(|e| io::Error::other(format!("输入帧分配失败: {e}")))?;
 
-        // 6) 模型：加载失败/输入尺寸不匹配都只降级为"仅预览"
+        // 7) 模型：加载失败/输入尺寸不匹配都只降级为"仅预览"
         let (infer, model_error, model_input) = match TpuInference::try_new(
             &cfg.model,
             cfg.conf_threshold,
@@ -279,6 +330,10 @@ impl VpssPipeline {
             pos,
             cfg,
             seq: 0,
+            route,
+            pending: None,
+            snapshots: VecDeque::with_capacity(SNAPSHOT_QUEUE),
+            bind_errors: 0,
             _sys: sys,
         })
     }
@@ -295,44 +350,38 @@ impl VpssPipeline {
             state.model = self.cfg.model.clone();
             state.model_input = self.model_input.clone();
             state.error = self.model_error.clone();
-            state.encode = "vpss".to_string();
+            state.encode = self.route_label().to_string();
         }
 
-        let preview_period = if self.cfg.preview_fps > 0.0 {
-            Duration::from_secs_f32(1.0 / self.cfg.preview_fps)
-        } else {
-            Duration::ZERO
-        };
-        let preview_due = preview_period.mul_f32(0.5); // 允许一点余量，避免帧率被量化砍半
-        let mut last_preview = Instant::now()
-            .checked_sub(preview_period)
-            .unwrap_or_else(Instant::now);
         let mut last_error: Option<String> = None;
         let mut last_error_at = Instant::now()
             .checked_sub(Duration::from_secs(5))
             .unwrap_or_else(Instant::now);
 
-        while running.load(Ordering::Relaxed) {
-            let preview_due_now = preview_period.is_zero() || last_preview.elapsed() >= preview_due;
-            if preview_due_now {
-                last_preview = Instant::now();
+        info!(
+            "预览交接：{}（延迟取流：编码与 TPU 并行）",
+            match self.route {
+                PreviewRoute::Bind => "VPSS→VENC bind + PTS 对帧",
+                PreviewRoute::User => "用户态取帧 + SendFrame",
             }
+        );
 
-            match self.step(preview_due_now) {
+        while running.load(Ordering::Relaxed) {
+            match self.step() {
                 Ok(step) => {
                     {
                         let mut state = inner.state.lock().unwrap();
                         state.record_model_frame(Instant::now(), &step.timings, step.snapshot);
                         state.error = self.model_error.clone();
-                        state.encode = "vpss".to_string();
+                        state.encode = self.route_label().to_string();
                         state.encode_ms = step.timings.encode_ms;
-                        if step.preview_sent {
-                            state.preview_sent += 1;
-                        }
+                        state.preview_sent += 1; // 每帧都投递预览（不锁帧）
                     }
                     if let Some((jpeg, snapshot, encode_ms)) = step.preview {
                         let frame = Arc::new(PreviewFrame {
-                            seq: step.seq,
+                            // 用配对快照的 seq：user 路由的码流是上一帧的，
+                            // 这样 `jpeg` 和 `vision` 始终同帧。
+                            seq: snapshot.seq,
                             jpeg: Some(jpeg),
                             vision: Some(snapshot),
                         });
@@ -360,11 +409,12 @@ impl VpssPipeline {
                 }
             }
         }
+        self.shutdown();
         info!("VPSS 视觉线程退出");
     }
 
-    /// 一帧：返回快照 + 可选的（JPEG、同帧快照、编码耗时）。
-    fn step(&mut self, with_preview: bool) -> io::Result<VpssStep> {
+    /// 一帧：返回快照 + 可选预览（每帧都出预览，不锁帧）。
+    fn step(&mut self) -> io::Result<VpssStep> {
         let t_frame = Instant::now();
 
         // 1) 采集（零拷贝）→ 拷进 VB 块（全链路唯一一次 CPU 像素搬运）
@@ -381,6 +431,8 @@ impl VpssPipeline {
 
         // 2) VPSS：硬件 CSC（+ 缩放），chn0 给 TPU、chn1 给预览
         let t1 = Instant::now();
+        // 帧 PTS = 采集序号：bind 路由靠它把码流和快照精确对上（驱动透传）
+        self.input.set_pts(self.seq);
         self.vpss
             .send_frame(self.input.info(), ffi::CVI_IO_BLOCK)
             .map_err(|e| io::Error::other(format!("VPSS SendFrame 失败: {e}")))?;
@@ -416,31 +468,7 @@ impl VpssPipeline {
         let result = self.pos.analyze(&dets);
         let position_ms = elapsed_ms(t2);
 
-        // 5) 预览：到节拍才取 chn1 → VENC（硬件 JPEG）。没取走的 chn1 帧由
-        //    驱动按 u32Depth 丢掉，不会拖慢模型这一路。
-        let mut encode_ms = 0.0;
-        let mut preview = None;
-        let mut preview_sent = false;
-        if with_preview {
-            preview_sent = true;
-            let t3 = Instant::now();
-            let nv12 = self
-                .vpss
-                .get_chn_frame(1, GET_FRAME_TIMEOUT_MS)
-                .map_err(|e| io::Error::other(format!("VPSS GetChnFrame(chn1) 失败: {e}")))?;
-            let jpeg = self
-                .enc
-                .encode_info(nv12.info(), ffi::CVI_IO_BLOCK)
-                .map_err(|e| io::Error::other(format!("VENC 编码失败: {e}")))?;
-            drop(nv12);
-            encode_ms = elapsed_ms(t3);
-            if jpeg.is_empty() {
-                return Err(io::Error::other("VENC 输出为空"));
-            }
-            preview = Some(jpeg);
-        }
-
-        // 6) 快照（与预览同帧）
+        // 5) 快照（预览与检测严格同帧）
         let step = crate::vision::VisionStep {
             seq: self.seq,
             at: t_frame,
@@ -452,31 +480,138 @@ impl VpssPipeline {
                 infer_ms,
                 nms_ms,
                 position_ms,
-                encode_ms,
+                encode_ms: 0.0, // 下面按路由补
                 total_ms: elapsed_ms(t_frame),
             },
         };
-        self.seq += 1;
         let snapshot = Arc::new(snapshot(&step));
+        self.seq += 1;
 
+        // 6) 预览交接（A+B 的核心）。
+        //
+        // - Bind：chn1 直接进 VENC，**每帧都必须取走码流**（否则 VENC 队列会顶住
+        //   整条链路）；编码与上面的 TPU 天然并行，所以这里几乎不等待。
+        //   用帧 PTS 精确对帧（驱动透传：输入帧 PTS == 码流 PTS，已实测）。
+        // - User：把当前帧交给 VENC（`SendFrame` 不等编码），码流留到**下一轮**
+        //   取（同样与 TPU 重叠）；一送一取，顺序即配对。
+        let mut encode_ms = 0.0;
+        let mut preview: Option<(Arc<[u8]>, Arc<VisionSnapshot>, f64)> = None;
+        match self.route {
+            PreviewRoute::Bind => {
+                self.register_snapshot(self.seq.wrapping_sub(1), &snapshot);
+                let t3 = Instant::now();
+                match self.enc.get_stream_meta(GET_FRAME_TIMEOUT_MS) {
+                    Ok((jpeg, meta)) => {
+                        self.bind_errors = 0;
+                        let jpeg: Arc<[u8]> = Arc::from(jpeg);
+                        let paired = self
+                            .take_snapshot_by_pts(meta.pts)
+                            .unwrap_or_else(|| Arc::clone(&snapshot));
+                        encode_ms = elapsed_ms(t3);
+                        if !jpeg.is_empty() {
+                            preview = Some((jpeg, paired, encode_ms));
+                        }
+                    }
+                    Err(e) => {
+                        self.bind_errors += 1;
+                        if self.bind_errors >= BIND_ERROR_LIMIT {
+                            self.degrade_from_bind();
+                        }
+                        return Err(io::Error::other(format!("bind 取流失败: {e}")));
+                    }
+                }
+            }
+            PreviewRoute::User => {
+                // 上一轮交给 VENC 的那一帧，码流已经好了
+                if let Some(prev) = self.pending.take() {
+                    let t3 = Instant::now();
+                    let jpeg = self
+                        .enc
+                        .get_stream(GET_FRAME_TIMEOUT_MS)
+                        .map_err(|e| io::Error::other(format!("VENC 取流失败: {e}")))?;
+                    encode_ms = elapsed_ms(t3);
+                    if !jpeg.is_empty() {
+                        preview = Some((Arc::from(jpeg), prev, encode_ms));
+                    }
+                }
+                // 把当前帧交给 VENC（只送不取：编码和下一轮的 TPU 重叠）
+                let t3 = Instant::now();
+                let nv12 = self
+                    .vpss
+                    .get_chn_frame(1, GET_FRAME_TIMEOUT_MS)
+                    .map_err(|e| io::Error::other(format!("VPSS GetChnFrame(chn1) 失败: {e}")))?;
+                self.enc
+                    .send_frame_info(nv12.info(), ffi::CVI_IO_BLOCK)
+                    .map_err(|e| io::Error::other(format!("VENC SendFrame 失败: {e}")))?;
+                drop(nv12);
+                self.pending = Some(Arc::clone(&snapshot));
+                encode_ms += elapsed_ms(t3);
+            }
+        }
+
+        let timings = VisionTimings {
+            encode_ms,
+            ..step.timings
+        };
         Ok(VpssStep {
-            seq: step.seq,
-            timings: step.timings,
-            snapshot: Arc::clone(&snapshot),
-            preview: preview.map(|jpeg| (Arc::from(jpeg), snapshot, encode_ms)),
-            preview_sent,
+            timings,
+            snapshot,
+            preview,
         })
+    }
+
+    /// bind 路由：登记 `(pts, 快照)` 供码流 PTS 匹配。
+    fn register_snapshot(&mut self, pts: u64, snapshot: &Arc<VisionSnapshot>) {
+        self.snapshots.push_back((pts, Arc::clone(snapshot)));
+        while self.snapshots.len() > SNAPSHOT_QUEUE {
+            self.snapshots.pop_front();
+        }
+    }
+
+    /// bind 路由：按 PTS 取走快照（取不到返回 `None`）。
+    fn take_snapshot_by_pts(&mut self, pts: u64) -> Option<Arc<VisionSnapshot>> {
+        let idx = self.snapshots.iter().position(|(p, _)| *p == pts)?;
+        self.snapshots.remove(idx).map(|(_, s)| s)
+    }
+
+    /// bind 连续失败：解绑并退回用户态取帧（解绑失败则保持 bind）。
+    fn degrade_from_bind(&mut self) {
+        match self.vpss.unbind_chn_from_venc(1, self.enc.channel()) {
+            Ok(()) => {
+                warn!("bind 取流连续失败：已解绑，退回用户态取帧 + 延迟取流");
+                self.route = PreviewRoute::User;
+                self.bind_errors = 0;
+            }
+            Err(e) => {
+                warn!("bind 解绑失败（{e}）：保持 bind，继续重试");
+            }
+        }
+    }
+
+    /// 退出前解绑（残留的绑定会污染下一次启动）。
+    fn shutdown(&mut self) {
+        if self.route == PreviewRoute::Bind {
+            if let Err(e) = self.vpss.unbind_chn_from_venc(1, self.enc.channel()) {
+                warn!("退出时解绑 VPSS→VENC 失败：{e}");
+            }
+        }
+    }
+
+    /// 状态展示用的后端标签（网页 `vision.encode`）。
+    fn route_label(&self) -> &'static str {
+        match self.route {
+            PreviewRoute::Bind => "vpss+bind",
+            PreviewRoute::User => "vpss",
+        }
     }
 }
 
 /// 一帧的结果（快照 + 可选预览）。
 struct VpssStep {
-    seq: u64,
     timings: VisionTimings,
     snapshot: Arc<VisionSnapshot>,
     /// `(JPEG, 同帧快照, 编码耗时)`。
     preview: Option<(Arc<[u8]>, Arc<VisionSnapshot>, f64)>,
-    preview_sent: bool,
 }
 
 /* ------------------------------------------------------------------ */

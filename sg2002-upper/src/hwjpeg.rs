@@ -4,7 +4,8 @@
 //!
 //! 相机出的是 **YUYV422**，而 VENC 的 JPEG 通道只认 semi-planar YUV420
 //! （把 YUYV 直接交给驱动会被当成 NV12 解释，画面变成绿/品红条纹），
-//! 所以编码前在写 VB 块时做一次 YUYV422 → NV12 转换。输入帧用
+//! 所以编码前要写一份 NV12：转换函数在 [`crate::preprocess`]
+//! （`yuyv422_to_nv12_*`），这里只负责按平面写进 VB 块。输入帧用
 //! `cvimpi-rs` 的 cached 映射（`alloc_frame_cached`）：CPU 逐字节写 cached
 //! 内存比 uncached 快一个数量级（实测 460KB：25ms → 3.3ms），
 //! `Encoder::send_frame` 会在送硬件前自动 flush。
@@ -31,14 +32,12 @@ use cvimpi_rs::ffi;
 use cvimpi_rs::sys::{Sys, VbPoolConfig};
 use cvimpi_rs::venc_input_layout;
 
-use crate::vision::{FRAME_H, FRAME_W};
+use crate::preprocess::{FRAME_H, FRAME_W, YUYV_LEN, yuyv422_to_nv12_uv, yuyv422_to_nv12_y};
 
 /// 编码输入帧的像素格式：驱动只接受 semi-planar YUV420（见模块注释）。
 const INPUT_FORMAT: ffi::PIXEL_FORMAT_E = ffi::PIXEL_FORMAT_NV12;
 /// VB 公共池块数（与旧的 C 封装一致）。
 const VB_BLK_CNT: u32 = 4;
-/// 输入帧字节数（640x480 YUYV422，2 字节/像素）。
-const YUYV_LEN: usize = FRAME_W * 2 * FRAME_H;
 
 /// 硬件 JPEG 编码器句柄（与创建它的线程绑定）。
 pub struct HwJpeg {
@@ -138,43 +137,15 @@ impl HwJpeg {
 
 /// 把 640x480 YUYV422 写进 NV12 输入帧（自动处理硬件 stride）。
 ///
-/// 输入帧是 cached 映射（`Sys::alloc_frame_cached`），写完由
-/// `Encoder::send_frame` 统一 flush 给硬件。
+/// 像素转换在 [`crate::preprocess`]（`yuyv422_to_nv12_*`），这里只负责把
+/// 结果按平面写进 VB 块；输入帧是 cached 映射（`Sys::alloc_frame_cached`），
+/// 写完由 `Encoder::send_frame` 统一 flush 给硬件。
 fn write_nv12(frame: &mut Frame<'_>, yuyv: &[u8]) -> cvimpi_rs::Result<()> {
     let y_stride = frame.stride(0) as usize;
-    yuyv_to_y(yuyv, frame.plane_mut(0)?, y_stride);
+    yuyv422_to_nv12_y(yuyv, frame.plane_mut(0)?, y_stride);
     let uv_stride = frame.stride(1) as usize;
-    yuyv_to_uv(yuyv, frame.plane_mut(1)?, uv_stride);
+    yuyv422_to_nv12_uv(yuyv, frame.plane_mut(1)?, uv_stride);
     Ok(())
-}
-
-/// YUYV422 → NV12 的 Y 平面：每对像素取亮度，按 `stride` 逐行写。
-fn yuyv_to_y(yuyv: &[u8], dst: &mut [u8], stride: usize) {
-    let src_stride = FRAME_W * 2;
-    for y in 0..FRAME_H {
-        let src = &yuyv[y * src_stride..y * src_stride + src_stride];
-        let dst = &mut dst[y * stride..y * stride + FRAME_W];
-        for x in 0..FRAME_W / 2 {
-            dst[x * 2] = src[x * 4];
-            dst[x * 2 + 1] = src[x * 4 + 2];
-        }
-    }
-}
-
-/// YUYV422 → NV12 的交织 UV 平面：2x2 块取平均（与旧的 C 封装一致）。
-fn yuyv_to_uv(yuyv: &[u8], dst: &mut [u8], stride: usize) {
-    let src_stride = FRAME_W * 2;
-    for y in (0..FRAME_H).step_by(2) {
-        let r0 = &yuyv[y * src_stride..y * src_stride + src_stride];
-        let r1 = &yuyv[(y + 1) * src_stride..(y + 1) * src_stride + src_stride];
-        let dst = &mut dst[(y / 2) * stride..(y / 2) * stride + FRAME_W];
-        for x in 0..FRAME_W / 2 {
-            let u = (u16::from(r0[x * 4 + 1]) + u16::from(r1[x * 4 + 1])) / 2;
-            let v = (u16::from(r0[x * 4 + 3]) + u16::from(r1[x * 4 + 3])) / 2;
-            dst[x * 2] = u as u8;
-            dst[x * 2 + 1] = v as u8;
-        }
-    }
 }
 
 #[cfg(test)]
@@ -195,51 +166,6 @@ mod tests {
             }
         }
         buf
-    }
-
-    #[test]
-    fn yuyv_to_y_takes_luma_and_respects_stride() {
-        let src = yuyv_pattern();
-        let stride = FRAME_W + 64; // 模拟驱动 stride padding
-        let mut dst = vec![0xAAu8; stride * FRAME_H];
-        yuyv_to_y(&src, &mut dst, stride);
-
-        for y in [0usize, 1, 239, 479] {
-            let row = &dst[y * stride..y * stride + FRAME_W];
-            for (i, &v) in row.iter().enumerate() {
-                assert_eq!(v as usize, i % 256, "第 {y} 行第 {i} 列");
-            }
-        }
-        // padding 不被写
-        assert_eq!(dst[FRAME_W], 0xAA);
-        assert_eq!(dst[stride * FRAME_H - 1], 0xAA);
-    }
-
-    #[test]
-    fn yuyv_to_uv_averages_2x2_blocks() {
-        let mut src = yuyv_pattern();
-        // 让 (0,0)-(1,1) 这 2x2 块取不同的 UV：行 0 的 U=10/V=200，行 1 的 U=30/V=100
-        for pair in 0..FRAME_W / 2 {
-            src[pair * 4 + 1] = 10;
-            src[pair * 4 + 3] = 200;
-            let r1 = FRAME_W * 2 + pair * 4;
-            src[r1 + 1] = 30;
-            src[r1 + 3] = 100;
-        }
-        let stride = FRAME_W + 64;
-        let mut dst = vec![0xAAu8; stride * (FRAME_H / 2)];
-        yuyv_to_uv(&src, &mut dst, stride);
-
-        assert_eq!(dst[0], 20, "U 取两行平均");
-        assert_eq!(dst[1], 150, "V 取两行平均");
-        assert_eq!(dst[2], 20);
-        assert_eq!(dst[3], 150);
-        // 第二行 UV（源的第 2/3 行仍是 10/200）
-        assert_eq!(dst[stride], 10);
-        assert_eq!(dst[stride + 1], 200);
-        // padding 不被写
-        assert_eq!(dst[FRAME_W], 0xAA);
-        assert_eq!(dst[stride * (FRAME_H / 2) - 1], 0xAA);
     }
 
     /// 输出指纹（校验缓存/刷写路径的编码结果）。

@@ -90,8 +90,8 @@ pub struct VisionStatus {
     pub model: String,
     /// 模型输入张量形状（如 `[1, 3, 480, 640]`）。
     pub input: String,
-    /// 预览编码后端：`hw`（VENC 硬件）/ `sw`（纯 Rust）/ `vpss`（VPSS + VENC + 用户态取帧）
-    /// / `vpss+bind`（VPSS 直连 VENC）/ `none`。
+    /// 预览编码后端：`hw`（VENC 硬件）/ `sw`（纯 Rust）/ `vpss+bind`（VPSS 直连 VENC）
+    /// / `none`。
     pub encode: String,
     /// 预览投递成功/丢弃/已发布计数（诊断用）。
     pub sent: u64,

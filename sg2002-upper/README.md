@@ -55,27 +55,25 @@ MMF 会话与硬件 VENC 预览共用（`CVI_SYS_Init` 进程级只有一个 `Sy
 ./vpss_probe --csc expand601 --bind --model /root/yolov8n_tennis_v3.cvimodel --frames 30
 ```
 
-### 预览交接（Phase 2 A+B）
+### 预览交接
 
-VPSS chn1 默认用 `CVI_SYS_Bind` **直连 VENC**（内核内交接），用户态只 `GetStream`；
+VPSS chn1 用 `CVI_SYS_Bind` **直连 VENC**（内核内交接），用户态只 `GetStream`；
 编码和 TPU 推理在硬件上并行，所以取流几乎不等待。用输入帧 PTS 精确对帧
 （驱动透传：`StreamMeta.pts == 输入帧 PTS`）。
 
-- `SMARTCAR_VPSS_ROUTE=user ./smartcar ...` 可以强制退回
-  「用户态取帧 + `SendFrame` + 延迟取流」；
-- bind 调用失败、或取流连续失败 5 次 → 自动解绑并退回用户态取帧（不会卡死）；
-- 退出前 `UnBind`；启动时 `clear_venc_bind()` 清掉上次崩溃留下的残留节点。
-- 退出前会把**未取的码流取干净**（user 路由下是上一轮 `SendFrame` 的那帧）：
-  否则驱动在 `DestroyChn` 时会一直等码流缓冲释放，线程卡死在 ioctl 里、
-  内核留下 VENC 通道 / VB 块（实测；修好后三种路由都在 ~0.5s 内干净退出）。
+- bind 失败 → `try_start` 返回错误，由 `smartcar` 回退 CPU 管线；
+- 启动时 `clear_venc_bind()` 清掉上次崩溃留下的残留节点，退出前 `UnBind`；
+- 退出前把**未取的码流取干净**（取流失败过就会积压）：否则驱动在 `DestroyChn`
+  时会一直等码流缓冲释放，线程卡死在 ioctl 里、内核留下 VENC 通道 / VB 块
+  （实测；修好后 ~0.5s 内干净退出）。
 
 实测（640x480 YUYV，同一场景）：
 
-| | bind（默认） | 用户态取帧 | 无 VPSS（CPU 路径） |
-|---|---|---|---|
-| 预览编码耗时 | **~4ms**（avg，编码在 TPU 期间完成） | ~1.3ms | ~22ms |
-| 视觉帧率 | 贴着相机（16.5~19.8fps，随光照） | 同左 | 13.1 fps |
-| smartcar CPU | 6% | 6% | 42% |
+| | bind | 无 VPSS（CPU 路径） |
+|---|---|---|
+| 预览编码耗时 | **~4ms**（avg，编码在 TPU 期间完成） | ~22ms |
+| 视觉帧率 | 贴着相机（16.5~19.8fps，随光照） | 13.1 fps |
+| smartcar CPU | 6% | 42% |
 
 探针对比（30 帧含零拷贝模型）：bind + 延迟取流 **25.6fps**，同步编码路径 20.4fps。
 

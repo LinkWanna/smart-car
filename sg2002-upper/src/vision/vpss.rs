@@ -41,7 +41,7 @@ use crate::position::PositionAnalyzer;
 use crate::preview::{
     CameraStatus, PreviewFrame, PreviewSource, VisionSnapshot, VisionStatus, VisionTimings,
 };
-use crate::tpu::TpuInference;
+use crate::yolo::Yolo;
 
 use super::state::StreamInner;
 use super::{FRAME_H, FRAME_W, VisionConfig, VisionStep, elapsed_ms, snapshot};
@@ -164,7 +164,7 @@ struct VpssPipeline {
     input: Frame<'static>,
     camera: crate::camera::Camera,
     /// `None` = 模型不可用（仅预览，自动模式不可用）。
-    infer: Option<TpuInference>,
+    infer: Option<Yolo>,
     model_error: Option<String>,
     model_input: String,
     pos: PositionAnalyzer,
@@ -285,7 +285,7 @@ impl VpssPipeline {
             .map_err(|e| io::Error::other(format!("输入帧分配失败: {e}")))?;
 
         // 7) 模型：加载失败/输入尺寸不匹配都只降级为"仅预览"
-        let (infer, model_error, model_input) = match TpuInference::try_new(
+        let (infer, model_error, model_input) = match Yolo::from_file(
             &cfg.model,
             cfg.conf_threshold,
             cfg.iou_threshold,
@@ -438,7 +438,7 @@ impl VpssPipeline {
         // 3) 推理（零拷贝：输入张量直接指向 chn0 的物理地址）
         let mut infer_error = None;
         let (dets, infer_ms, nms_ms) = match self.infer.as_mut() {
-            Some(infer) => match infer.try_infer_physical(rgb.phy_addr(0)) {
+            Some(infer) => match infer.infer(rgb.phy_addr(0)) {
                 Ok(dets) => {
                     let (tpu, nms) = infer.last_timing();
                     (dets, tpu, nms)

@@ -18,7 +18,7 @@
 //! - `cpu`：CPU 管线的线程编排；
 //! - `vpss`：VPSS 管线的会话/组/VENC 生命周期与帧循环。
 //!
-//! 相机必须以模型需要的 **YUYV422** 打开；模型输入（`Preprocessor`）与预览 JPEG
+//! 相机必须以模型需要的 **YUYV422** 打开；模型输入（YUYV→RGB 平面）与预览 JPEG
 //! 都由同一帧得到，因此不需要第二路相机。模型加载失败不致命：退化为「仅预览」
 //! （`model_ok == false`），手动遥控照常，自动模式不可用（见 [`crate::preview::PreviewSource::auto_ready`]）。
 
@@ -119,7 +119,7 @@ pub(crate) fn elapsed_ms(since: Instant) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tpu::Detection;
+    use crate::yolo::Detection;
 
     #[test]
     fn snapshot_normalizes_detections() {

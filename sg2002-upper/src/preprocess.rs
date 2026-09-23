@@ -1,6 +1,7 @@
 //! 相机 YUYV422 帧的像素工作流（取帧之后的全部处理）。
 //!
-//! - 模型侧：[`Preprocessor`] 把 YUYV422 转成 RGB 平面 CHW（TPU 输入）；
+//! - 模型侧：[`yuyv422_to_rgb_planes`] 把 YUYV422 转成 RGB 平面 CHW（TPU 输入），
+//!   直接写进 VB 帧的三个平面（零拷贝）或 CPU 缓冲；
 //! - 预览侧：[`PreviewEncoder`] 把同一帧编码成 JPEG（硬件 VENC 优先，失败降级软件编码）；
 //! - 共用转换：[`yuyv422_to_rgb`]、[`yuyv422_to_nv12_y`] / [`yuyv422_to_nv12_uv`]。
 //!
@@ -10,6 +11,7 @@
 use std::io;
 use std::sync::Arc;
 
+use cvimpi_rs::sys::Sys;
 use jpeg_encoder::{ColorType, Encoder};
 use log::{info, warn};
 
@@ -24,11 +26,26 @@ pub const YUYV_LEN: usize = FRAME_W * 2 * FRAME_H;
 
 /// YUYV422 (640x480) → RGB 平面 CHW (640x480)
 pub fn yuyv422_to_rgb(yuyv: &[u8], rgb: &mut [u8]) {
-    assert_eq!(yuyv.len(), YUYV_LEN);
-    assert_eq!(rgb.len(), FRAME_W * FRAME_H * 3);
     let plane = FRAME_W * FRAME_H;
+    assert_eq!(rgb.len(), plane * 3);
     let (r_plane, rest) = rgb.split_at_mut(plane);
     let (g_plane, b_plane) = rest.split_at_mut(plane);
+    yuyv422_to_rgb_planes(yuyv, r_plane, g_plane, b_plane);
+}
+
+/// YUYV422 → RGB 三个平面（每个平面 `FRAME_W * FRAME_H` 字节，紧凑排布）。
+///
+/// 直接写 VB 帧的三个平面（`Frame::planes_mut`）时用这个：一次遍历完成
+/// 转换 + 写入，不需要中间缓冲，也没有第二次拷贝。
+pub fn yuyv422_to_rgb_planes(
+    yuyv: &[u8],
+    r_plane: &mut [u8],
+    g_plane: &mut [u8],
+    b_plane: &mut [u8],
+) {
+    assert_eq!(yuyv.len(), YUYV_LEN);
+    let plane = FRAME_W * FRAME_H;
+    assert!(r_plane.len() >= plane && g_plane.len() >= plane && b_plane.len() >= plane);
     for y in 0..FRAME_H {
         for x in 0..FRAME_W / 2 {
             let off = (y * (FRAME_W / 2) + x) * 4;
@@ -82,41 +99,12 @@ pub fn yuyv422_to_nv12_uv(yuyv: &[u8], dst: &mut [u8], stride: usize) {
     }
 }
 
-/// 模型输入预处理器：YUYV422 → RGB 平面 CHW，内部缓冲跨帧复用。
-pub struct Preprocessor {
-    pub target_w: usize,
-    pub target_h: usize,
-    buf: Vec<u8>,
-}
-
-impl Preprocessor {
-    pub fn new(target_w: usize, target_h: usize) -> Self {
-        assert_eq!(
-            (target_w, target_h),
-            (FRAME_W, FRAME_H),
-            "仅支持 {FRAME_W}x{FRAME_H} 直通"
-        );
-        Self {
-            target_w,
-            target_h,
-            buf: vec![0u8; FRAME_W * FRAME_H * 3],
-        }
-    }
-
-    /// 处理一帧 YUYV422；返回内部 RGB 平面缓冲（下一帧会被覆盖）。
-    pub fn process_yuyv(&mut self, yuyv: &[u8], src_w: usize, src_h: usize) -> &[u8] {
-        assert_eq!((src_w, src_h), (FRAME_W, FRAME_H));
-        yuyv422_to_rgb(yuyv, &mut self.buf);
-        &self.buf
-    }
-}
-
 /// 预览编码后端当前需要的输入格式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PreviewInput {
     /// 相机原始 YUYV422（硬件 VENC：内部转 NV12 后编码；数据直接来自相机缓冲）。
     Yuyv,
-    /// RGB 平面 CHW（软件编码；数据来自 [`Preprocessor`] 缓冲）。
+    /// RGB 平面 CHW（软件编码；数据来自零拷贝输入帧或 CPU 兜底缓冲）。
     RgbPlanar,
 }
 
@@ -124,11 +112,11 @@ pub enum PreviewInput {
 ///
 /// 输入要求会随降级变化：构造后与每次 [`PreviewEncoder::encode`] 之后都用
 /// [`PreviewEncoder::input_format`] 查询，采集线程据此决定拷贝哪种数据。
-pub struct PreviewEncoder {
+pub struct PreviewEncoder<'a> {
     /// 硬件 VENC（`None` = 不可用/已降级）。
     ///
     /// `HwJpeg` 与线程绑定，所以整个编码器必须在同一个线程里创建和使用。
-    hw: Option<HwJpeg>,
+    hw: Option<HwJpeg<'a>>,
     input: PreviewInput,
     /// 软件编码的降采样倍数（1 = 原尺寸）与质量。
     scale: usize,
@@ -138,20 +126,26 @@ pub struct PreviewEncoder {
     jpeg: Vec<u8>,
 }
 
-impl PreviewEncoder {
-    /// 打开硬件 VENC；没有厂商库/内核不支持时直接选软件编码。
-    pub fn new(scale: usize, quality: u8) -> Self {
-        let hw = match HwJpeg::new(FRAME_W as u32, FRAME_H as u32, quality) {
-            Ok(enc) => {
-                info!(
-                    "预览编码：硬件 VENC（输入像素格式 {}，qfactor {}）",
-                    enc.input_format(),
-                    quality
-                );
-                Some(enc)
-            }
-            Err(e) => {
-                warn!("硬件编码不可用（{e}）；改用纯 Rust 编码");
+impl<'a> PreviewEncoder<'a> {
+    /// 打开硬件 VENC（借用会话 `sys`）；没有会话/厂商库/内核不支持时直接选软件编码。
+    pub fn new(sys: Option<&'a Sys>, scale: usize, quality: u8) -> Self {
+        let hw = match sys {
+            Some(sys) => match HwJpeg::new(sys, FRAME_W as u32, FRAME_H as u32, quality) {
+                Ok(enc) => {
+                    info!(
+                        "预览编码：硬件 VENC（输入像素格式 {}，qfactor {}）",
+                        enc.input_format(),
+                        quality
+                    );
+                    Some(enc)
+                }
+                Err(e) => {
+                    warn!("硬件编码不可用（{e}）；改用纯 Rust 编码");
+                    None
+                }
+            },
+            None => {
+                warn!("MMF 会话不可用；改用纯 Rust 编码");
                 None
             }
         };
@@ -424,17 +418,29 @@ mod tests {
         assert!(encode_jpeg(&[0u8; 16], 1, 80, &mut packed, &mut jpeg).is_err());
     }
 
-    /// 真机降级检查（需要厂商库）：进程内 VENC 会话只能初始化一次，
-    /// 第二个编码器拿不到会话，应自动降到软件编码并出图。
+    /// 真机降级检查（需要厂商库）：有会话时拿硬件 VENC；没有会话（MMF 不可用）
+    /// 直接降级软件编码并出图。
     #[test]
     #[ignore = "需要 SG2002 硬件（VENC + 厂商库）"]
     fn preview_encoder_falls_back_to_software() {
-        let hw = PreviewEncoder::new(1, 80);
-        assert_eq!(hw.backend(), "hw", "第一个编码器应拿到硬件 VENC");
+        let layout = cvimpi_rs::venc_input_layout(
+            FRAME_W as u32,
+            FRAME_H as u32,
+            cvimpi_rs::ffi::PIXEL_FORMAT_NV12,
+        )
+        .expect("NV12 布局");
+        let sys =
+            cvimpi_rs::sys::Sys::init(&[
+                cvimpi_rs::sys::VbPoolConfig::new(layout.vb_size, 4).with_name("hwjpeg")
+            ])
+            .expect("JPEG 会话初始化失败");
+
+        let hw = PreviewEncoder::new(Some(&sys), 1, 80);
+        assert_eq!(hw.backend(), "hw", "有会话时应拿到硬件 VENC");
         assert_eq!(hw.input_format(), PreviewInput::Yuyv);
 
-        let mut sw = PreviewEncoder::new(1, 80);
-        assert_eq!(sw.backend(), "sw", "第二个编码器应降级软件编码");
+        let mut sw = PreviewEncoder::new(None, 1, 80);
+        assert_eq!(sw.backend(), "sw", "没有会话时应降级软件编码");
         assert_eq!(sw.input_format(), PreviewInput::RgbPlanar);
 
         // 梯度图，避免全黑压缩后过小

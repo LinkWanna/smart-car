@@ -1,16 +1,4 @@
-//! camera.rs — V4L2 零拷贝相机，使用 `v4l` crate 替代手写 `videodev2.h`
-//!
-//! [`Camera::try_new`] 一步完成打开/校验/配置/申请缓冲/开流；采集用
-//! [`Camera::get_frame`]，返回的 [`CaptureFrame`] 是 mmap 缓冲的只读句柄：
-//! 帧下标封装在句柄内，归还由 [`CaptureFrame::release`] 或 `Drop` 完成。
-//! 可以同时持有多帧（上限是申请的缓冲数），全部不归还时 `DQBUF` 阻塞等待回填。
-//!
-//! ```ignore
-//! let camera = Camera::try_new("/dev/video0", "yuyv")?;
-//! let frame = camera.get_frame()?;
-//! let pixels = frame.as_slice();   // 零拷贝
-//! frame.release()?;                // 或者直接 drop(frame)
-//! ```
+//! camera.rs — V4L2 零拷贝相机
 
 use std::io;
 use std::os::unix::io::RawFd;
@@ -20,11 +8,7 @@ use v4l::format::FourCC;
 use v4l::v4l_sys::{v4l2_buffer, v4l2_capability, v4l2_format, v4l2_requestbuffers};
 use v4l::v4l2::vidioc;
 
-/// 一帧 mmap 缓冲的只读句柄，由 [`Camera::get_frame`] 返回。
-///
-/// 帧下标是句柄内部状态；`Drop` 自动 QBUF 归还，[`CaptureFrame::release`] 可
-/// 显式归还并拿到错误。句柄只借用 `&Camera`，所以可以同时持有多帧，
-/// 期间不能 `stop`/析构相机。
+/// mmap 缓冲的只读句柄
 pub struct CaptureFrame<'a> {
     camera: &'a Camera,
     idx: usize,
@@ -65,20 +49,12 @@ pub struct Camera {
     bufs: Vec<MmapBuffer>,
     w: u32,
     h: u32,
-    /// 驱动实际协商到的像素格式（如 `MJPG`）。
     fourcc: FourCC,
-    /// 打开的设备节点（USB 相机重新枚举后会变）。
     device: String,
 }
 
 impl Camera {
-    /// 打开设备并按 `fmt_str`（`yuyv` / `jpeg` / `mjpeg`）配置 640x480、
-    /// 申请 mmap 缓冲、启动视频流。
-    ///
-    /// 任一步失败返回 `io::Error`（消息带 `camera_init 失败:` 前缀），
-    /// 调用方（视觉管线 / 网页预览）据此优雅降级；成功后可用
-    /// [`Camera::pixel_format`] 检查驱动是否真的接受了请求的格式。
-    pub fn try_new(device: &str, fmt_str: &str) -> io::Result<Self> {
+    pub fn from_path(device: &str, fmt_str: &str) -> io::Result<Self> {
         let fourcc = match fmt_str {
             "yuyv" => FourCC::new(b"YUYV"),
             "jpeg" | "mjpeg" => FourCC::new(b"MJPG"),
@@ -92,30 +68,23 @@ impl Camera {
         let fd = v4l::v4l2::open(device, libc::O_RDWR).map_err(|e| {
             io::Error::new(e.kind(), format!("camera_init 失败: 打开 {device}: {e}"))
         })?;
-        match Self::setup(fd, fourcc, device) {
-            Ok(cam) => Ok(cam),
-            Err(e) => {
-                v4l::v4l2::close(fd).ok();
-                Err(e)
-            }
-        }
-    }
 
-    /// 在已打开的 fd 上完成配置；失败时由调用方关闭 fd。
-    fn setup(fd: RawFd, fourcc: FourCC, device: &str) -> io::Result<Self> {
         let mut cam = Self {
             fd,
             bufs: Vec::new(),
             w: 640,
             h: 480,
-            fourcc: FourCC::new(b"????"),
+            fourcc,
             device: device.to_string(),
         };
+
         if let Err(e) = cam.configure(fourcc) {
             cam.unmap_all();
+            v4l::v4l2::close(fd).ok();
             return Err(e);
         }
-        Ok(cam)
+
+        return Ok(cam);
     }
 
     /// 校验设备、协商格式、申请缓冲并开流。
@@ -343,7 +312,7 @@ impl std::fmt::Display for Camera {
 ///
 /// USB 相机重新枚举后编号会变（`video0` → `video1`），所以这里不能死认一个节点。
 pub fn open_yuyv(device: &str) -> io::Result<Camera> {
-    let first_error = match Camera::try_new(device, "yuyv") {
+    let first_error = match Camera::from_path(device, "yuyv") {
         Ok(camera) => return Ok(camera),
         Err(e) => e,
     };
@@ -371,7 +340,7 @@ pub fn open_yuyv(device: &str) -> io::Result<Camera> {
         if path == device {
             continue;
         }
-        if let Ok(camera) = Camera::try_new(path, "yuyv") {
+        if let Ok(camera) = Camera::from_path(path, "yuyv") {
             log::info!("{device} 不存在，改用 {path}（USB 重新枚举后编号会变）");
             return Ok(camera);
         }
@@ -396,12 +365,12 @@ mod tests {
     #[test]
     fn try_new_reports_instead_of_panicking() {
         // 不存在的设备：返回错误而不是 panic。
-        let err = match Camera::try_new("/dev/video-no-such", "mjpeg") {
+        let err = match Camera::from_path("/dev/video-no-such", "mjpeg") {
             Ok(_) => panic!("不存在的设备不应打开成功"),
             Err(e) => e,
         };
         assert!(err.to_string().contains("camera_init 失败"), "{err}");
         // 不支持的格式名同样报错。
-        assert!(Camera::try_new("/dev/video-no-such", "rgb").is_err());
+        assert!(Camera::from_path("/dev/video-no-such", "rgb").is_err());
     }
 }

@@ -1,7 +1,7 @@
 //! 网页预览与视觉之间的中性契约：一帧预览 = JPEG 画面 + **同帧**的视觉结果。
 //!
 //! 两个实现（`smartcar` 按硬件可用性二选一）：
-//! - [`crate::vision::VisionStream`]：CPU 管线（YUYV→RGB 软件转换 + 编码线程）；
+//! - [`crate::vision::VisionStream`]：CPU 管线（YUYV→RGB 转换 + 编码线程）；
 //! - [`crate::vision::VpssStream`]：VPSS 硬件管线（硬件 CSC + VENC 硬编）。
 //!
 //! 两者都是「相机 YUYV（模型输入格式）采集 + 编码」，画面与检测严格同帧。

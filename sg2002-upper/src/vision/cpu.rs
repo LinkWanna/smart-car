@@ -5,6 +5,7 @@
 //! 预览编码拖慢（C906 上 640x480 软件编码约 120ms，硬件 VENC 约 12ms），而网页
 //! 显示的仍是「模型看到的那一帧」，框与画面严格对齐。
 
+use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
@@ -12,15 +13,21 @@ use std::time::{Duration, Instant};
 
 use log::{info, warn};
 
+use cvimpi_rs::ffi;
+use cvimpi_rs::sys::{Sys, VbPoolConfig};
+use cvimpi_rs::venc_input_layout;
+
 use crate::preprocess::{PreviewEncoder, PreviewInput};
 use crate::preview::{CameraStatus, PreviewFrame, PreviewSource, VisionSnapshot, VisionStatus};
 
 use super::core::Vision;
 use super::state::{EncodePacket, StreamInner};
-use super::{VisionConfig, elapsed_ms, snapshot};
+use super::{FRAME_H, FRAME_W, VisionConfig, elapsed_ms, snapshot};
 
 /// 相机打开失败时的重试次数（USB 枚举/上一个进程释放设备都需要时间）。
 const CAMERA_OPEN_RETRIES: usize = 3;
+/// VB 公共池块数：RGB 输入帧 + NV12 编码输入帧 + VENC 码流缓冲。
+const VB_BLK_CNT: u32 = 6;
 
 /// 后台视觉源：采集/推理线程 + 预览编码线程，实现 [`PreviewSource`]。
 ///
@@ -38,17 +45,34 @@ impl VisionStream {
     pub fn start(cfg: VisionConfig) -> Self {
         let inner = Arc::new(StreamInner::new(cfg));
         let running = Arc::new(AtomicBool::new(true));
+        // 会话：TPU 零拷贝输入帧与硬件预览编码（VENC）共用一个 `Sys`
+        // （`CVI_SYS_Init` 是进程级状态，进程里只能有一个）。拿不到会话时
+        // 仍可软件预览，但没有推理（见 `Vision`）。
+        let session = match create_session() {
+            Ok(sys) => Some(Arc::new(sys)),
+            Err(e) => {
+                warn!("MMF 会话不可用（{e}）：预览降级软件编码，模型不可用");
+                None
+            }
+        };
         let (ready_tx, ready_rx) = mpsc::channel::<Result<String, String>>();
         // 容量 2：编码线程忙时允许排一帧，避免节拍量化导致预览帧率减半
         let (packet_tx, packet_rx) = mpsc::sync_channel::<EncodePacket>(2);
 
         let encoder_inner = Arc::clone(&inner);
         let encoder_running = Arc::clone(&running);
+        let encoder_session = session.clone();
         // 编码线程先定下后端（hw 要 YUYV、sw 要 RGB 平面），再开采集线程，
         // 避免首帧按错的格式拷贝数据（编码线程自己的初始化可能要几十毫秒）。
         let (enc_ready_tx, enc_ready_rx) = mpsc::channel::<()>();
         let encoder = thread::spawn(move || {
-            encoder_loop(packet_rx, encoder_inner, encoder_running, enc_ready_tx)
+            encoder_loop(
+                packet_rx,
+                encoder_inner,
+                encoder_running,
+                enc_ready_tx,
+                encoder_session,
+            )
         });
         if enc_ready_rx.recv_timeout(Duration::from_secs(5)).is_err() {
             warn!("编码线程初始化超时");
@@ -56,8 +80,9 @@ impl VisionStream {
 
         let thread_inner = Arc::clone(&inner);
         let thread_running = Arc::clone(&running);
-        let handle =
-            thread::spawn(move || capture_loop(thread_inner, thread_running, packet_tx, ready_tx));
+        let handle = thread::spawn(move || {
+            capture_loop(thread_inner, thread_running, packet_tx, ready_tx, session)
+        });
 
         let device = inner.cfg.device.clone();
         match ready_rx.recv_timeout(Duration::from_secs(10)) {
@@ -120,19 +145,35 @@ impl PreviewSource for VisionStream {
     }
 }
 
+/// 创建 CPU 管线的 MMF 会话：一个公共池要同时放得下模型输入的 RGB 平面帧
+/// 与 VENC 的 NV12 输入帧。
+fn create_session() -> io::Result<Sys> {
+    let rgb = venc_input_layout(
+        FRAME_W as u32,
+        FRAME_H as u32,
+        ffi::PIXEL_FORMAT_RGB_888_PLANAR,
+    )
+    .ok_or_else(|| io::Error::other("venc_input_layout 不支持 RGB_888_PLANAR"))?;
+    let nv12 = venc_input_layout(FRAME_W as u32, FRAME_H as u32, ffi::PIXEL_FORMAT_NV12)
+        .ok_or_else(|| io::Error::other("venc_input_layout 不支持 NV12"))?;
+    Sys::init(&[VbPoolConfig::new(rgb.vb_size.max(nv12.vb_size), VB_BLK_CNT).with_name("cpu")])
+        .map_err(|e| io::Error::other(format!("MMF 会话初始化失败: {e}")))
+}
+
 /// 采集/推理循环：模型帧 → 快照（控制线程用）+ 预览包（按 `preview_fps` 限频）。
 fn capture_loop(
     inner: Arc<StreamInner>,
     running: Arc<AtomicBool>,
     packets: mpsc::SyncSender<EncodePacket>,
     ready: mpsc::Sender<Result<String, String>>,
+    session: Option<Arc<Sys>>,
 ) {
     let cfg = inner.cfg.clone();
     // 相机可能还在枚举/被上一个进程占着：重试几次再放弃
     let mut vision = {
         let mut attempt = 0;
         loop {
-            match Vision::new(cfg.clone()) {
+            match Vision::new(cfg.clone(), session.as_deref()) {
                 Ok(vision) => break vision,
                 Err(e) if attempt < CAMERA_OPEN_RETRIES => {
                     attempt += 1;
@@ -256,8 +297,9 @@ fn encoder_loop(
     inner: Arc<StreamInner>,
     running: Arc<AtomicBool>,
     ready: mpsc::Sender<()>,
+    session: Option<Arc<Sys>>,
 ) {
-    let mut preview = PreviewEncoder::new(inner.cfg.scale, inner.cfg.quality);
+    let mut preview = PreviewEncoder::new(session.as_deref(), inner.cfg.scale, inner.cfg.quality);
     sync_preview_backend(&inner, &preview);
     // 采集线程在 `VisionStream::start` 里等这个信号，拿到后才开始采集
     let _ = ready.send(());

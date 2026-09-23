@@ -2,7 +2,7 @@
 //!
 //! 模块分层：
 //! - 感知：`camera`（V4L2 零拷贝 + YUYV 节点发现）、`preprocess`（YUYV→RGB / YUYV→JPEG
-//!   的像素工作流）、`tpu`（推理 + NMS）、`position`（位置/距离分级 + 控制观测）、
+//!   的像素工作流）、`yolo`（TPU 零拷贝推理 + NMS）、`position`（位置/距离分级 + 控制观测）、
 //!   `vision`（视觉域：单帧核心 + 两条管线 —— CPU `cpu` 与 VPSS 硬件 `vpss`，
 //!   共用线程状态与同帧预览契约）；
 //! - 下位机通信与控制：`control`（`protocol` 线协议——与固件共用的
@@ -12,11 +12,12 @@
 //!   手动/自动仲裁）、`preview`（预览与视觉之间的中性契约）。
 //! - 观测：`logging`（`log` + `simple_logger` 初始化）。
 //! - 硬件编解码：`hwjpeg`（SG2002 VENC 硬件 JPEG，封装在 `cvimpi-rs` 里，
-//!   编解码会话/通道/VB 池都由它管理；打不开硬件时上层降级到软件编码）。
+//!   会话由调用方提供（CPU 管线与 TPU 零拷贝输入帧共用），通道/VB 输入帧由它管理；
+//!   打不开硬件时上层降级到软件编码）。
 //!
 //! 入口 bin：`smartcar`（整合：视觉 + 网页 + 手动/自动）、`vpss_probe`（上板探针）。
 //!
-//! `camera` / `tpu` / `position` / `hwjpeg` 依赖板端 C 库与 V4L2，随 crate
+//! `camera` / `yolo` / `position` / `hwjpeg` 依赖板端 C 库与 V4L2，随 crate
 //! 无条件编译：板端直接运行，主机上可用 `cargo check` 做编译检查
 //! （链接/运行需要厂商库，只在板端进行）。
 //!
@@ -39,11 +40,15 @@
 //! 硬件句柄可能来不及清理，内核里会留下 VB 池 / bind 节点（下次启动的
 //! `Sys::init` 与 `clear_venc_bind` 会兜底，彻底恢复需要重启设备）。
 //!
-//! ## `unsafe 'static` 约定
+//! ## 会话（`Sys`）与生命周期
 //!
-//! [`hwjpeg::HwJpeg`] 与 `vision::vpss::VpssPipeline` 都持有「借用会话的句柄 +
-//! 会话本身」，用 `unsafe` 把借用延长成 `'static`（`cvimpi_rs::sys::Sys` 不能
-//! 被句柄安全借用，见 `cvimpi-rs` 的说明）。两条硬约定：
+//! `CVI_SYS_Init` 是进程级状态，一个进程只能有一个 [`cvimpi_rs::sys::Sys`]：
+//!
+//! - CPU 管线（`vision::cpu`）在 [`vision::VisionStream::start`] 里建会话，
+//!   用 `Arc<Sys>` 共享给采集线程（TPU 零拷贝输入帧）与编码线程（`HwJpeg`
+//!   借用）；拿不到会话时仍可软件预览，但没有推理；
+//! - VPSS 管线（`vision::vpss`）自己持有会话：`VpssPipeline` 持有「借用会话的
+//!   句柄 + 会话本身」，用 `unsafe` 把借用延长成 `'static`。两条硬约定：
 //!
 //! 1. 会话放在 `Box<Sys>` 里且**移动结构体不会移动它**（堆地址稳定）；
 //! 2. 结构体字段声明顺序 = 析构顺序，`_sys` 必须声明在最后、最后析构。
@@ -58,9 +63,9 @@ pub mod logging;
 pub mod position;
 pub mod preprocess;
 pub mod preview;
-pub mod tpu;
 pub mod vision;
 pub mod web;
+pub mod yolo;
 
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};

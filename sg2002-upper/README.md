@@ -23,6 +23,10 @@ SMARTCAR_LOG=warn,hwjpeg=debug ./smartcar --bind 192.168.1.2  # 默认 warn，�
 
 VPSS 建组失败 / 组号用尽 / 模型输入尺寸不匹配 → 自动回退 `--vpss off`（CPU 路径）。
 
+`--vpss off`（CPU 路径）走同一条零拷贝链路：YUYV→RGB 直接写进 VB 帧的三个平面
+（`Frame::planes_mut`，一次遍历、无中间缓冲），flush 后把物理地址交给 TPU；
+MMF 会话与硬件 VENC 预览共用（`CVI_SYS_Init` 进程级只有一个 `Sys`）。
+
 实测（640x480 YUYV、`yolov8n_tennis_v3`、同一场景）：
 
 | | `--vpss auto` | `--vpss off` |
@@ -31,7 +35,7 @@ VPSS 建组失败 / 组号用尽 / 模型输入尺寸不匹配 → 自动回退 
 | smartcar CPU 占用 | **6%** | 42% |
 | 预览 JPEG | 640x480 ~33KB，WS 推送 **16.5 fps** | 640x480 ~29KB |
 | 预览编码耗时 | ~4ms（bind，编码在 TPU 期间完成） | ~22ms |
-| 推理 | ~31ms（零拷贝） | ~32ms（含 921KB memcpy） |
+| 推理 | ~31ms（零拷贝） | ~33ms（零拷贝） |
 
 带宽：640x480@16.5fps ≈ 545KB/s（约 4.4Mbps），走 AP 没问题；要省流量就
 `--video-fps 8`（或加大 `--quality` 之外的压缩，但一般不必）。

@@ -230,6 +230,14 @@ impl<'a> Frame<'a> {
         self.info.stVFrame.u32Length[plane]
     }
 
+    /// 平面物理地址（交给硬件用；`0` 表示该平面不存在）。
+    ///
+    /// 典型用途是喂 TPU（`CVI_NN_SetTensorPhysicalAddr`）：RGB 平面帧的
+    /// 三个平面物理地址连续、stride 等于宽度，正好是模型要的 NCHW 布局。
+    pub fn phy_addr(&self, plane: usize) -> u64 {
+        self.info.stVFrame.u64PhyAddr[plane]
+    }
+
     /// 整个平面（含 stride）的可变视图。
     pub fn plane_mut(&mut self, plane: usize) -> Result<&mut [u8]> {
         if plane >= 3 {
@@ -242,6 +250,51 @@ impl<'a> Frame<'a> {
         }
         // SAFETY: 该平面由 `map_plane` 映射了恰好 `len` 字节，且归本 `Frame` 所有。
         Ok(unsafe { slice::from_raw_parts_mut(ptr, len) })
+    }
+
+    /// 三个平面的只读视图（未映射的平面为空切片）。
+    ///
+    /// 一次读取多个平面（如把 RGB 平面帧打包成紧凑缓冲）时用它，
+    /// 免去逐个 [`Frame::plane_mut`] 的借用冲突。
+    pub fn planes(&self) -> [&[u8]; 3] {
+        let v = &self.info.stVFrame;
+        let ptrs = [
+            v.pu8VirAddr[0].cast_const(),
+            v.pu8VirAddr[1].cast_const(),
+            v.pu8VirAddr[2].cast_const(),
+        ];
+        let lens = [
+            v.u32Length[0] as usize,
+            v.u32Length[1] as usize,
+            v.u32Length[2] as usize,
+        ];
+        // SAFETY: 三个平面是三次独立映射的区间，互不重叠；`&self` 保证没有
+        // 可变借用同时存在（见 `planes_mut` 的说明）。
+        [
+            unsafe { plane_slice(ptrs[0], lens[0]) },
+            unsafe { plane_slice(ptrs[1], lens[1]) },
+            unsafe { plane_slice(ptrs[2], lens[2]) },
+        ]
+    }
+
+    /// 三个平面同时可变借用（未映射的平面为空切片）。
+    ///
+    /// 适合一次遍历写多个平面的转换（如 YUYV422 → RGB 平面）；
+    /// 单平面写入用 [`Frame::plane_mut`] 即可。
+    pub fn planes_mut(&mut self) -> [&mut [u8]; 3] {
+        let v = &mut self.info.stVFrame;
+        let ptrs = [v.pu8VirAddr[0], v.pu8VirAddr[1], v.pu8VirAddr[2]];
+        let lens = [
+            v.u32Length[0] as usize,
+            v.u32Length[1] as usize,
+            v.u32Length[2] as usize,
+        ];
+        // SAFETY: `&mut self` 保证独占；三个平面是三次独立映射的区间，互不重叠。
+        [
+            unsafe { plane_slice_mut(ptrs[0], lens[0]) },
+            unsafe { plane_slice_mut(ptrs[1], lens[1]) },
+            unsafe { plane_slice_mut(ptrs[2], lens[2]) },
+        ]
     }
 
     /// 把紧凑排布的帧数据（Y，然后 U/V 或交织的 UV）拷入已映射的平面，
@@ -269,6 +322,26 @@ impl<'a> Frame<'a> {
             }
         }
         Ok(())
+    }
+}
+
+/// SAFETY: `ptr`/`len` 必须描述一段有效映射，或 `ptr` 为空 / `len` 为 0。
+unsafe fn plane_slice<'x>(ptr: *const u8, len: usize) -> &'x [u8] {
+    if ptr.is_null() || len == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(ptr, len) }
+    }
+}
+
+/// SAFETY: 同 [`plane_slice`]；调用方还要保证各平面区间互不重叠。
+unsafe fn plane_slice_mut<'x>(ptr: *mut u8, len: usize) -> &'x mut [u8] {
+    if ptr.is_null() || len == 0 {
+        // 空切片也要非空指针（`from_raw_parts_mut` 的前置条件）。
+        let dangling = core::ptr::NonNull::<u8>::dangling().as_ptr();
+        unsafe { slice::from_raw_parts_mut(dangling, 0) }
+    } else {
+        unsafe { slice::from_raw_parts_mut(ptr, len) }
     }
 }
 

@@ -7,15 +7,16 @@
 //! smartcar --no-vision            # 只遥控（无视觉，自动模式不可用）
 //! smartcar --quality 80          # 预览 JPEG 质量
 //! smartcar --video-fps 10        # 限制预览帧率（默认 0 = 不锁帧，跟相机）
-//! smartcar --vpss off            # 只用 CPU 路径（YUYV→RGB 软件转换 + memcpy）
+//! smartcar --vpss off            # 只用 CPU 路径（YUYV→RGB 直写 VB 帧，零拷贝喂 TPU）
 //! ```
 //!
 //! 视觉后端（`--vpss auto` 默认）：
 //! - **VPSS 硬件**（`vision::vpss`）：相机 YUYV 只 memcpy 一次进 VB 块，硬件 CSC
 //!   同时出 chn0 RGB 平面（物理地址零拷贝喂 TPU）与 chn1 NV12（VENC 硬编 JPEG，
 //!   640x480 原尺寸、每帧都出；`--video-fps` 只作为可选的推送上限）；
-//! - **CPU 路径**（`vision::cpu`，回退）：YUYV→RGB 软件转换 + memcpy 喂 TPU，
-//!   预览走 VENC/软件编码。VPSS 建组失败、组号用尽或模型尺寸不匹配时自动回退。
+//! - **CPU 路径**（`vision::cpu`，回退）：YUYV→RGB 直接写进 VB 帧（CPU 转换），
+//!   物理地址零拷贝喂 TPU；预览走 VENC/软件编码。VPSS 建组失败、组号用尽或
+//!   模型尺寸不匹配时自动回退。
 //!
 //! 输入模式由页面按钮切换（默认手动，不允许键盘悄悄切换）：
 //! - **手动**：WASD（`control::teleop`：油门斜坡 + 转向 + 输入看门狗）；
@@ -152,7 +153,7 @@ enum VpssMode {
     /// 优先 VPSS 硬件 CSC（chn0 RGB 平面零拷贝喂 TPU + chn1 NV12 硬编预览），
     /// 建组失败/组号用尽/模型尺寸不匹配时自动回退 CPU 路径。
     Auto,
-    /// 只用 CPU 路径（YUYV→RGB 软件转换 + memcpy 喂 TPU）。
+    /// 只用 CPU 路径（YUYV→RGB 直写 VB 帧，零拷贝喂 TPU）。
     Off,
 }
 

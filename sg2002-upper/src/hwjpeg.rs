@@ -18,9 +18,10 @@
 //! - 输入固定 640x480 YUYV422（与相机一致）；
 //! - 任何失败都返回 `io::Error`，上层据此降级到软件编码。
 //!
-//! 编解码会话（`CVI_SYS_Init` + 公共 VB 池）由 `cvimpi-rs` 的
-//! [`Sys`] 持有；`HwJpeg` 析构时按 `Encoder` → `Frame` → `Sys` 的顺序
-//! 清理，不会给内核留下残留池。
+//! 编解码会话（`CVI_SYS_Init` + 公共 VB 池）**由调用方提供**：进程里只能有一个
+//! [`Sys`]（`CVI_SYS_Init` 是进程级状态），CPU 管线把它和 TPU 零拷贝输入帧
+//! 共用（见 [`crate::vision::cpu`]），所以这里只借用、不拥有。池的 block 要
+//! 放得下 NV12 输入帧（`venc_input_layout`）。
 
 use std::io;
 use std::marker::PhantomData;
@@ -29,35 +30,28 @@ use std::time::Instant;
 
 use cvimpi_rs::encoder::{Encoder, EncoderConfig, Frame};
 use cvimpi_rs::ffi;
-use cvimpi_rs::sys::{Sys, VbPoolConfig};
-use cvimpi_rs::venc_input_layout;
+use cvimpi_rs::sys::Sys;
 
 use crate::preprocess::{FRAME_H, FRAME_W, YUYV_LEN, yuyv422_to_nv12_uv, yuyv422_to_nv12_y};
 
 /// 编码输入帧的像素格式：驱动只接受 semi-planar YUV420（见模块注释）。
 const INPUT_FORMAT: ffi::PIXEL_FORMAT_E = ffi::PIXEL_FORMAT_NV12;
-/// VB 公共池块数（与旧的 C 封装一致）。
-const VB_BLK_CNT: u32 = 4;
 
 /// 硬件 JPEG 编码器句柄（与创建它的线程绑定）。
-pub struct HwJpeg {
-    /// VENC 通道。字段声明顺序 = 析构顺序：`enc`/`frame` 先于 `_sys`，
-    /// 保证句柄不会在会话之后被拆掉（借用检查器看不到这一层，见 `new`）。
-    enc: Encoder<'static>,
+pub struct HwJpeg<'a> {
+    /// VENC 通道。字段声明顺序 = 析构顺序：`enc`/`frame` 先于调用方的会话，
+    /// 保证句柄不会在会话之后被拆掉。
+    enc: Encoder<'a>,
     /// 复用的编码输入帧（VB 块），避免每帧重新申请/映射。
-    frame: Frame<'static>,
-    /// 进程级编解码会话（`CVI_SYS_Init` + 公共 VB 池）。
-    ///
-    /// `Box` 让堆地址稳定：`enc`/`frame` 的 `'static` 借用实际指向这里，
-    /// 且移动 `HwJpeg` 不会移动它。
-    _sys: Box<Sys>,
+    frame: Frame<'a>,
     /// 保持 `!Send`：VENC 通道必须固定线程使用。
     _not_send: PhantomData<*const ()>,
 }
 
-impl HwJpeg {
-    /// 打开 VENC 通道；失败（没有厂商库/内核不支持/参数非法）返回错误，上层降级。
-    pub fn new(width: u32, height: u32, quality: u8) -> io::Result<Self> {
+impl<'a> HwJpeg<'a> {
+    /// 在会话 `sys` 上打开 VENC 通道；失败（没有厂商库/内核不支持/参数非法）
+    /// 返回错误，上层降级到软件编码。
+    pub fn new(sys: &'a Sys, width: u32, height: u32, quality: u8) -> io::Result<Self> {
         if width as usize != FRAME_W || height as usize != FRAME_H {
             return Err(io::Error::other(format!(
                 "硬件编码只支持 {FRAME_W}x{FRAME_H}，收到 {width}x{height}"
@@ -70,32 +64,19 @@ impl HwJpeg {
             quality.clamp(1, 99)
         };
 
-        let layout = venc_input_layout(width, height, INPUT_FORMAT)
-            .ok_or_else(|| io::Error::other("venc_input_layout 不支持 NV12"))?;
-        let sys = Box::new(
-            Sys::init(&[VbPoolConfig::new(layout.vb_size, VB_BLK_CNT).with_name("hwjpeg")])
-                .map_err(|e| io::Error::other(format!("JPEG 会话初始化失败: {e}")))?,
-        );
-
-        // SAFETY: `sys` 在堆上（移动 `HwJpeg` 不会移动它），而 `enc`/`frame` 按
-        // 字段顺序（也是局部变量逆序）先于 `sys` 析构，所以这里延长的 `'static`
-        // 借用不会真的超出会话；`session` 只在构造函数内部使用，不对外泄露。
-        let session: &'static Sys = unsafe { &*(&*sys as *const Sys) };
-
-        let enc = session
+        let enc = sys
             .create_encoder(
                 0,
                 &EncoderConfig::new(width, height, INPUT_FORMAT).with_quality(u32::from(quality)),
             )
             .map_err(|e| io::Error::other(format!("CVI_VENC 通道创建失败: {e}")))?;
-        let frame = session
+        let frame = sys
             .alloc_frame_cached(width, height, INPUT_FORMAT)
             .map_err(|e| io::Error::other(format!("编码输入帧分配失败: {e}")))?;
 
         Ok(Self {
             enc,
             frame,
-            _sys: sys,
             _not_send: PhantomData,
         })
     }
@@ -151,6 +132,8 @@ fn write_nv12(frame: &mut Frame<'_>, yuyv: &[u8]) -> cvimpi_rs::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cvimpi_rs::sys::VbPoolConfig;
+    use cvimpi_rs::venc_input_layout;
 
     /// 构造「YUYV：U=10+行号%2、V=200-列号%2、Y=列号」的可区分测试图。
     fn yuyv_pattern() -> Vec<u8> {
@@ -184,9 +167,12 @@ mod tests {
 
         let rounds = 30u32;
         let yuyv = yuyv_pattern();
-        let mut hw = HwJpeg::new(FRAME_W as u32, FRAME_H as u32, 70).expect("硬件编码不可用");
-        let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
         let (w, h) = (FRAME_W as u32, FRAME_H as u32);
+        let layout = venc_input_layout(w, h, INPUT_FORMAT).expect("NV12 布局");
+        let sys = Sys::init(&[VbPoolConfig::new(layout.vb_size, 4).with_name("hwjpeg")])
+            .expect("JPEG 会话初始化失败");
+        let mut hw = HwJpeg::new(&sys, w, h, 70).expect("硬件编码不可用");
+        let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
         assert!(hw.frame.is_cached(), "生产路径应使用 cached 输入帧");
 
         // 预热：首帧要等 VENC 起流，不参与统计
@@ -214,7 +200,7 @@ mod tests {
         );
 
         // 对照：uncached 输入帧直写（store 是 posted 的，加 fence 才是真实耗时）
-        let mut uncached = hw._sys.alloc_frame(w, h, INPUT_FORMAT).unwrap();
+        let mut uncached = sys.alloc_frame(w, h, INPUT_FORMAT).unwrap();
         let (mut conv, mut venc) = (0.0f64, 0.0f64);
         for _ in 0..rounds {
             fence(Ordering::SeqCst);

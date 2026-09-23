@@ -3,7 +3,7 @@
 //! 输入 TPU 检测框，输出 [`PositionResult`]（九宫格分区 / 距离分级）；以及
 //! 控制律用的 [`Observation`]（`PositionResult` 的轻量投影）与 [`Distance`]。
 
-use crate::tpu::Detection;
+use crate::yolo::Detection;
 
 /// 九宫格边界（640x480 管线的默认值）：横向/纵向 33%~66%。
 const LEFT_BOUNDARY: f32 = 0.33;

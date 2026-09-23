@@ -1,7 +1,7 @@
 ip addr add 192.168.1.2/24 dev eth0
 ./smartcar --bind 192.168.1.2     # 整合：视觉追踪 + 网页（手动/自动切换）
 
-# 日志走 stderr（时间戳/级别/模块），默认 info；级别用 SMARTCAR_LOG 控制：
+# 日志走 stderr（时间戳只有 时:分:秒.毫秒 / 级别 / 模块），默认 info；级别用 SMARTCAR_LOG 控制：
 SMARTCAR_LOG=debug ./smartcar --bind 192.168.1.2           # 全部 debug（含逐帧编码耗时）
 SMARTCAR_LOG=warn,hwjpeg=debug ./smartcar --bind 192.168.1.2  # 默认 warn，只看编码耗时
 

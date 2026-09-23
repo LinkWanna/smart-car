@@ -1,7 +1,13 @@
 //! 日志初始化：`log` 门面 + `simple_logger` 后端。
 //!
 //! 每个 bin 在 `main` 开头调用 [`init`]；库内直接用 `log::{info, warn, error, debug}`
-//! 宏，输出到 **stderr**（带时间戳 / 级别 / 模块，tty 上带颜色）。
+//! 宏，输出到 **stderr**（tty 上带颜色）：
+//!
+//! ```text
+//! 03:26:54.562 INFO  [smartcar]  页面：http://192.168.1.2/
+//! ```
+//!
+//! 时间戳只保留 `时:分:秒.毫秒`（板端没有 RTC，年月日没有意义，只会刷屏）。
 //!
 //! 级别由环境变量 `SMARTCAR_LOG` 控制（未设置时看 `RUST_LOG`，默认 `info`）：
 //!
@@ -16,6 +22,10 @@ use log::LevelFilter;
 /// 本 crate 的模块路径前缀（短模块名 `vision` 会展开成 `sg2002_upper::vision`）。
 const CRATE: &str = "sg2002_upper";
 
+/// 时间戳格式：只留时分秒.毫秒（默认格式会带 `1970-01-01T...Z`，板端没 RTC 纯噪声）。
+const TIMESTAMP_FORMAT: &[time::format_description::FormatItem<'static>] =
+    time::macros::format_description!("[hour]:[minute]:[second].[subsecond digits:3]");
+
 /// 初始化全局 logger；重复调用忽略（已经初始化过就保持原样）。
 pub fn init() {
     let spec = std::env::var("SMARTCAR_LOG")
@@ -23,7 +33,9 @@ pub fn init() {
         .unwrap_or_default();
     let (default, overrides) = parse_spec(&spec);
 
-    let mut logger = simple_logger::SimpleLogger::new().with_level(default);
+    let mut logger = simple_logger::SimpleLogger::new()
+        .with_level(default)
+        .with_timestamp_format(TIMESTAMP_FORMAT);
     for (target, level) in overrides {
         logger = logger.with_module_level(&target, level);
     }

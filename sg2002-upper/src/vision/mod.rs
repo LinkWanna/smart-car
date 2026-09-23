@@ -1,10 +1,14 @@
-//! 视觉域：相机 YUYV → 预处理 → TPU 推理 → 位置分析 →（同帧）JPEG 预览。
+//! 视觉域：相机 YUYV → 预处理 → TPU 推理 →（同帧）JPEG 预览。
+//!
+//! 视觉只负责「检测框」：本模块的输出是 [`crate::yolo::Detection`]（像素坐标）
+//! 与统计信息，不做分区/距离/控制律输入这类高层语义（那是追踪侧的事，
+//! 见 [`crate::control::position`]）。
 //!
 //! 两条管线，共用本模块的状态与契约（选择在 `smartcar`，VPSS 不可用时回退 CPU）：
 //!
 //! - [`VisionStream`]（`cpu` 子模块）：CPU 版，采集/推理一个线程、JPEG 编码另一个线程。
-//!   采集线程把**模型真正消费的那一帧**（YUYV 或 RGB 缓冲拷贝 + 检测快照）投给
-//!   编码线程，编码线程编码完把 `(JPEG, 同帧快照)` 发布给网页；
+//!   采集线程把**模型真正消费的那一帧**（YUYV 或 RGB 缓冲拷贝 + 检测帧）投给
+//!   编码线程，编码线程编码完把 `(JPEG, 同帧检测)` 发布给网页；
 //! - [`VpssStream`]（`vpss` 子模块）：VPSS 硬件版，单线程：相机 YUYV 只 memcpy 一次
 //!   进 VB 块，硬件 CSC 出 RGB 平面（TPU 零拷贝）与 NV12（VENC 硬编预览）。
 //!
@@ -12,7 +16,7 @@
 //!
 //! 子模块分工：
 //!
-//! - `core`：[`Vision`] 单帧步进（采集 → 预处理 → 推理 → 位置分析）；
+//! - `core`：[`Vision`] 单帧步进（采集 → 预处理 → 推理）；
 //! - `state`：两条管线共用的线程状态（`StreamInner`/`StreamState`）与
 //!   [`crate::preview::PreviewSource`] 实现；
 //! - `cpu`：CPU 管线的线程编排；
@@ -24,8 +28,8 @@
 
 use std::time::Instant;
 
-use crate::position::{Observation, PositionResult};
-use crate::preview::{DetectionBox, TargetInfo, VisionSnapshot, VisionTimings};
+use crate::preview::{DetectionFrame, VisionTimings};
+use crate::yolo::Detection;
 
 mod core;
 mod cpu;
@@ -75,40 +79,19 @@ impl Default for VisionConfig {
 pub struct VisionStep {
     pub seq: u64,
     pub at: Instant,
-    pub result: PositionResult,
+    /// 检测框（像素坐标）。
+    pub dets: Vec<Detection>,
     /// 给预览线程的数据（按 `PreviewInput` 拷贝，`None` = 不带）。
     pub preview: Option<Vec<u8>>,
     pub timings: VisionTimings,
 }
 
-/// 由一帧结果构造网页/控制用的快照（归一化检测框 + 控制律输入 + 分级信息）。
-pub fn snapshot(step: &VisionStep) -> VisionSnapshot {
-    let observation = Observation::from_result(&step.result);
-    let dets = step
-        .result
-        .all_detections
-        .iter()
-        .map(|d| DetectionBox {
-            x1: d.x1 / FRAME_W as f32,
-            y1: d.y1 / FRAME_H as f32,
-            x2: d.x2 / FRAME_W as f32,
-            y2: d.y2 / FRAME_H as f32,
-            confidence: d.confidence,
-        })
-        .collect();
-    let target = step.result.has_target().then(|| TargetInfo {
-        err_x: observation.err_x,
-        zone: step.result.zone.clone(),
-        distance: step.result.distance.clone(),
-        confidence: step.result.target_confidence,
-    });
-    VisionSnapshot {
+/// 由一帧结果构造检测帧（控制线程与网页共用；与预览 JPEG 同帧）。
+pub fn detection_frame(step: &VisionStep) -> DetectionFrame {
+    DetectionFrame {
         seq: step.seq,
         at: step.at,
-        dets,
-        observation,
-        target,
-        timings: step.timings,
+        dets: step.dets.clone(),
     }
 }
 
@@ -119,10 +102,9 @@ pub(crate) fn elapsed_ms(since: Instant) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::yolo::Detection;
 
     #[test]
-    fn snapshot_normalizes_detections() {
+    fn detection_frame_keeps_frame_pairing() {
         let det = Detection {
             label: "tennis_ball".into(),
             confidence: 0.9,
@@ -131,30 +113,19 @@ mod tests {
             x2: 320.0,
             y2: 240.0,
         };
-        let result = PositionResult {
-            target_class: "tennis_ball".into(),
-            target_confidence: 0.9,
-            center_x: 0.375,
-            center_y: 0.375,
-            size_ratio: 0.03,
-            zone: "left_top".into(),
-            distance: "far".into(),
-            detection_count: 1,
-            all_detections: vec![det],
-        };
         let step = VisionStep {
             seq: 7,
             at: Instant::now(),
-            result,
+            dets: vec![det],
             preview: None,
             timings: VisionTimings::default(),
         };
-        let snap = snapshot(&step);
-        assert_eq!(snap.seq, 7);
-        assert_eq!(snap.dets.len(), 1);
-        let d = snap.dets[0];
-        assert!((d.x1 - 0.25).abs() < 1e-6 && (d.y2 - 0.5).abs() < 1e-6);
-        assert!(snap.target.is_some());
-        assert!((snap.observation.err_x + 0.25).abs() < 1e-6);
+        let frame = detection_frame(&step);
+        assert_eq!(frame.seq, 7);
+        assert_eq!(frame.at, step.at);
+        assert_eq!(frame.dets.len(), 1);
+        assert_eq!(frame.dets[0].label, "tennis_ball");
+        assert!((frame.dets[0].confidence - 0.9).abs() < 1e-6);
+        assert!((frame.dets[0].x1 - 160.0).abs() < 1e-6);
     }
 }

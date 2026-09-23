@@ -1,7 +1,11 @@
-//! position.rs — 位置分析，移植自 python/src/position.py
+//! control/position.rs — 位置分析：检测框 → 九宫格分区 / 距离分级（追踪侧语义）。
 //!
-//! 输入 TPU 检测框，输出 [`PositionResult`]（九宫格分区 / 距离分级）；以及
-//! 控制律用的 [`Observation`]（`PositionResult` 的轻量投影）与 [`Distance`]。
+//! 这是**自动追踪侧**的高层语义：vision 只输出检测框（`Vec<Detection>`），
+//! 由控制会话（[`super::session::ControlSession`]）在自动模式下调用本模块，
+//! 得到控制律输入 [`Observation`]。
+//!
+//! 输入检测框（像素坐标），输出 [`PositionResult`]（九宫格分区 / 距离分级）；
+//! 以及控制律用的 [`Observation`]（`PositionResult` 的轻量投影）与 [`Distance`]。
 
 use crate::yolo::Detection;
 
@@ -39,7 +43,6 @@ pub struct PositionResult {
     pub zone: String,
     pub distance: String,
     pub detection_count: usize,
-    pub all_detections: Vec<Detection>,
 }
 
 impl PositionResult {
@@ -128,7 +131,6 @@ impl PositionAnalyzer {
             zone: Zone::NONE.to_string(),
             distance: "none".to_string(),
             detection_count: detections.len(),
-            all_detections: detections.to_vec(),
         };
 
         // 零拷贝过滤：仅借用，避免 Vec 克隆

@@ -37,14 +37,13 @@ use cvimpi_rs::venc_input_layout;
 use cvimpi_rs::vpss::{VPSS_GRP_AUTO, Vpss, VpssChnConfig, VpssConfig};
 
 use crate::camera::open_yuyv;
-use crate::position::PositionAnalyzer;
 use crate::preview::{
-    CameraStatus, PreviewFrame, PreviewSource, VisionSnapshot, VisionStatus, VisionTimings,
+    CameraStatus, DetectionFrame, PreviewFrame, PreviewSource, VisionStatus, VisionTimings,
 };
 use crate::yolo::Yolo;
 
 use super::state::StreamInner;
-use super::{FRAME_H, FRAME_W, VisionConfig, VisionStep, elapsed_ms, snapshot};
+use super::{FRAME_H, FRAME_W, VisionConfig, VisionStep, detection_frame, elapsed_ms};
 
 /// 预览队列深度（chn1 用户态取帧队列）。
 ///
@@ -126,8 +125,8 @@ impl PreviewSource for VpssStream {
         self.inner.vision_status()
     }
 
-    fn latest_snapshot(&self) -> Option<Arc<VisionSnapshot>> {
-        self.inner.latest_snapshot()
+    fn latest_detections(&self) -> Option<Arc<DetectionFrame>> {
+        self.inner.latest_detections()
     }
 
     fn stop(&self) {
@@ -155,12 +154,11 @@ struct VpssPipeline {
     infer: Option<Yolo>,
     model_error: Option<String>,
     model_input: String,
-    pos: PositionAnalyzer,
     cfg: VisionConfig,
     seq: u64,
-    /// `(pts, 快照)`：chn1 在内核里直接进 VENC，用户态看不到帧，
-    /// 只能靠帧 PTS 把码流和快照精确对上。
-    snapshots: VecDeque<(u64, Arc<VisionSnapshot>)>,
+    /// `(pts, 检测帧)`：chn1 在内核里直接进 VENC，用户态看不到帧，
+    /// 只能靠帧 PTS 把码流和检测帧精确对上。
+    snapshots: VecDeque<(u64, Arc<DetectionFrame>)>,
     /// 会话（堆上，地址稳定）。
     _sys: Box<Sys>,
 }
@@ -271,8 +269,6 @@ impl VpssPipeline {
             warn!("VPSS 管线模型不可用（仅预览，自动模式不可用）：{err}");
         }
 
-        let pos = PositionAnalyzer::for_640x480();
-
         Ok(Self {
             vpss,
             enc,
@@ -281,7 +277,6 @@ impl VpssPipeline {
             infer,
             model_error,
             model_input,
-            pos,
             cfg,
             seq: 0,
             snapshots: VecDeque::with_capacity(SNAPSHOT_QUEUE),
@@ -316,7 +311,7 @@ impl VpssPipeline {
                 Ok(step) => {
                     {
                         let mut state = inner.state.lock().unwrap();
-                        state.record_model_frame(Instant::now(), &step.timings, step.snapshot);
+                        state.record_model_frame(Instant::now(), &step.timings, step.frame);
                         state.error = self.model_error.clone();
                         state.encode = ENCODE_LABEL.to_string();
                         state.encode_ms = step.timings.encode_ms;
@@ -324,11 +319,11 @@ impl VpssPipeline {
                     }
                     if let Some(paired) = step.preview {
                         let frame = Arc::new(PreviewFrame {
-                            // 用配对快照的 seq：链路积压时码流可能是旧帧，
-                            // 用它的 seq 保证 `jpeg` 和 `vision` 始终同帧。
-                            seq: paired.snapshot.seq,
+                            // 用配对帧的 seq：链路积压时码流可能是旧帧，
+                            // 用它的 seq 保证 `jpeg` 和 `dets` 始终同帧。
+                            seq: paired.frame.seq,
                             jpeg: Some(paired.jpeg),
-                            vision: Some(paired.snapshot),
+                            dets: Some(paired.frame),
                         });
                         let mut state = inner.state.lock().unwrap();
                         state.record_preview(frame, paired.encode_ms, Instant::now());
@@ -409,34 +404,28 @@ impl VpssPipeline {
             self.infer = None;
         }
 
-        // 4) 位置分析
-        let t2 = Instant::now();
-        let result = self.pos.analyze(&dets);
-        let position_ms = elapsed_ms(t2);
-
-        // 5) 快照（预览与检测严格同帧）
+        // 4) 检测帧（位置/距离等语义由追踪侧自己算）+ 预览与检测严格同帧
         let step = VisionStep {
             seq: self.seq,
             at: t_frame,
-            result,
+            dets,
             preview: None,
             timings: VisionTimings {
                 capture_ms,
                 preprocess_ms: vpss_ms,
                 infer_ms,
                 nms_ms,
-                position_ms,
                 encode_ms: 0.0, // 下面补
                 total_ms: elapsed_ms(t_frame),
             },
         };
-        let snapshot = Arc::new(snapshot(&step));
+        let frame = Arc::new(detection_frame(&step));
         self.seq += 1;
 
-        // 6) 预览交接：chn1 在内核里直接进 VENC，**每帧都必须取走码流**
+        // 5) 预览交接：chn1 在内核里直接进 VENC，**每帧都必须取走码流**
         //    （否则 VENC 队列会顶住整条链路）；编码与上面的 TPU 天然并行，
-        //    所以这里几乎不等待。按帧 PTS 取回同帧快照（见 `take_snapshot_by_pts`）。
-        self.register_snapshot(self.seq.wrapping_sub(1), &snapshot);
+        //    所以这里几乎不等待。按帧 PTS 取回同帧检测（见 `take_detections_by_pts`）。
+        self.register_detections(self.seq.wrapping_sub(1), &frame);
         let t3 = Instant::now();
         let (jpeg, meta) = self
             .enc
@@ -445,14 +434,14 @@ impl VpssPipeline {
         let encode_ms = elapsed_ms(t3);
         let jpeg: Arc<[u8]> = Arc::from(jpeg);
         let paired = self
-            .take_snapshot_by_pts(meta.pts)
-            .unwrap_or_else(|| Arc::clone(&snapshot));
+            .take_detections_by_pts(meta.pts)
+            .unwrap_or_else(|| Arc::clone(&frame));
         let preview = if jpeg.is_empty() {
             None
         } else {
             Some(PairedPreview {
                 jpeg,
-                snapshot: paired,
+                frame: paired,
                 encode_ms,
             })
         };
@@ -463,21 +452,21 @@ impl VpssPipeline {
         };
         Ok(VpssStep {
             timings,
-            snapshot,
+            frame,
             preview,
         })
     }
 
-    /// 登记 `(pts, 快照)` 供码流 PTS 匹配。
-    fn register_snapshot(&mut self, pts: u64, snapshot: &Arc<VisionSnapshot>) {
-        self.snapshots.push_back((pts, Arc::clone(snapshot)));
+    /// 登记 `(pts, 检测帧)` 供码流 PTS 匹配。
+    fn register_detections(&mut self, pts: u64, frame: &Arc<DetectionFrame>) {
+        self.snapshots.push_back((pts, Arc::clone(frame)));
         while self.snapshots.len() > SNAPSHOT_QUEUE {
             self.snapshots.pop_front();
         }
     }
 
-    /// 按 PTS 取走快照（取不到返回 `None`，调用方兜底用当前帧）。
-    fn take_snapshot_by_pts(&mut self, pts: u64) -> Option<Arc<VisionSnapshot>> {
+    /// 按 PTS 取走检测帧（取不到返回 `None`，调用方兜底用当前帧）。
+    fn take_detections_by_pts(&mut self, pts: u64) -> Option<Arc<DetectionFrame>> {
         let idx = self.snapshots.iter().position(|(p, _)| *p == pts)?;
         self.snapshots.remove(idx).map(|(_, s)| s)
     }
@@ -500,17 +489,17 @@ impl VpssPipeline {
     }
 }
 
-/// 一帧的结果（快照 + 可选预览）。
+/// 一帧的结果（检测帧 + 可选预览）。
 struct VpssStep {
     timings: VisionTimings,
-    snapshot: Arc<VisionSnapshot>,
+    frame: Arc<DetectionFrame>,
     preview: Option<PairedPreview>,
 }
 
-/// 已经和快照配好对的预览：`jpeg` 与 `snapshot` 严格同帧。
+/// 已经和检测帧配好对的预览：`jpeg` 与 `frame` 严格同帧。
 struct PairedPreview {
     jpeg: Arc<[u8]>,
-    snapshot: Arc<VisionSnapshot>,
+    frame: Arc<DetectionFrame>,
     encode_ms: f64,
 }
 

@@ -18,11 +18,11 @@ use cvimpi_rs::sys::{Sys, VbPoolConfig};
 use cvimpi_rs::venc_input_layout;
 
 use crate::preprocess::{PreviewEncoder, PreviewInput};
-use crate::preview::{CameraStatus, PreviewFrame, PreviewSource, VisionSnapshot, VisionStatus};
+use crate::preview::{CameraStatus, DetectionFrame, PreviewFrame, PreviewSource, VisionStatus};
 
 use super::core::Vision;
 use super::state::{EncodePacket, StreamInner};
-use super::{FRAME_H, FRAME_W, VisionConfig, elapsed_ms, snapshot};
+use super::{FRAME_H, FRAME_W, VisionConfig, detection_frame, elapsed_ms};
 
 /// 相机打开失败时的重试次数（USB 枚举/上一个进程释放设备都需要时间）。
 const CAMERA_OPEN_RETRIES: usize = 3;
@@ -136,8 +136,8 @@ impl PreviewSource for VisionStream {
         self.inner.vision_status()
     }
 
-    fn latest_snapshot(&self) -> Option<Arc<VisionSnapshot>> {
-        self.inner.latest_snapshot()
+    fn latest_detections(&self) -> Option<Arc<DetectionFrame>> {
+        self.inner.latest_detections()
     }
 
     fn stop(&self) {
@@ -242,17 +242,17 @@ fn capture_loop(
         match vision.step(preview) {
             Ok(step) => {
                 let now = Instant::now();
-                let snap = Arc::new(snapshot(&step));
+                let frame = Arc::new(detection_frame(&step));
                 let has_preview = step.preview.is_some();
                 {
                     let mut state = inner.state.lock().unwrap();
-                    state.record_model_frame(now, &step.timings, Arc::clone(&snap));
+                    state.record_model_frame(now, &step.timings, Arc::clone(&frame));
                     state.error = vision.model_error().map(str::to_string);
                 }
                 if has_preview {
                     let packet = EncodePacket {
                         data: step.preview.expect("has_preview 时应有数据"),
-                        snapshot: snap,
+                        frame,
                     };
                     // 预览线程忙（容量 2）就跳过本帧预览，不阻塞模型
                     let ok = packets.try_send(packet).is_ok();
@@ -316,11 +316,10 @@ fn encoder_loop(
         };
         sync_preview_backend(&inner, &preview);
         let encode_ms = elapsed_ms(t0);
-        let seq = packet.snapshot.seq;
         let frame = Arc::new(PreviewFrame {
-            seq,
+            seq: packet.frame.seq,
             jpeg: Some(jpeg_bytes),
-            vision: Some(packet.snapshot),
+            dets: Some(packet.frame),
         });
         let now = Instant::now();
         let mut state = inner.state.lock().unwrap();

@@ -1,4 +1,4 @@
-//! 单帧步进的视觉核心：[`Vision`]（相机 → 预处理 → 推理 → 位置分析）。
+//! 单帧步进的视觉核心：[`Vision`]（相机 → 预处理 → 推理）。
 
 use std::io;
 use std::time::Instant;
@@ -8,7 +8,6 @@ use cvimpi_rs::ffi;
 use cvimpi_rs::sys::Sys;
 
 use crate::camera::{Camera, open_yuyv};
-use crate::position::PositionAnalyzer;
 use crate::preprocess::{FRAME_H, FRAME_W, PreviewInput, yuyv422_to_rgb, yuyv422_to_rgb_planes};
 use crate::preview::VisionTimings;
 use crate::yolo::Yolo;
@@ -93,7 +92,6 @@ pub struct Vision<'a> {
     input: RgbInput<'a>,
     /// `None` = 模型不可用（仅预览）。
     yolo: Option<Yolo>,
-    pos: PositionAnalyzer,
     seq: u64,
     model_error: Option<String>,
     model_input: String,
@@ -119,7 +117,6 @@ impl<'a> Vision<'a> {
             camera,
             input,
             yolo,
-            pos: PositionAnalyzer::for_640x480(),
             seq: 0,
             model_error,
             model_input,
@@ -198,25 +195,19 @@ impl<'a> Vision<'a> {
             self.yolo = None;
         }
 
-        // 4) 位置分析
-        let t2 = Instant::now();
-        let result = self.pos.analyze(&dets);
-        let position_ms = elapsed_ms(t2);
-
-        // 5) 预览数据已在第 2 步拷好
+        // 4) 检测框（位置/距离等语义由追踪侧自己算）+ 预览数据（第 2 步已拷好）
         let seq = self.seq;
         self.seq += 1;
         Ok(VisionStep {
             seq,
             at: t_frame,
-            result,
+            dets,
             preview,
             timings: VisionTimings {
                 capture_ms,
                 preprocess_ms,
                 infer_ms,
                 nms_ms,
-                position_ms,
                 encode_ms: 0.0,
                 total_ms: elapsed_ms(t_frame),
             },

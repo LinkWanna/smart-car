@@ -9,15 +9,15 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crate::preview::{
-    CameraStatus, PreviewFrame, PreviewSource, VisionSnapshot, VisionStatus, VisionTimings,
+    CameraStatus, DetectionFrame, PreviewFrame, PreviewSource, VisionStatus, VisionTimings,
 };
 
 use super::VisionConfig;
 
-/// 投给预览线程的一帧：数据（YUYV 或 RGB 平面）+ 同帧快照。
+/// 投给预览线程的一帧：数据（YUYV 或 RGB 平面）+ 同帧检测帧。
 pub(crate) struct EncodePacket {
     pub(crate) data: Vec<u8>,
-    pub(crate) snapshot: Arc<VisionSnapshot>,
+    pub(crate) frame: Arc<DetectionFrame>,
 }
 
 /// 线程共享状态（一次锁拿到全部，避免撕裂读）。
@@ -30,7 +30,7 @@ pub(crate) struct StreamState {
     pub(crate) frames: u64,
     pub(crate) fps: f64,
     pub(crate) last_at: Option<Instant>,
-    pub(crate) latest_snapshot: Option<Arc<VisionSnapshot>>,
+    pub(crate) latest_dets: Option<Arc<DetectionFrame>>,
     /// 预览投递计数（诊断：模型帧 → 预览线程）。
     pub(crate) preview_sent: u64,
     pub(crate) preview_dropped: u64,
@@ -53,7 +53,6 @@ pub(crate) struct StreamState {
     pub(crate) model_input: String,
     pub(crate) infer_ms: f64,
     pub(crate) nms_ms: f64,
-    pub(crate) position_ms: f64,
     pub(crate) dets: usize,
     pub(crate) error: Option<String>,
 }
@@ -67,12 +66,12 @@ impl StreamState {
         self.preview_at.map(|at| at.elapsed().as_millis() as u64)
     }
 
-    /// 记一帧模型结果（帧数 / EMA 帧率 / 耗时分项 / 最新快照）。
+    /// 记一帧模型结果（帧数 / EMA 帧率 / 耗时分项 / 最新检测帧）。
     pub(crate) fn record_model_frame(
         &mut self,
         now: Instant,
         timings: &VisionTimings,
-        snapshot: Arc<VisionSnapshot>,
+        frame: Arc<DetectionFrame>,
     ) {
         if let Some(prev) = self.last_at {
             let dt = now.saturating_duration_since(prev).as_secs_f64();
@@ -88,9 +87,8 @@ impl StreamState {
         self.last_at = Some(now);
         self.infer_ms = timings.infer_ms;
         self.nms_ms = timings.nms_ms;
-        self.position_ms = timings.position_ms;
-        self.dets = snapshot.dets.len();
-        self.latest_snapshot = Some(snapshot);
+        self.dets = frame.dets.len();
+        self.latest_dets = Some(frame);
     }
 
     /// 记一帧已发布的预览（投递/发布计数、编码耗时 EMA、预览帧率）。
@@ -189,14 +187,13 @@ impl PreviewSource for StreamInner {
             age_ms: state.model_age_ms(),
             infer_ms: state.infer_ms,
             nms_ms: state.nms_ms,
-            position_ms: state.position_ms,
             encode_ms: state.encode_ms,
             dets: state.dets,
             error: state.error.clone(),
         })
     }
 
-    fn latest_snapshot(&self) -> Option<Arc<VisionSnapshot>> {
-        self.state.lock().unwrap().latest_snapshot.clone()
+    fn latest_detections(&self) -> Option<Arc<DetectionFrame>> {
+        self.state.lock().unwrap().latest_dets.clone()
     }
 }

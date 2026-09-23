@@ -30,7 +30,8 @@ use serde_json::{Value, json};
 use crate::control::ControlSession;
 use crate::control::session::{AutoState, Mode};
 use crate::control::teleop::{Action, Keys};
-use crate::preview::{PreviewSource, VisionSnapshot};
+use crate::preview::{DetectionFrame, PreviewSource};
+use crate::vision::{FRAME_H, FRAME_W};
 
 /// WebSocket 每轮主动推送的时长（略小于页面 100ms 的按键心跳间隔）。
 const PUSH_WINDOW: Duration = Duration::from_millis(90);
@@ -195,7 +196,6 @@ impl Shared {
             "age_ms": st.age_ms,
             "infer_ms": st.infer_ms,
             "nms_ms": st.nms_ms,
-            "position_ms": st.position_ms,
             "encode_ms": st.encode_ms,
             "dets": st.dets,
             "error": st.error,
@@ -335,30 +335,26 @@ fn auto_value(auto: Option<&AutoState>) -> Value {
 }
 
 /// 一帧预览对应的视觉消息（`seq` 与紧随其后的 JPEG 严格同帧）。
-fn vision_frame_value(seq: u64, snap: &VisionSnapshot) -> Value {
-    let dets: Vec<Value> = snap
+///
+/// 只发检测框（归一化）与统计；分区/距离这类语义不在视觉侧，页面不依赖。
+fn vision_frame_value(seq: u64, frame: &DetectionFrame) -> Value {
+    let dets: Vec<Value> = frame
         .dets
         .iter()
         .map(|d| {
             json!({
-                "x1": d.x1, "y1": d.y1, "x2": d.x2, "y2": d.y2, "conf": d.confidence,
+                "x1": d.x1 / FRAME_W as f32,
+                "y1": d.y1 / FRAME_H as f32,
+                "x2": d.x2 / FRAME_W as f32,
+                "y2": d.y2 / FRAME_H as f32,
+                "conf": d.confidence,
             })
         })
         .collect();
-    let target = snap.target.as_ref().map(|t| {
-        json!({
-            "err_x": t.err_x,
-            "zone": t.zone,
-            "distance": t.distance,
-            "confidence": t.confidence,
-        })
-    });
     json!({
         "type": "vision",
         "seq": seq,
         "dets": dets,
-        "target": target,
-        "infer_ms": snap.timings.infer_ms,
     })
 }
 
@@ -407,8 +403,8 @@ fn websocket_session(mut socket: Websocket, shared: Arc<Shared>) {
                         alive = socket.send_binary(jpeg).is_ok();
                     }
                     // 紧跟同帧的检测结果：页面据此画覆盖框（与画面严格对齐）
-                    if alive && let Some(snap) = &frame.vision {
-                        alive = send_json(&mut socket, &vision_frame_value(frame.seq, snap));
+                    if alive && let Some(dets) = &frame.dets {
+                        alive = send_json(&mut socket, &vision_frame_value(frame.seq, dets));
                     }
                 }
             }
@@ -479,8 +475,8 @@ fn send_json(socket: &mut Websocket, value: &Value) -> bool {
 mod tests {
     use super::*;
     use crate::control::{DriveTarget, LinkSnapshot, TeleopConfig};
-    use crate::position::{Distance, Observation};
-    use crate::preview::{CameraStatus, PreviewFrame, VisionStatus, VisionTimings};
+    use crate::preview::{CameraStatus, PreviewFrame, VisionStatus};
+    use crate::yolo::Detection;
     use std::io::{Read, Write};
     use std::net::TcpStream;
     use std::sync::Mutex;
@@ -512,35 +508,44 @@ mod tests {
         }
     }
 
-    /// 可控的假视觉源：手动放「最新快照」来驱动自动模式。
+    /// 可控的假视觉源：手动放「最新检测帧」来驱动自动模式。
     #[derive(Default)]
     struct FakeVision {
-        snap: Mutex<Option<Arc<VisionSnapshot>>>,
+        frame: Mutex<Option<Arc<DetectionFrame>>>,
     }
 
     impl FakeVision {
-        /// 放一帧新鲜观测。
+        /// 放一帧新鲜检测：`err_x` 是期望的位置分析结果（-1..=1），
+        /// `present = false` 表示没有检测框。
         fn put(&self, err_x: f32, present: bool) {
-            *self.snap.lock().unwrap() = Some(Arc::new(VisionSnapshot {
+            let dets = if present {
+                // 反推一个中心在 err_x 处的框（位置分析会还原出同一个 err_x；
+                // 10x10 的小框 → 距离分级 far）
+                let cx = (err_x / 2.0 + 0.5) * FRAME_W as f32;
+                let cy = FRAME_H as f32 / 2.0;
+                vec![Detection {
+                    label: "tennis_ball".to_string(),
+                    confidence: 0.9,
+                    x1: cx - 5.0,
+                    y1: cy - 5.0,
+                    x2: cx + 5.0,
+                    y2: cy + 5.0,
+                }]
+            } else {
+                Vec::new()
+            };
+            *self.frame.lock().unwrap() = Some(Arc::new(DetectionFrame {
                 seq: 1,
                 at: Instant::now(),
-                dets: Vec::new(),
-                observation: Observation {
-                    present,
-                    err_x,
-                    distance: Distance::Far,
-                    confidence: 0.9,
-                },
-                target: None,
-                timings: VisionTimings::default(),
+                dets,
             }));
         }
 
-        /// 把当前观测改成「很久以前」（模拟画面卡住/链路丢失）。
+        /// 把当前检测帧改成「很久以前」（模拟画面卡住/链路丢失）。
         fn expire(&self) {
-            let mut guard = self.snap.lock().unwrap();
-            if let Some(snap) = guard.as_ref() {
-                let mut stale = (**snap).clone();
+            let mut guard = self.frame.lock().unwrap();
+            if let Some(frame) = guard.as_ref() {
+                let mut stale = (**frame).clone();
                 stale.at = Instant::now()
                     .checked_sub(Duration::from_secs(2))
                     .unwrap_or_else(Instant::now);
@@ -551,22 +556,22 @@ mod tests {
 
     impl PreviewSource for FakeVision {
         fn frame_if_new(&self, after: u64) -> Option<Arc<PreviewFrame>> {
-            let snap = self.snap.lock().unwrap().clone()?;
-            (snap.seq > after).then(|| {
+            let frame = self.frame.lock().unwrap().clone()?;
+            (frame.seq > after).then(|| {
                 Arc::new(PreviewFrame {
-                    seq: snap.seq,
+                    seq: frame.seq,
                     jpeg: None,
-                    vision: Some(snap),
+                    dets: Some(frame),
                 })
             })
         }
 
         fn latest(&self) -> Option<Arc<PreviewFrame>> {
-            self.snap.lock().unwrap().clone().map(|snap| {
+            self.frame.lock().unwrap().clone().map(|frame| {
                 Arc::new(PreviewFrame {
-                    seq: snap.seq,
+                    seq: frame.seq,
                     jpeg: None,
-                    vision: Some(snap),
+                    dets: Some(frame),
                 })
             })
         }
@@ -585,11 +590,11 @@ mod tests {
 
         fn vision_status(&self) -> Option<VisionStatus> {
             let age_ms = self
-                .snap
+                .frame
                 .lock()
                 .unwrap()
                 .as_ref()
-                .map(|snap| snap.at.elapsed().as_millis() as u64);
+                .map(|frame| frame.at.elapsed().as_millis() as u64);
             Some(VisionStatus {
                 model_ok: true,
                 model: "fake".to_string(),
@@ -603,15 +608,14 @@ mod tests {
                 age_ms,
                 infer_ms: 30.0,
                 nms_ms: 1.0,
-                position_ms: 0.5,
                 encode_ms: 5.0,
                 dets: 1,
                 error: None,
             })
         }
 
-        fn latest_snapshot(&self) -> Option<Arc<VisionSnapshot>> {
-            self.snap.lock().unwrap().clone()
+        fn latest_detections(&self) -> Option<Arc<DetectionFrame>> {
+            self.frame.lock().unwrap().clone()
         }
     }
 
@@ -753,6 +757,32 @@ mod tests {
         let resp = http_get(server.addr, "/api/mode?set=manual");
         assert!(resp.contains("\"mode\":\"manual\""), "{resp}");
         server.stop();
+    }
+
+    #[test]
+    fn vision_message_normalizes_boxes() {
+        let frame = DetectionFrame {
+            seq: 3,
+            at: Instant::now(),
+            dets: vec![Detection {
+                label: "tennis_ball".to_string(),
+                confidence: 0.8,
+                x1: 160.0,
+                y1: 120.0,
+                x2: 320.0,
+                y2: 240.0,
+            }],
+        };
+        let value = vision_frame_value(3, &frame);
+        assert_eq!(value["type"], "vision");
+        assert_eq!(value["seq"], 3);
+        let d = &value["dets"][0];
+        let f = |key: &str| d[key].as_f64().unwrap() as f32;
+        assert!((f("x1") - 0.25).abs() < 1e-6);
+        assert!((f("y1") - 0.25).abs() < 1e-6);
+        assert!((f("x2") - 0.5).abs() < 1e-6);
+        assert!((f("y2") - 0.5).abs() < 1e-6);
+        assert!((f("conf") - 0.8).abs() < 1e-6);
     }
 
     #[test]

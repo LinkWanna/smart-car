@@ -24,7 +24,7 @@
 use std::fmt;
 use std::time::{Duration, Instant};
 
-use crate::position::{Distance, Observation};
+use super::position::{Distance, Observation};
 
 /// 控制决策输出。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

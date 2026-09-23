@@ -4,8 +4,9 @@
 //! 仲裁逻辑都在这里（[`ControlSession::spawn`] 启动）。
 //!
 //! 线程模型：控制线程按 `control_hz` 推进 —— 手动模式跑 [`Teleop::tick`]，
-//! 自动模式取 [`PreviewSource::latest_snapshot`]（超过 `AUTO_STALE` 视为
-//! 看不到，滑行）推进视觉伺服；输出统一经 `apply` 落到 [`DriveTarget`]。
+//! 自动模式取 [`PreviewSource::latest_detections`]（超过 `AUTO_STALE` 视为
+//! 看不到，滑行），在本地做位置分析（[`PositionAnalyzer`]）后推进视觉伺服；
+//! 输出统一经 `apply` 落到 [`DriveTarget`]。
 //! 模式切换时重置伺服状态并清空手动输入（避免残留油门/锁存），退出前滑行。
 
 use std::fmt;
@@ -16,8 +17,9 @@ use std::time::{Duration, Instant};
 
 use log::info;
 
-use crate::preview::{PreviewSource, VisionSnapshot};
+use crate::preview::{DetectionFrame, PreviewSource};
 
+use super::position::{Observation, PositionAnalyzer};
 use super::servo::{Action as ServoAction, ControlConfig, ControlLoop};
 use super::target::{DriveTarget, LinkSnapshot};
 use super::teleop::{Action, Hud, Keys, Output, Teleop, TeleopConfig};
@@ -86,6 +88,8 @@ pub struct ControlSession {
     mode: Mutex<Mode>,
     /// 自动模式控制律参数。
     servo_cfg: ControlConfig,
+    /// 自动模式的位置分析（检测框 → 分区/距离；追踪侧语义，与 vision 解耦）。
+    analyzer: PositionAnalyzer,
     auto: Mutex<Option<AutoState>>,
     /// 自动模式的数据源；`None` = 未启用视觉。
     vision: Option<Arc<dyn PreviewSource>>,
@@ -105,6 +109,7 @@ impl ControlSession {
             teleop: Mutex::new(Teleop::new(teleop_cfg)),
             mode: Mutex::new(Mode::Manual),
             servo_cfg: ControlConfig::default(),
+            analyzer: PositionAnalyzer::for_640x480(),
             auto: Mutex::new(None),
             vision,
             running: AtomicBool::new(true),
@@ -233,21 +238,23 @@ impl ControlSession {
         self.target.coast();
     }
 
-    /// 自动模式：取最新视觉观测（过期/不可用 → 滑行），推进视觉伺服。
+    /// 自动模式：取最新检测帧（过期/不可用 → 滑行），做位置分析后推进视觉伺服。
     fn auto_output(&self, servo: &mut ControlLoop, now: Instant) -> Output {
-        let snap: Option<Arc<VisionSnapshot>> = self
+        let frame: Option<Arc<DetectionFrame>> = self
             .vision
             .as_ref()
-            .and_then(|preview| preview.latest_snapshot())
-            .filter(|snap| now.saturating_duration_since(snap.at) < AUTO_STALE);
-        let Some(snap) = snap else {
+            .and_then(|preview| preview.latest_detections())
+            .filter(|frame| now.saturating_duration_since(frame.at) < AUTO_STALE);
+        let Some(frame) = frame else {
             *self.auto.lock().unwrap() = Some(AutoState {
                 action: "等待视觉".to_string(),
                 cmd: [0, 0],
             });
             return Output::Coast;
         };
-        let action = servo.step(&snap.observation, now);
+        // 追踪语义：检测框 → 位置/距离分级 → 控制律输入
+        let obs = Observation::from_result(&self.analyzer.analyze(&frame.dets));
+        let action = servo.step(&obs, now);
         let cmd = action.wheels().map_or([0, 0], |(l, r)| [l, r]);
         *self.auto.lock().unwrap() = Some(AutoState {
             action: action.to_string(),

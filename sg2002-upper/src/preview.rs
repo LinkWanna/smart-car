@@ -1,37 +1,28 @@
-//! 网页预览与视觉之间的中性契约：一帧预览 = JPEG 画面 + **同帧**的视觉结果。
+//! 网页/控制与视觉之间的中性契约：一帧预览 = JPEG 画面 + **同帧**的检测框。
 //!
 //! 两个实现（`smartcar` 按硬件可用性二选一）：
 //! - [`crate::vision::VisionStream`]：CPU 管线（YUYV→RGB 转换 + 编码线程）；
 //! - [`crate::vision::VpssStream`]：VPSS 硬件管线（硬件 CSC + VENC 硬编）。
 //!
 //! 两者都是「相机 YUYV（模型输入格式）采集 + 编码」，画面与检测严格同帧。
-//! 网页层只依赖本模块的抽象，不关心相机是怎么打开的。
+//! 这里只传**检测框本身**（像素坐标）与统计信息，不做任何高层语义 ——
+//! 分区/距离/控制律输入由消费方自己算（追踪侧见 [`crate::control::position`]），
+//! 网页侧只画框、只显示统计。网页层只依赖本模块的抽象，不关心相机怎么打开。
 
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::position::Observation;
+use crate::yolo::Detection;
 
-/// 归一化检测框（0..1，坐标系 = 模型输入帧）。
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct DetectionBox {
-    pub x1: f32,
-    pub y1: f32,
-    pub x2: f32,
-    pub y2: f32,
-    pub confidence: f32,
-}
-
-/// 目标分级信息（HUD 与覆盖框用）。
-#[derive(Debug, Clone, PartialEq)]
-pub struct TargetInfo {
-    /// 目标中心横向偏差，-1..=1，右为正。
-    pub err_x: f32,
-    /// 九宫格分区（`center_mid` 等）。
-    pub zone: String,
-    /// `near`/`mid`/`far`。
-    pub distance: String,
-    pub confidence: f32,
+/// 一帧检测结果（与 [`PreviewFrame`] 里的 JPEG 同帧；像素坐标 = 模型输入帧）。
+#[derive(Debug, Clone)]
+pub struct DetectionFrame {
+    /// 帧序号（与预览帧一致）。
+    pub seq: u64,
+    /// 采集时刻（自动模式据此判断观测是否过期）。
+    pub at: Instant,
+    /// 检测框（像素坐标）。
+    pub dets: Vec<Detection>,
 }
 
 /// 一帧的处理耗时（ms）。
@@ -41,33 +32,17 @@ pub struct VisionTimings {
     pub preprocess_ms: f64,
     pub infer_ms: f64,
     pub nms_ms: f64,
-    pub position_ms: f64,
     pub encode_ms: f64,
     pub total_ms: f64,
 }
 
-/// 一帧的视觉快照（与 [`PreviewFrame`] 里的 JPEG 同帧）。
-#[derive(Debug, Clone)]
-pub struct VisionSnapshot {
-    /// 帧序号（与预览帧一致）。
-    pub seq: u64,
-    /// 采集时刻（自动模式据此判断观测是否过期）。
-    pub at: Instant,
-    /// 检测框（归一化）。
-    pub dets: Vec<DetectionBox>,
-    /// 控制律输入。
-    pub observation: Observation,
-    /// 目标分级（无目标为 `None`）。
-    pub target: Option<TargetInfo>,
-    pub timings: VisionTimings,
-}
-
-/// 一帧预览：JPEG + 同帧视觉结果（MJPG 直出源没有视觉结果）。
+/// 一帧预览：JPEG + 同帧检测（MJPG 直出源没有检测结果）。
 #[derive(Debug, Clone)]
 pub struct PreviewFrame {
     pub seq: u64,
     pub jpeg: Option<Arc<[u8]>>,
-    pub vision: Option<Arc<VisionSnapshot>>,
+    /// 同帧检测（网页据此画覆盖框）。
+    pub dets: Option<Arc<DetectionFrame>>,
 }
 
 /// 相机/预览状态（对应 JSON 里的 `camera` 字段）。
@@ -103,7 +78,6 @@ pub struct VisionStatus {
     pub age_ms: Option<u64>,
     pub infer_ms: f64,
     pub nms_ms: f64,
-    pub position_ms: f64,
     pub encode_ms: f64,
     /// 最近一帧的检测框数量。
     pub dets: usize,
@@ -125,8 +99,8 @@ pub trait PreviewSource: Send + Sync {
     /// 视觉状态；纯画面源（MJPG）返回 `None`。
     fn vision_status(&self) -> Option<VisionStatus>;
 
-    /// 控制线程用：最新视觉快照。
-    fn latest_snapshot(&self) -> Option<Arc<VisionSnapshot>> {
+    /// 控制线程用：最新一帧检测（像素坐标）；纯画面源返回 `None`。
+    fn latest_detections(&self) -> Option<Arc<DetectionFrame>> {
         None
     }
 

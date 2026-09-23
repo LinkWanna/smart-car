@@ -2,12 +2,12 @@
 //!
 //! 模块分层：
 //! - 感知：`camera`（V4L2 零拷贝 + YUYV 节点发现）、`preprocess`（YUYV→RGB / YUYV→JPEG
-//!   的像素工作流）、`yolo`（TPU 零拷贝推理 + NMS）、`position`（位置/距离分级 + 控制观测）、
-//!   `vision`（视觉域：单帧核心 + 两条管线 —— CPU `cpu` 与 VPSS 硬件 `vpss`，
-//!   共用线程状态与同帧预览契约）；
+//!   的像素工作流）、`yolo`（TPU 零拷贝推理 + NMS）、`vision`（视觉域：单帧核心 +
+//!   两条管线 —— CPU `cpu` 与 VPSS 硬件 `vpss`，共用线程状态与同帧预览契约；
+//!   只输出检测框，不做位置/追踪语义）；
 //! - 下位机通信与控制：`control`（`protocol` 线协议——与固件共用的
 //!   `protocol` crate、`serial` 串口、`car` 链路 + 安全看门狗、
-//!   `servo` 视觉伺服控制律）。
+//!   `position` 位置/距离分级（追踪侧语义）、`servo` 视觉伺服控制律）。
 //! - 网页遥控：`web`（零依赖 HTTP/WebSocket、手动遥控控制律、MJPEG 预览、
 //!   手动/自动仲裁）、`preview`（预览与视觉之间的中性契约）。
 //! - 观测：`logging`（`log` + `simple_logger` 初始化）。
@@ -60,7 +60,6 @@ pub mod camera;
 pub mod control;
 pub mod hwjpeg;
 pub mod logging;
-pub mod position;
 pub mod preprocess;
 pub mod preview;
 pub mod vision;

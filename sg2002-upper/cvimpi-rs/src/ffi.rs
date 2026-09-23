@@ -1,10 +1,17 @@
 //! CVI MPI 的原始 FFI 声明（只覆盖 JPEG 编解码所需的部分）。
 //!
-//! 这里只声明 JPEG 编码（`VENC` + `PT_JPEG`）与解码（`VDEC` + `PT_JPEG`）一条静态图
-//! 工作流需要的接口，外加初始化中间件、分配帧所需的 sys / VB 调用。
+//! 这里声明 JPEG 编解码一条静态图工作流用到的数据结构和 ioctl 号：
 //!
-//! 字段名刻意与 `../include` 下的 C 头文件保持一致，方便逐行对照。结构体布局由
-//! `tools/abi_probe.c` 在同一套头文件上实测得到（64 位 LP64：riscv64 / aarch64）。
+//! * `sys` / `vb` 仍链接厂商的 `libsys.so`（[`CVI_SYS_Init`] / [`CVI_VB_Init`] /
+//!   [`CVI_SYS_Mmap`] / [`CVI_SYS_Bind`] …），extern 声明在文件底部；
+//! * `venc` / `vdec` 不再链接 `libvenc.so` / `libvdec.so`，改为按
+//!   `include/linux/cvi_vc_drv_ioctl.h` 的协议直连 `/dev/cvi_vc_enc*` /
+//!   `/dev/cvi_vc_dec*`（实现在 `encoder` / `decoder` 模块），所以这里只保留
+//!   结构体、ioctl 号以及它们的编译期 ABI 断言；
+//! * `vpss` 同样直连 `/dev/cvi-vpss`，ioctl 号在文件中部。
+//!
+//! 字段名刻意与 `../include` 下的 C 头文件保持一致，方便逐行对照。结构体布局
+//! 由同一套 C 头文件上的 ABI 探针实测得到（64 位 LP64：riscv64 / aarch64）。
 //! 32 位 ARM 的 C 结构里有额外的 `#ifdef __arm__` padding 字段，本封装未覆盖。
 #![allow(non_snake_case, non_camel_case_types, dead_code)]
 
@@ -154,6 +161,15 @@ pub struct VIDEO_FRAME_S {
 pub struct VIDEO_FRAME_INFO_S {
     pub stVFrame: VIDEO_FRAME_S,
     pub u32PoolId: CVI_U32,
+}
+
+/// `VIDEO_FRAME_INFO_EX_S`（`modules/venc/src/cvi_venc.c` 与
+/// `modules/vdec/src/cvi_vdec.c`）：送帧 / 取帧 ioctl 的 `pstFrame` + 超时。
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VIDEO_FRAME_INFO_EX_S {
+    pub pstFrame: *const VIDEO_FRAME_INFO_S,
+    pub s32MilliSec: CVI_S32,
 }
 
 /* ------------------------------------------------------------------ */
@@ -424,6 +440,15 @@ pub struct VENC_STREAM_S {
     _opaque: [u8; 368],
 }
 
+/// `VENC_STREAM_EX_S`（`modules/venc/src/cvi_venc.c`）：
+/// `CVI_VENC_GetStream` ioctl 的 `pstStream` + 超时。
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VENC_STREAM_EX_S {
+    pub pstStream: *mut VENC_STREAM_S,
+    pub s32MilliSec: CVI_S32,
+}
+
 /* ------------------------------------------------------------------ */
 /* VDEC                                                                */
 /* ------------------------------------------------------------------ */
@@ -494,6 +519,15 @@ pub struct VDEC_STREAM_S {
     pub bEndOfStream: CVI_BOOL,
     pub bDisplay: CVI_BOOL,
     pub pu8Addr: *mut CVI_U8,
+}
+
+/// `VDEC_STREAM_EX_S`（`modules/vdec/src/cvi_vdec.c`）：
+/// `CVI_VDEC_SendStream` ioctl 的 `pstStream` + 超时。
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VDEC_STREAM_EX_S {
+    pub pstStream: *const VDEC_STREAM_S,
+    pub s32MilliSec: CVI_S32,
 }
 
 #[repr(C)]
@@ -744,6 +778,12 @@ const fn _IOWR<T>(ty: u8, nr: u8) -> u64 {
     _IOC(IOC_READ | IOC_WRITE, ty, nr, core::mem::size_of::<T>())
 }
 
+/// 无方向 / 无尺寸的 `_IO`（VENC/VDEC 的全部命令都是这种）。
+#[allow(non_snake_case)]
+const fn _IO(ty: u8, nr: u8) -> u64 {
+    _IOC(0, ty, nr, 0)
+}
+
 /// VPSS ioctl 的 type 字符（`'S'`）。
 pub const VPSS_IOC_TYPE: u8 = b'S';
 
@@ -765,9 +805,47 @@ pub const CVI_VPSS_SET_CHN_ROTATION: u64 = _IOW::<vpss_chn_rot_cfg>(VPSS_IOC_TYP
 /// 内部接口：直接写组的 CSC 矩阵（`CVI_VPSS_SetGrpProcAmp` 底层就是它）。
 pub const CVI_VPSS_SET_GRP_CSC_CFG: u64 = _IOW::<vpss_grp_csc_cfg>(VPSS_IOC_TYPE, 0x78);
 
-/// ABI 编译期校验：数值全部来自 `tools/vpss_abi_probe.c`
-/// （`gcc -I <cvi_mpi>/include -D__CV181X__ tools/vpss_abi_probe.c`）在 C 头上的实测输出。
-/// 布局或 ioctl 编码一旦写错，`cargo check` 直接失败（32 位 ARM 未覆盖，同本 crate 其它结构）。
+/* VENC / VDEC（`/dev/cvi_vc_enc*` / `/dev/cvi_vc_dec*`）的 ioctl：
+ * type 字符 `'V'`（`CVI_VC_DRV_IOCTL_MAGIC`），命令号就是 nr 本身
+ * （全部 `_IO`，不带方向/尺寸）。 */
+
+/// VENC / VDEC ioctl 的 type 字符（`'V'`）。
+pub const VC_IOC_TYPE: u8 = b'V';
+
+// encoder ioctl
+pub const CVI_VC_VENC_CREATE_CHN: u64 = _IO(VC_IOC_TYPE, 0);
+pub const CVI_VC_VENC_DESTROY_CHN: u64 = _IO(VC_IOC_TYPE, 1);
+pub const CVI_VC_VENC_RESET_CHN: u64 = _IO(VC_IOC_TYPE, 2);
+pub const CVI_VC_VENC_START_RECV_FRAME: u64 = _IO(VC_IOC_TYPE, 3);
+pub const CVI_VC_VENC_STOP_RECV_FRAME: u64 = _IO(VC_IOC_TYPE, 4);
+pub const CVI_VC_VENC_SET_CHN_ATTR: u64 = _IO(VC_IOC_TYPE, 6);
+pub const CVI_VC_VENC_GET_CHN_ATTR: u64 = _IO(VC_IOC_TYPE, 7);
+pub const CVI_VC_VENC_GET_STREAM: u64 = _IO(VC_IOC_TYPE, 8);
+pub const CVI_VC_VENC_RELEASE_STREAM: u64 = _IO(VC_IOC_TYPE, 9);
+pub const CVI_VC_VENC_SEND_FRAME: u64 = _IO(VC_IOC_TYPE, 11);
+pub const CVI_VC_VENC_SET_JPEG_PARAM: u64 = _IO(VC_IOC_TYPE, 24);
+pub const CVI_VC_VENC_GET_JPEG_PARAM: u64 = _IO(VC_IOC_TYPE, 25);
+pub const CVI_VC_VENC_ATTACH_VBPOOL: u64 = _IO(VC_IOC_TYPE, 40);
+pub const CVI_VC_VENC_DETACH_VBPOOL: u64 = _IO(VC_IOC_TYPE, 41);
+
+// decoder ioctl
+pub const CVI_VC_VDEC_CREATE_CHN: u64 = _IO(VC_IOC_TYPE, 47);
+pub const CVI_VC_VDEC_DESTROY_CHN: u64 = _IO(VC_IOC_TYPE, 48);
+pub const CVI_VC_VDEC_SET_CHN_ATTR: u64 = _IO(VC_IOC_TYPE, 50);
+pub const CVI_VC_VDEC_START_RECV_STREAM: u64 = _IO(VC_IOC_TYPE, 51);
+pub const CVI_VC_VDEC_STOP_RECV_STREAM: u64 = _IO(VC_IOC_TYPE, 52);
+pub const CVI_VC_VDEC_SET_CHN_PARAM: u64 = _IO(VC_IOC_TYPE, 55);
+pub const CVI_VC_VDEC_GET_CHN_PARAM: u64 = _IO(VC_IOC_TYPE, 56);
+pub const CVI_VC_VDEC_SEND_STREAM: u64 = _IO(VC_IOC_TYPE, 57);
+pub const CVI_VC_VDEC_GET_FRAME: u64 = _IO(VC_IOC_TYPE, 58);
+pub const CVI_VC_VDEC_RELEASE_FRAME: u64 = _IO(VC_IOC_TYPE, 59);
+pub const CVI_VC_VDEC_ATTACH_VBPOOL: u64 = _IO(VC_IOC_TYPE, 60);
+pub const CVI_VC_VDEC_DETACH_VBPOOL: u64 = _IO(VC_IOC_TYPE, 61);
+
+/// ABI 编译期校验：数值全部来自 `tools/vpss_abi_probe.c` 与
+/// `tools/venc_vdec_abi_probe.c`（`gcc -I <cvi_mpi>/include -D__CV181X__ …`）
+/// 在 C 头上的实测输出。布局或 ioctl 编码一旦写错，`cargo check` 直接失败
+/// （32 位 ARM 未覆盖，同本 crate 其它结构）。
 const _: () = {
     use core::mem::{offset_of, size_of};
 
@@ -780,9 +858,7 @@ const _: () = {
             && offset_of!(VPSS_NORMALIZE_S, mean) == 16
             && offset_of!(VPSS_NORMALIZE_S, rounding) == 28
     );
-    assert!(
-        size_of::<VPSS_GRP_ATTR_S>() == 24 && offset_of!(VPSS_GRP_ATTR_S, u8VpssDev) == 20
-    );
+    assert!(size_of::<VPSS_GRP_ATTR_S>() == 24 && offset_of!(VPSS_GRP_ATTR_S, u8VpssDev) == 20);
     assert!(
         size_of::<VPSS_CHN_ATTR_S>() == 92
             && offset_of!(VPSS_CHN_ATTR_S, u32Depth) == 28
@@ -822,6 +898,72 @@ const _: () = {
             && offset_of!(vpss_grp_csc_cfg, scene) == 44
     );
     assert!(size_of::<VIDEO_FRAME_INFO_S>() == 152);
+    assert!(
+        size_of::<VIDEO_FRAME_INFO_EX_S>() == 16
+            && offset_of!(VIDEO_FRAME_INFO_EX_S, s32MilliSec) == 8
+    );
+
+    assert!(size_of::<VENC_ATTR_S>() == 64 && offset_of!(VENC_ATTR_S, stAttr) == 36);
+    assert!(size_of::<VENC_RC_ATTR_S>() == 32);
+    assert!(size_of::<VENC_GOP_ATTR_S>() == 16);
+    assert!(
+        size_of::<VENC_CHN_ATTR_S>() == 112
+            && offset_of!(VENC_CHN_ATTR_S, stRcAttr) == 64
+            && offset_of!(VENC_CHN_ATTR_S, stGopAttr) == 96
+    );
+    assert!(size_of::<VENC_RECV_PIC_PARAM_S>() == 4);
+    assert!(size_of::<VENC_JPEG_PARAM_S>() == 200);
+    assert!(
+        size_of::<VENC_PACK_S>() == 144
+            && offset_of!(VENC_PACK_S, u32Len) == 16
+            && offset_of!(VENC_PACK_S, u64PTS) == 24
+            && offset_of!(VENC_PACK_S, stPackInfo) == 48
+    );
+    assert!(
+        size_of::<VENC_STREAM_S>() == 384
+            && offset_of!(VENC_STREAM_S, u32PackCount) == 8
+            && offset_of!(VENC_STREAM_S, u32Seq) == 12
+    );
+    assert!(size_of::<VENC_STREAM_EX_S>() == 16 && offset_of!(VENC_STREAM_EX_S, s32MilliSec) == 8);
+
+    assert!(
+        size_of::<VDEC_CHN_ATTR_S>() == 40
+            && offset_of!(VDEC_CHN_ATTR_S, u32FrameBufCnt) == 24
+            && offset_of!(VDEC_CHN_ATTR_S, stVdecVideoAttr) == 28
+    );
+    assert!(
+        size_of::<VDEC_CHN_PARAM_S>() == 32
+            && offset_of!(VDEC_CHN_PARAM_S, u32DisplayFrameNum) == 8
+    );
+    assert!(size_of::<VDEC_STREAM_S>() == 32 && offset_of!(VDEC_STREAM_S, pu8Addr) == 24);
+    assert!(size_of::<VDEC_STREAM_EX_S>() == 16 && offset_of!(VDEC_STREAM_EX_S, s32MilliSec) == 8);
+
+    assert!(CVI_VC_VENC_CREATE_CHN == 0x5600);
+    assert!(CVI_VC_VENC_DESTROY_CHN == 0x5601);
+    assert!(CVI_VC_VENC_RESET_CHN == 0x5602);
+    assert!(CVI_VC_VENC_START_RECV_FRAME == 0x5603);
+    assert!(CVI_VC_VENC_STOP_RECV_FRAME == 0x5604);
+    assert!(CVI_VC_VENC_SET_CHN_ATTR == 0x5606);
+    assert!(CVI_VC_VENC_GET_CHN_ATTR == 0x5607);
+    assert!(CVI_VC_VENC_GET_STREAM == 0x5608);
+    assert!(CVI_VC_VENC_RELEASE_STREAM == 0x5609);
+    assert!(CVI_VC_VENC_SEND_FRAME == 0x560b);
+    assert!(CVI_VC_VENC_SET_JPEG_PARAM == 0x5618);
+    assert!(CVI_VC_VENC_GET_JPEG_PARAM == 0x5619);
+    assert!(CVI_VC_VENC_ATTACH_VBPOOL == 0x5628);
+    assert!(CVI_VC_VENC_DETACH_VBPOOL == 0x5629);
+    assert!(CVI_VC_VDEC_CREATE_CHN == 0x562f);
+    assert!(CVI_VC_VDEC_DESTROY_CHN == 0x5630);
+    assert!(CVI_VC_VDEC_SET_CHN_ATTR == 0x5632);
+    assert!(CVI_VC_VDEC_START_RECV_STREAM == 0x5633);
+    assert!(CVI_VC_VDEC_STOP_RECV_STREAM == 0x5634);
+    assert!(CVI_VC_VDEC_SET_CHN_PARAM == 0x5637);
+    assert!(CVI_VC_VDEC_GET_CHN_PARAM == 0x5638);
+    assert!(CVI_VC_VDEC_SEND_STREAM == 0x5639);
+    assert!(CVI_VC_VDEC_GET_FRAME == 0x563a);
+    assert!(CVI_VC_VDEC_RELEASE_FRAME == 0x563b);
+    assert!(CVI_VC_VDEC_ATTACH_VBPOOL == 0x563c);
+    assert!(CVI_VC_VDEC_DETACH_VBPOOL == 0x563d);
 
     assert!(CVI_VPSS_CREATE_GROUP == 0x401c_5300);
     assert!(CVI_VPSS_DESTROY_GROUP == 0x4004_5301);
@@ -871,7 +1013,7 @@ pub const fn mmf_chn(mod_id: MOD_ID_E, dev: CVI_S32, chn: CVI_S32) -> MMF_CHN_S 
 }
 
 /* ------------------------------------------------------------------ */
-/* 函数                                                                */
+/* 函数（全部来自 libsys.so）                                          */
 /* ------------------------------------------------------------------ */
 
 unsafe extern "C" {
@@ -916,53 +1058,4 @@ unsafe extern "C" {
     pub fn CVI_VB_Handle2PoolId(Block: VB_BLK) -> VB_POOL;
     pub fn CVI_VB_Handle2PhysAddr(Block: VB_BLK) -> CVI_U64;
     pub fn CVI_VB_PhysAddr2Handle(u64PhyAddr: CVI_U64) -> VB_BLK;
-
-    // VENC
-    pub fn CVI_VENC_CreateChn(VeChn: VENC_CHN, pstAttr: *const VENC_CHN_ATTR_S) -> CVI_S32;
-    pub fn CVI_VENC_DestroyChn(VeChn: VENC_CHN) -> CVI_S32;
-    pub fn CVI_VENC_StartRecvFrame(
-        VeChn: VENC_CHN,
-        pstRecvParam: *const VENC_RECV_PIC_PARAM_S,
-    ) -> CVI_S32;
-    pub fn CVI_VENC_StopRecvFrame(VeChn: VENC_CHN) -> CVI_S32;
-    pub fn CVI_VENC_SendFrame(
-        VeChn: VENC_CHN,
-        pstFrame: *const VIDEO_FRAME_INFO_S,
-        s32MilliSec: CVI_S32,
-    ) -> CVI_S32;
-    pub fn CVI_VENC_GetStream(
-        VeChn: VENC_CHN,
-        pstStream: *mut VENC_STREAM_S,
-        S32MilliSec: CVI_S32,
-    ) -> CVI_S32;
-    pub fn CVI_VENC_ReleaseStream(VeChn: VENC_CHN, pstStream: *mut VENC_STREAM_S) -> CVI_S32;
-    pub fn CVI_VENC_SetJpegParam(
-        VeChn: VENC_CHN,
-        pstJpegParam: *const VENC_JPEG_PARAM_S,
-    ) -> CVI_S32;
-    pub fn CVI_VENC_GetJpegParam(VeChn: VENC_CHN, pstJpegParam: *mut VENC_JPEG_PARAM_S) -> CVI_S32;
-
-    // VDEC
-    pub fn CVI_VDEC_CreateChn(VdChn: VDEC_CHN, pstAttr: *const VDEC_CHN_ATTR_S) -> CVI_S32;
-    pub fn CVI_VDEC_DestroyChn(VdChn: VDEC_CHN) -> CVI_S32;
-    pub fn CVI_VDEC_StartRecvStream(VdChn: VDEC_CHN) -> CVI_S32;
-    pub fn CVI_VDEC_StopRecvStream(VdChn: VDEC_CHN) -> CVI_S32;
-    pub fn CVI_VDEC_GetChnParam(VdChn: VDEC_CHN, pstParam: *mut VDEC_CHN_PARAM_S) -> CVI_S32;
-    pub fn CVI_VDEC_SetChnParam(VdChn: VDEC_CHN, pstParam: *const VDEC_CHN_PARAM_S) -> CVI_S32;
-    pub fn CVI_VDEC_SendStream(
-        VdChn: VDEC_CHN,
-        pstStream: *const VDEC_STREAM_S,
-        s32MilliSec: CVI_S32,
-    ) -> CVI_S32;
-    pub fn CVI_VDEC_GetFrame(
-        VdChn: VDEC_CHN,
-        pstFrameInfo: *mut VIDEO_FRAME_INFO_S,
-        s32MilliSec: CVI_S32,
-    ) -> CVI_S32;
-    pub fn CVI_VDEC_ReleaseFrame(
-        VdChn: VDEC_CHN,
-        pstFrameInfo: *const VIDEO_FRAME_INFO_S,
-    ) -> CVI_S32;
-    pub fn CVI_VDEC_AttachVbPool(VdChn: VDEC_CHN, pstPool: *const VDEC_CHN_POOL_S) -> CVI_S32;
-    pub fn CVI_VDEC_DetachVbPool(VdChn: VDEC_CHN) -> CVI_S32;
 }

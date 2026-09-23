@@ -22,14 +22,16 @@
 //! # }
 //! ```
 
+use core::ffi::c_void;
 use core::marker::PhantomData;
 use core::{mem, slice};
+use std::os::unix::io::RawFd;
 
 use crate::ffi;
 use crate::sys::Sys;
 use crate::{
-    Error, Result, SessionRef, align_up, check, plane_dims, tight_frame_size,
-    vdec_frame_buffer_size,
+    Error, Result, SessionRef, align_up, ioctl_none, ioctl_read, ioctl_write, open_device,
+    plane_dims, tight_frame_size, vdec_frame_buffer_size,
 };
 
 /// JPEG 解码通道的配置。
@@ -79,12 +81,12 @@ impl DecoderConfig {
     }
 }
 
-/// 一条 `PT_JPEG` 解码通道（`CVI_VDEC_*`）。
+/// 一条 `PT_JPEG` 解码通道（`CVI_VDEC_*`，直连 `/dev/cvi_vc_dec{chn}`）。
 ///
 /// 由 [`Sys::create_decoder`] 创建；析构时停止并销毁通道，且在有
 /// [`DecodedFrame`] 借用它时无法析构。
 pub struct Decoder<'a> {
-    chn: ffi::VDEC_CHN,
+    dev: VdecDev,
     _session: SessionRef<'a>,
 }
 
@@ -116,13 +118,9 @@ impl<'a> Decoder<'a> {
         // 配置值只作为下限，实际取 `max(配置值, 池最大块数)`。
         attr.u32FrameBufCnt = cfg.frame_buf_cnt.max(sys.max_pool_blk_cnt());
 
-        check(
-            unsafe { ffi::CVI_VDEC_CreateChn(chn, &attr) },
-            "CVI_VDEC_CreateChn",
-        )?;
-
+        let dev = VdecDev::create(chn, &attr)?;
         let dec = Decoder {
-            chn,
+            dev,
             _session: PhantomData,
         };
 
@@ -132,19 +130,20 @@ impl<'a> Decoder<'a> {
         param.u32DisplayFrameNum = cfg.display_frame_num;
         param.picture_mut().u32Alpha = cfg.alpha;
 
-        check(
-            unsafe { ffi::CVI_VDEC_SetChnParam(chn, &param) },
-            "CVI_VDEC_SetChnParam",
-        )?;
-        check(
-            unsafe { ffi::CVI_VDEC_StartRecvStream(chn) },
-            "CVI_VDEC_StartRecvStream",
-        )?;
+        dec.dev.set_chn_param(&param)?;
+        dec.dev.start_recv_stream()?;
         Ok(dec)
     }
 
     pub fn channel(&self) -> ffi::VDEC_CHN {
-        self.chn
+        self.dev.channel()
+    }
+
+    /// 读回通道参数（`CVI_VDEC_GetChnParam`，诊断用）。
+    pub fn get_chn_param(&self) -> Result<ffi::VDEC_CHN_PARAM_S> {
+        let mut param: ffi::VDEC_CHN_PARAM_S = unsafe { mem::zeroed() };
+        self.dev.get_chn_param(&mut param)?;
+        Ok(param)
     }
 
     /// 把一整张 JPEG 作为一帧送入（`bEndOfFrame = 1`）。
@@ -157,43 +156,39 @@ impl<'a> Decoder<'a> {
             bDisplay: ffi::CVI_TRUE,
             pu8Addr: jpeg.as_ptr() as *mut u8,
         };
-        check(
-            unsafe { ffi::CVI_VDEC_SendStream(self.chn, &stream, timeout_ms) },
-            "CVI_VDEC_SendStream",
-        )
+        self.dev.send_stream(&stream, timeout_ms)
     }
 
     /// 取出一帧解码结果。返回的 [`DecodedFrame`] 借用本 decoder，并在析构时
     /// 释放对应的 VB block。
     pub fn get_frame<'s>(&'s self, timeout_ms: ffi::CVI_S32) -> Result<DecodedFrame<'s>> {
         let mut info: ffi::VIDEO_FRAME_INFO_S = unsafe { mem::zeroed() };
-        check(
-            unsafe { ffi::CVI_VDEC_GetFrame(self.chn, &mut info, timeout_ms) },
-            "CVI_VDEC_GetFrame",
-        )?;
+        self.dev.get_frame(&mut info, timeout_ms)?;
 
-        // 与 C sample 一致：让 CPU 能看到解码后的数据。
-        if let Some(dims) = plane_dims(
-            info.stVFrame.enPixelFormat,
-            info.stVFrame.u32Width,
-            info.stVFrame.u32Height,
-        ) {
-            for p in 0..dims.planes {
-                let vir = info.stVFrame.pu8VirAddr[p];
-                if vir.is_null() {
-                    continue;
-                }
-                let size = info.stVFrame.u32Stride[p].saturating_mul(dims.rows[p]);
-                unsafe {
-                    ffi::CVI_SYS_IonInvalidateCache(info.stVFrame.u64PhyAddr[p], vir.cast(), size);
-                }
+        // 与 C 封装一致：内核只回填物理地址/stride/长度，虚拟地址由用户态映射；
+        // `CVI_SYS_MmapCache` 是 cached 映射 + `IonInvalidateCache`（DMA 写完的
+        // 数据对 CPU 立即可见），映射长度用驱动给的 `u32Length`。
+        let mut maps: [Option<(*mut c_void, u32)>; 3] = [None; 3];
+        for p in 0..3 {
+            let phy = info.stVFrame.u64PhyAddr[p];
+            let len = info.stVFrame.u32Length[p];
+            if phy == 0 || len == 0 {
+                continue;
             }
+            let ptr = unsafe { ffi::CVI_SYS_MmapCache(phy, len) };
+            if ptr.is_null() {
+                unmap_planes(&mut maps);
+                let _ = self.dev.release_frame(&info);
+                return Err(Error::invalid("CVI_VDEC_GetFrame (CVI_SYS_MmapCache)"));
+            }
+            info.stVFrame.pu8VirAddr[p] = ptr.cast();
+            maps[p] = Some((ptr, len));
         }
 
         Ok(DecodedFrame {
-            chn: self.chn,
+            dev: &self.dev,
             info,
-            _decoder: PhantomData,
+            maps,
         })
     }
 
@@ -206,20 +201,31 @@ impl<'a> Decoder<'a> {
 
 impl Drop for Decoder<'_> {
     fn drop(&mut self) {
-        unsafe {
-            ffi::CVI_VDEC_StopRecvStream(self.chn);
-            ffi::CVI_VDEC_DestroyChn(self.chn);
+        // 与 C 封装一致：先停收流再销毁通道，失败忽略；fd 由 `VdecDev` 析构关闭。
+        let _ = self.dev.stop_recv_stream();
+        let _ = self.dev.destroy_chn();
+    }
+}
+
+/// 解除 `CVI_VDEC_GetFrame` 建立的所有平面映射（幂等）。
+fn unmap_planes(maps: &mut [Option<(*mut c_void, u32)>; 3]) {
+    for slot in maps.iter_mut() {
+        if let Some((ptr, len)) = slot.take() {
+            unsafe {
+                ffi::CVI_SYS_Munmap(ptr, len);
+            }
         }
     }
 }
 
-/// 由 decoder 的 VB 池持有的解码帧；析构时释放。
+/// 由 decoder 的 VB 池持有的解码帧；析构时解除平面映射并释放。
 ///
 /// 借用产生它的 [`Decoder`]（见 [`Decoder::get_frame`]）。
 pub struct DecodedFrame<'s> {
-    chn: ffi::VDEC_CHN,
+    dev: &'s VdecDev,
     info: ffi::VIDEO_FRAME_INFO_S,
-    _decoder: PhantomData<&'s ()>,
+    /// `CVI_VDEC_GetFrame` 建立的平面映射：`(地址, 长度)`。
+    maps: [Option<(*mut c_void, u32)>; 3],
 }
 
 impl DecodedFrame<'_> {
@@ -287,12 +293,141 @@ impl DecodedFrame<'_> {
 
 impl Drop for DecodedFrame<'_> {
     fn drop(&mut self) {
-        unsafe {
-            ffi::CVI_VDEC_ReleaseFrame(self.chn, &self.info);
-        }
+        unmap_planes(&mut self.maps);
+        let _ = self.dev.release_frame(&self.info);
     }
 }
 
 // SAFETY: 理由同 `encoder::Frame` —— 平面裸指针指向中间件持有的 VB 内存，
 // 且不携带任何线程局部状态，因此把帧移动到别的线程是安全的。
 unsafe impl Send for DecodedFrame<'_> {}
+
+/* ------------------------------------------------------------------ */
+/* 设备层（/dev/cvi_vc_dec{chn} 的 ioctl 直连）                        */
+/* ------------------------------------------------------------------ */
+
+/// VDEC 设备节点前缀（`CVI_VC_DRV_DECODER_DEV_NAME`）。
+const VDEC_DEV_PREFIX: &str = "/dev/cvi_vc_dec";
+
+/// 一条 VDEC 通道的内核句柄（一个 `/dev/cvi_vc_dec{chn}` fd）。
+///
+/// 厂商的 `libvdec.so` 本身就是「open 设备 + ioctl」的浅封装（见 cvi_mpi 的
+/// `modules/vdec/src/cvi_vdec.c`），所以这里按
+/// `include/linux/cvi_vc_drv_ioctl.h` 的协议直接实现：全部命令都是 `_IO`
+/// （type 字符 `'V'`，命令号 = `0x5600 | nr`），`SendStream` / `GetFrame` 的
+/// 载荷是「结构体指针 + `s32MilliSec`」的 EX 包装。
+///
+/// [`VdecDev::create`] 完成 `open` + `CVI_VC_VDEC_CREATE_CHN`；析构只关 fd，
+/// `StopRecvStream` / `DestroyChn` 由 [`Decoder`] 的 `Drop` 显式调用。
+struct VdecDev {
+    fd: RawFd,
+    chn: ffi::VDEC_CHN,
+}
+
+impl VdecDev {
+    /// `open("/dev/cvi_vc_dec{chn}")` + `CVI_VC_VDEC_CREATE_CHN`。
+    fn create(chn: ffi::VDEC_CHN, attr: &ffi::VDEC_CHN_ATTR_S) -> Result<Self> {
+        let fd = open_device(VDEC_DEV_PREFIX, chn, "open(/dev/cvi_vc_dec*)")?;
+        let dev = Self { fd, chn };
+        ioctl_write(fd, ffi::CVI_VC_VDEC_CREATE_CHN, attr, "CVI_VDEC_CreateChn")?;
+        Ok(dev)
+    }
+
+    fn channel(&self) -> ffi::VDEC_CHN {
+        self.chn
+    }
+
+    /// `CVI_VDEC_StartRecvStream`。
+    fn start_recv_stream(&self) -> Result<()> {
+        ioctl_none(
+            self.fd,
+            ffi::CVI_VC_VDEC_START_RECV_STREAM,
+            "CVI_VDEC_StartRecvStream",
+        )
+    }
+
+    /// `CVI_VDEC_StopRecvStream`。
+    fn stop_recv_stream(&self) -> Result<()> {
+        ioctl_none(
+            self.fd,
+            ffi::CVI_VC_VDEC_STOP_RECV_STREAM,
+            "CVI_VDEC_StopRecvStream",
+        )
+    }
+
+    /// `CVI_VDEC_DestroyChn`。
+    fn destroy_chn(&self) -> Result<()> {
+        ioctl_none(self.fd, ffi::CVI_VC_VDEC_DESTROY_CHN, "CVI_VDEC_DestroyChn")
+    }
+
+    /// `CVI_VDEC_SetChnParam`。
+    fn set_chn_param(&self, param: &ffi::VDEC_CHN_PARAM_S) -> Result<()> {
+        ioctl_write(
+            self.fd,
+            ffi::CVI_VC_VDEC_SET_CHN_PARAM,
+            param,
+            "CVI_VDEC_SetChnParam",
+        )
+    }
+
+    /// `CVI_VDEC_GetChnParam`。
+    fn get_chn_param(&self, param: &mut ffi::VDEC_CHN_PARAM_S) -> Result<()> {
+        ioctl_read(
+            self.fd,
+            ffi::CVI_VC_VDEC_GET_CHN_PARAM,
+            param,
+            "CVI_VDEC_GetChnParam",
+        )
+    }
+
+    /// `CVI_VDEC_SendStream`。
+    fn send_stream(&self, stream: &ffi::VDEC_STREAM_S, timeout_ms: ffi::CVI_S32) -> Result<()> {
+        let ex = ffi::VDEC_STREAM_EX_S {
+            pstStream: stream,
+            s32MilliSec: timeout_ms,
+        };
+        ioctl_write(
+            self.fd,
+            ffi::CVI_VC_VDEC_SEND_STREAM,
+            &ex,
+            "CVI_VDEC_SendStream",
+        )
+    }
+
+    /// `CVI_VDEC_GetFrame`：内核把帧描述（物理地址/stride/长度）填进 `info`。
+    fn get_frame(
+        &self,
+        info: &mut ffi::VIDEO_FRAME_INFO_S,
+        timeout_ms: ffi::CVI_S32,
+    ) -> Result<()> {
+        let ex = ffi::VIDEO_FRAME_INFO_EX_S {
+            pstFrame: info,
+            s32MilliSec: timeout_ms,
+        };
+        ioctl_write(
+            self.fd,
+            ffi::CVI_VC_VDEC_GET_FRAME,
+            &ex,
+            "CVI_VDEC_GetFrame",
+        )
+    }
+
+    /// `CVI_VDEC_ReleaseFrame`。
+    fn release_frame(&self, info: &ffi::VIDEO_FRAME_INFO_S) -> Result<()> {
+        ioctl_write(
+            self.fd,
+            ffi::CVI_VC_VDEC_RELEASE_FRAME,
+            info,
+            "CVI_VDEC_ReleaseFrame",
+        )
+    }
+}
+
+impl Drop for VdecDev {
+    fn drop(&mut self) {
+        if self.fd >= 0 {
+            unsafe { libc::close(self.fd) };
+            self.fd = -1;
+        }
+    }
+}

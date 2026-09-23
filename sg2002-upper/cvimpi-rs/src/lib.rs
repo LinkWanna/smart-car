@@ -2,16 +2,22 @@
 //!
 //! 范围刻意收窄：
 //!
-//! * [`ffi`] — 原始 `extern "C"` 绑定：JPEG 编解码路径所需的
-//!   `sys` / `vb` / `venc` / `vdec` 接口，字段布局对照 `../include` 下的 C 头文件
-//!   （用 `tools/abi_probe.c` 实测）。
+//! * [`ffi`] — 原始声明：JPEG 编解码路径所需的数据结构、ioctl 号（字段布局
+//!   对照 `../include` 下的 C 头文件实测），以及仍然链接的 `libsys.so` 的
+//!   `sys` / `vb` / bind 接口。
 //! * [`sys`] — 会话所有者：`CVI_SYS_Init` + 全局 VB 池
 //!   （[`sys::Sys`]、[`sys::VbPoolConfig`]）；其余句柄都从它派生。
 //! * [`encoder`] — `PT_JPEG` 编码通道及其 VB 输入帧 [`encoder::Frame`]。
 //! * [`decoder`] — `PT_JPEG` 解码通道及 [`decoder::DecodedFrame`]。
 //! * [`vpss`] — 视频后处理（硬件 CSC + 缩放），直接走 `/dev/cvi-vpss` 的 ioctl。
 //!
-//! 共享逻辑留在 crate 根部：错误类型 [`Error`] 和对照 `cvi_buffer.h` 的缓冲布局计算。
+//! VENC / VDEC 也不链接厂商库：`libvenc.so` / `libvdec.so` 本身只是
+//! 「open 设备 + ioctl + `/dev/mem` 映射」的浅封装，所以 [`encoder`] /
+//! [`decoder`] 直接走 `/dev/cvi_vc_enc*` / `/dev/cvi_vc_dec*` 的 ioctl
+//! （与 [`vpss`] 直连 `/dev/cvi-vpss` 的做法相同）。
+//!
+//! 共享逻辑留在 crate 根部：错误类型 [`Error`]、对照 `cvi_buffer.h` 的缓冲布局
+//! 计算，以及 `encoder` / `decoder` 共用的 ioctl 底层（`open_device` / `ioctl_*`）。
 //!
 //! # 生命周期
 //!
@@ -75,6 +81,8 @@ pub mod vpss;
 
 use core::fmt;
 use core::marker::PhantomData;
+use std::ffi::CString;
+use std::os::unix::io::RawFd;
 
 /// 零大小标记：句柄在 `'a` 期间借用 [`sys::Sys`] 会话。
 pub(crate) type SessionRef<'a> = PhantomData<&'a ()>;
@@ -330,4 +338,50 @@ pub fn vdec_frame_buffer_size(width: u32, height: u32, fmt: ffi::PIXEL_FORMAT_E)
     let w = align_up(width, JPEGD_ALIGN_W);
     let h = align_up(height, JPEGD_ALIGN_H);
     common_pic_layout(w, h, fmt, JPEGD_ALIGN_W).map(|l| l.vb_size)
+}
+
+/* ------------------------------------------------------------------ */
+/* ioctl 底层（encoder / decoder 直连字符设备用）                      */
+/* ------------------------------------------------------------------ */
+
+/// 打开 `/dev/{prefix}{chn}`（`O_RDWR | O_DSYNC | O_CLOEXEC`，与 C 封装一致）。
+pub(crate) fn open_device(prefix: &str, chn: i32, op: &'static str) -> Result<RawFd> {
+    let path = format!("{prefix}{chn}");
+    let c_path = CString::new(path).map_err(|_| Error::invalid(op))?;
+    let fd = unsafe {
+        libc::open(
+            c_path.as_ptr(),
+            libc::O_RDWR | libc::O_DSYNC | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(errno(op));
+    }
+    Ok(fd)
+}
+
+/// 无参数的 ioctl（C 里写成 `ioctl(fd, cmd)`，这里显式传 0）。
+pub(crate) fn ioctl_none(fd: RawFd, cmd: u64, op: &'static str) -> Result<()> {
+    ioctl_check(unsafe { libc::ioctl(fd, cmd as _, 0usize) }, op)
+}
+
+/// 把 `arg` 的指针交给内核（只读，或内核只读取指针本身）。
+pub(crate) fn ioctl_write<T>(fd: RawFd, cmd: u64, arg: &T, op: &'static str) -> Result<()> {
+    ioctl_check(unsafe { libc::ioctl(fd, cmd as _, arg as *const T) }, op)
+}
+
+/// 把 `arg` 的可变指针交给内核（内核会写回）。
+pub(crate) fn ioctl_read<T>(fd: RawFd, cmd: u64, arg: &mut T, op: &'static str) -> Result<()> {
+    ioctl_check(unsafe { libc::ioctl(fd, cmd as _, arg as *mut T) }, op)
+}
+
+fn ioctl_check(ret: libc::c_int, op: &'static str) -> Result<()> {
+    if ret >= 0 { Ok(()) } else { Err(errno(op)) }
+}
+
+/// 当前线程的 errno 转成 [`Error`]（`code` 为 `-errno`，可用
+/// [`vpss::errno_str`] 翻成文本）。
+pub(crate) fn errno(op: &'static str) -> Error {
+    let err = unsafe { *libc::__errno_location() };
+    Error::from_op(-err, op)
 }

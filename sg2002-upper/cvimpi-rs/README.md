@@ -1,20 +1,25 @@
 # cvimpi-rs
 
-`cvi_mpi`（CV180X / CV181X / SG200X）的 **Rust 薄 FFI 封装**，覆盖 **JPEG 编解码**与
+`cvi_mpi`（CV180X / CV181X / SG200X）的 **Rust 薄封装**，覆盖 **JPEG 编解码**与
 **VPSS 视频后处理**两条工作流：
 
-| 能力 | 依赖的 MPI 模块 | 对应头文件 |
+| 能力 | 实现方式 | 对应头文件 |
 |---|---|---|
-| JPEG 编码（YUV → JPEG） | `venc`（`PT_JPEG`） | `cvi_venc.h` |
-| JPEG 解码（JPEG → YUV） | `vdec`（`PT_JPEG`） | `cvi_vdec.h` |
-| 硬件 CSC / 缩放（YUYV → RGB 平面 + NV12 双路输出） | `vpss`（`/dev/cvi-vpss` ioctl 直连） | `cvi_vpss.h` |
-| 初始化 / VB 池 | `sys` | `cvi_sys.h`、`cvi_vb.h` |
+| JPEG 编码（YUV → JPEG） | `/dev/cvi_vc_enc*` ioctl 直连（`PT_JPEG`） | `cvi_venc.h`、`cvi_vc_drv_ioctl.h` |
+| JPEG 解码（JPEG → YUV） | `/dev/cvi_vc_dec*` ioctl 直连（`PT_JPEG`） | `cvi_vdec.h`、`cvi_vc_drv_ioctl.h` |
+| 硬件 CSC / 缩放（YUYV → RGB 平面 + NV12 双路输出） | `/dev/cvi-vpss` ioctl 直连 | `cvi_vpss.h`、`vpss_uapi.h` |
+| 初始化 / VB 池 / `Mmap` / bind | 链接厂商 `libsys.so` | `cvi_sys.h`、`cvi_vb.h` |
 
-VI / ISP / VO / RGN / GDC / audio / IVE / bin 全部不在范围内；需要时可直接用 `ffi` 模块里的原始绑定继续扩展。
+VI / ISP / VO / RGN / GDC / audio / IVE / bin 全部不在范围内；需要时可直接用 `ffi` 模块里的原始声明继续扩展。
 
-> VPSS 没有走厂商的 `libvpss.so`（板端镜像里没有这个库），而是按
-> `include/linux/vpss_uapi.h` 的 ioctl 协议在 `vpss` 模块里直接实现；
-> ABI（结构体尺寸 / 字段偏移 / ioctl 号）由 `tools/vpss_abi_probe.c` 在 C 头上实测，
+> 厂商的 `libvenc.so` / `libvdec.so` 本身只是「open 设备 + ioctl + `/dev/mem`
+> 映射物理地址」的浅封装（见 cvi_mpi 的 `modules/{venc,vdec}/src/*.c`），所以
+> 这里不再链接它们：`venc` / `vdec` 按 `include/linux/cvi_vc_drv_ioctl.h` 直连
+> 设备节点（实现在 `encoder` / `decoder` 模块），帧/码流缓冲的虚拟地址用
+> `CVI_SYS_Mmap*` 映射 —— 与 C 封装的做法一致（`GetFrame` 自动映射平面、
+> `GetStream` 自动映射 pack，在 `decoder` / `encoder` 模块里显式完成）。
+> `libvpss.so` 板端镜像里没有，VPSS 同样按 `include/linux/vpss_uapi.h` 直连。
+> ABI（结构体尺寸 / 字段偏移 / ioctl 号）由 `tools/*_abi_probe.c` 在 C 头上实测，
 > 并在 `ffi.rs` 底部用编译期断言钉死（`cargo check` 即可校验）。
 
 ## 环境准备
@@ -28,10 +33,9 @@ VI / ISP / VO / RGN / GDC / audio / IVE / bin 全部不在范围内；需要时�
 2. 交叉工具链：`.cargo/config.toml` 默认使用 `riscv64-unknown-linux-musl-gcc`
    （Xuantie-900 / CVITEK musl）。换工具链时改这一行即可。
 
-3. `libs/`（固定路径，无需配置）里只保留链接所需的 3 个 `.so`：
-   `libsys.so` / `libvenc.so` / `libvdec.so`。运行期这些库由设备提供
-   （SDK 会安装到 `/usr/lib`），`libs/` 只用于链接；ABI 对照用的头文件在仓库
-   根目录 `../include`。
+3. `libs/`（固定路径，无需配置）里只保留链接所需的 `libsys.so`（VENC / VDEC 走
+   设备节点 ioctl，不需要动态库）。运行期 `libsys.so` 由设备提供（SDK 会安装到
+   `/usr/lib`），`libs/` 只用于链接；ABI 对照用的头文件在仓库根目录 `../include`。
 
 ## 构建 / 部署
 
@@ -197,15 +201,15 @@ VB 池 block 取二者最大值即可同时服务编码与解码。
 
 * 绑定按 **64 位 LP64**（riscv64 / aarch64）编写；32 位 ARM 的 C 结构里有额外的
   `#ifdef __arm__` padding 字段，本封装未覆盖（`ffi::abi_check` 也只在非 arm 上启用）。
-* `src/ffi.rs` 底部的 `abi_check` 用 `size_of!` / `offset_of!` 做**编译期断言**；
-  一旦 `cvi_mpi/include` 的版本和断言不一致，`cargo check` 会直接失败。
+* `src/ffi.rs` 底部的编译期断言用 `size_of!` / `offset_of!` 校验全部结构布局与
+  ioctl 号；一旦 `cvi_mpi/include` 的版本和断言不一致，`cargo check` 会直接失败。
 * 升级 `cvi_mpi` 后重新测量：
 
   ```sh
-  gcc -I ../include -D__CV181X__ tools/abi_probe.c -o /tmp/abi_probe && /tmp/abi_probe
+  gcc -I ../include -D__CV181X__ tools/venc_vdec_abi_probe.c -o /tmp/venc_vdec_probe && /tmp/venc_vdec_probe
   ```
 
-  把输出与 `src/ffi.rs::abi_check` 里的数字对齐即可。
+  把输出与 `src/ffi.rs` 里的数字对齐即可（VPSS 部分对应 `tools/vpss_abi_probe.c`）。
 * 已知省略：`VENC_STREAM_S` 的两个 stream-info union 作为 368 字节 opaque 处理；
   `VENC_RC_ATTR_S` / `VDEC_CHN_PARAM_S` 的 union 也只保留 opaque 存储
   （JPEG 路径不使用，需要时按 probe 结果补齐）。
@@ -225,7 +229,13 @@ VB 池 block 取二者最大值即可同时服务编码与解码。
   （`send_frame` 自动 flush；两帧不同输入编码结果不同，证明 DMA 读到了新数据）。
 * `cargo check`：通过（含全部 ABI 断言），无 warning。
 * `cargo build --release --target riscv64gc-unknown-linux-musl`：链接成功，
-  `NEEDED` 为 `libsys.so / libvenc.so / libvdec.so / libatomic.so.1 / libc.so`。
+  `NEEDED` 只剩 `libsys.so / libatomic.so.1 / libc.so` —— 不再依赖
+  `libvenc.so` / `libvdec.so`。
+* **VENC / VDEC 直连 ioctl 与厂商库逐字节等价**（真机对拍）：同一张 640x480 NV12
+  输入、质量 85，新路径编出的 JPEG 与旧 `cvimpi-rs` CLI（链接 `libvenc`）md5 相同
+  （128288 字节）；解码回来的 NV12 与旧路径（`libvdec`）md5 相同；
+  `GetJpegParam` 读回质量 = 85。VPSS→VENC bind 链路（`--bind`）取流、PTS 透传正常
+  （`GetStream` 0.2ms/帧，`seq`/`pts` 与输入帧一致）。
 * `qemu-riscv64` 下运行 CLI：动态加载整条依赖链成功；`CVI_SYS_Init` 因宿主无
   `/dev/cvi-base` 按预期报错（`0xc0028010`）。
 * doctest：5 个 `no_run`（编译通过，含 `Send` 断言）+ 2 个 `compile_fail`，后者证明
@@ -238,5 +248,6 @@ VB 池 block 取二者最大值即可同时服务编码与解码。
   的 per-channel 池模式（`--vbMode=user`）。
 * 硬件 JPEG 解码器一般只支持 baseline；progressive JPEG 请先在设备上用 sample 验证。
 * 编码输入帧默认 uncached 映射（`CVI_SYS_Mmap`，写完免 flush）；CPU 密集写入时用
-  `Sys::alloc_frame_cached`（cached，`send_frame` 自动 flush）。解码输出读取前会
-  调用一次 `CVI_SYS_IonInvalidateCache`（与 C sample 一致）。
+  `Sys::alloc_frame_cached`（cached，`send_frame` 自动 flush）。解码输出与 VENC 码流
+  用 `CVI_SYS_MmapCache` 映射（cached + `IonInvalidateCache`，与 C 封装的
+  `/dev/mem` 映射一致）。

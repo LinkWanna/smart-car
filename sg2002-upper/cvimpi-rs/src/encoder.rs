@@ -28,11 +28,13 @@
 use core::ffi::c_void;
 use core::marker::PhantomData;
 use core::{mem, slice};
+use std::os::unix::io::RawFd;
 
 use crate::ffi;
 use crate::sys::Sys;
 use crate::{
-    Error, FrameLayout, Result, SessionRef, check, plane_dims, tight_frame_size, venc_input_layout,
+    Error, FrameLayout, Result, SessionRef, check, ioctl_none, ioctl_read, ioctl_write,
+    open_device, plane_dims, tight_frame_size, venc_input_layout,
 };
 
 #[inline]
@@ -186,9 +188,7 @@ impl<'a> Frame<'a> {
                 continue;
             }
             check(
-                unsafe {
-                    ffi::CVI_SYS_IonFlushCache(v.u64PhyAddr[p], vir.cast(), v.u32Length[p])
-                },
+                unsafe { ffi::CVI_SYS_IonFlushCache(v.u64PhyAddr[p], vir.cast(), v.u32Length[p]) },
                 "CVI_SYS_IonFlushCache",
             )?;
         }
@@ -333,11 +333,11 @@ impl EncoderConfig {
     }
 }
 
-/// 一条 `PT_JPEG` 编码通道（`CVI_VENC_*`）。
+/// 一条 `PT_JPEG` 编码通道（`CVI_VENC_*`，直连 `/dev/cvi_vc_enc{chn}`）。
 ///
 /// 由 [`Sys::create_encoder`] 创建；析构时停止并销毁通道。
 pub struct Encoder<'a> {
-    chn: ffi::VENC_CHN,
+    dev: VencDev,
     _session: SessionRef<'a>,
 }
 
@@ -385,13 +385,9 @@ impl<'a> Encoder<'a> {
         attr.stRcAttr = ffi::VENC_RC_ATTR_S::default();
         attr.stGopAttr = ffi::VENC_GOP_ATTR_S::default();
 
-        check(
-            unsafe { ffi::CVI_VENC_CreateChn(chn, &attr) },
-            "CVI_VENC_CreateChn",
-        )?;
-
+        let dev = VencDev::create(chn, &attr)?;
         let enc = Encoder {
-            chn,
+            dev,
             _session: PhantomData,
         };
         if let Some(q) = cfg.quality {
@@ -402,17 +398,11 @@ impl<'a> Encoder<'a> {
 
     /// 开始接收帧（`CVI_VENC_StartRecvFrame`）。`-1` 表示不限帧数。
     pub fn start_recv_frame(&self, recv_pic_num: i32) -> Result<()> {
-        let recv = ffi::VENC_RECV_PIC_PARAM_S {
-            s32RecvPicNum: recv_pic_num,
-        };
-        check(
-            unsafe { ffi::CVI_VENC_StartRecvFrame(self.chn, &recv) },
-            "CVI_VENC_StartRecvFrame",
-        )
+        self.dev.start_recv_frame(recv_pic_num)
     }
 
     pub fn channel(&self) -> ffi::VENC_CHN {
-        self.chn
+        self.dev.channel()
     }
 
     /// 用 `CVI_VENC_SetJpegParam` 设置新质量（`1..=99`，50 为标准量化表）。
@@ -421,18 +411,19 @@ impl<'a> Encoder<'a> {
             u32Qfactor: quality,
             ..Default::default()
         };
-        check(
-            unsafe { ffi::CVI_VENC_SetJpegParam(self.chn, &p) },
-            "CVI_VENC_SetJpegParam",
-        )
+        self.dev.set_jpeg_param(&p)
     }
 
     /// 用 `CVI_VENC_SetJpegParam` 设置自定义量化表。
     pub fn set_jpeg_param(&self, param: &ffi::VENC_JPEG_PARAM_S) -> Result<()> {
-        check(
-            unsafe { ffi::CVI_VENC_SetJpegParam(self.chn, param) },
-            "CVI_VENC_SetJpegParam",
-        )
+        self.dev.set_jpeg_param(param)
+    }
+
+    /// 读回当前 JPEG 参数（`CVI_VENC_GetJpegParam`，诊断用）。
+    pub fn get_jpeg_param(&self) -> Result<ffi::VENC_JPEG_PARAM_S> {
+        let mut param = ffi::VENC_JPEG_PARAM_S::default();
+        self.dev.get_jpeg_param(&mut param)?;
+        Ok(param)
     }
 
     /// 提交一帧输入（`CVI_VENC_SendFrame`）。
@@ -440,10 +431,7 @@ impl<'a> Encoder<'a> {
     /// cached 帧会先 [`Frame::flush`]（uncached 帧 no-op）。
     pub fn send_frame(&self, frame: &Frame<'_>, timeout_ms: ffi::CVI_S32) -> Result<()> {
         frame.flush()?;
-        check(
-            unsafe { ffi::CVI_VENC_SendFrame(self.chn, frame.info(), timeout_ms) },
-            "CVI_VENC_SendFrame",
-        )
+        self.dev.send_frame(frame.info(), timeout_ms)
     }
 
     /// 提交任意一帧 `VIDEO_FRAME_INFO_S`（例如 VPSS 通道输出帧）。
@@ -457,10 +445,7 @@ impl<'a> Encoder<'a> {
         frame: &ffi::VIDEO_FRAME_INFO_S,
         timeout_ms: ffi::CVI_S32,
     ) -> Result<()> {
-        check(
-            unsafe { ffi::CVI_VENC_SendFrame(self.chn, frame, timeout_ms) },
-            "CVI_VENC_SendFrame",
-        )
+        self.dev.send_frame(frame, timeout_ms)
     }
 
     /// `send_frame_info` + `get_stream`。
@@ -486,41 +471,18 @@ impl<'a> Encoder<'a> {
         let mut stream: ffi::VENC_STREAM_S = unsafe { mem::zeroed() };
         stream.pstPack = packs.as_mut_ptr();
         stream.u32PackCount = MAX_STREAM_PACKS as u32;
-        check(
-            unsafe { ffi::CVI_VENC_GetStream(self.chn, &mut stream, timeout_ms) },
-            "CVI_VENC_GetStream",
-        )?;
 
-        let mut out = Vec::new();
-        let mut meta = StreamMeta {
-            seq: stream.u32Seq,
-            pts: 0,
-        };
-        if !stream.pstPack.is_null() {
-            // SAFETY: 中间件已把 `pstPack`（指向上面的 `packs`）填成
-            // `u32PackCount` 个有效的 `VENC_PACK_S`，这些数据归码流缓冲所有。
-            unsafe {
-                for i in 0..stream.u32PackCount.min(MAX_STREAM_PACKS as u32) as usize {
-                    let pack = &*stream.pstPack.add(i);
-                    if i == 0 {
-                        meta.pts = pack.u64PTS;
-                    }
-                    if pack.pu8Addr.is_null() || pack.u32Len == 0 {
-                        continue;
-                    }
-                    out.extend_from_slice(slice::from_raw_parts(
-                        pack.pu8Addr,
-                        pack.u32Len as usize,
-                    ));
-                }
-            }
+        self.dev.get_stream(&mut stream, timeout_ms)?;
+
+        // 内核只回填物理地址；逐 pack 映射拷出（见 `copy_stream_packs`）。
+        // 无论拷贝成功与否，都要把码流缓冲还给内核。
+        let copied = copy_stream_packs(&stream);
+        let released = self.dev.release_stream(&mut stream);
+        match (copied, released) {
+            (Ok(v), Ok(())) => Ok(v),
+            (Err(e), _) => Err(e),
+            (Ok(_), Err(e)) => Err(e),
         }
-
-        check(
-            unsafe { ffi::CVI_VENC_ReleaseStream(self.chn, &mut stream) },
-            "CVI_VENC_ReleaseStream",
-        )?;
-        Ok((out, meta))
     }
 
     /// `send_frame` + `get_stream`。
@@ -530,11 +492,186 @@ impl<'a> Encoder<'a> {
     }
 }
 
+/// 把 `CVI_VENC_GetStream` 回填的各 pack 拷成一个连续缓冲。
+///
+/// 与 C 封装一致：每个 pack 的 `u64PhyAddr` 经 `/dev/mem`（libsys 的
+/// `CVI_SYS_MmapCache`，cached + invalidate）映射后读取 `u32Len` 字节，
+/// 读完立即解除映射；`pu8Addr` 保持内核回填的原值（C 封装也是把它原样还给
+/// `ReleaseStream`）。映射/拷贝失败时不会留下未解除的映射。
+fn copy_stream_packs(stream: &ffi::VENC_STREAM_S) -> Result<(Vec<u8>, StreamMeta)> {
+    let mut out = Vec::new();
+    let mut meta = StreamMeta {
+        seq: stream.u32Seq,
+        pts: 0,
+    };
+    if stream.pstPack.is_null() {
+        return Ok((out, meta));
+    }
+
+    // SAFETY: 内核把 `pstPack`（调用方提供的数组）填成 `u32PackCount` 个有效
+    // `VENC_PACK_S`；数量不会超过调用时给的容量。
+    let count = stream.u32PackCount.min(MAX_STREAM_PACKS as u32) as usize;
+    for i in 0..count {
+        let pack = unsafe { &*stream.pstPack.add(i) };
+        if i == 0 {
+            meta.pts = pack.u64PTS;
+        }
+        if pack.u64PhyAddr == 0 || pack.u32Len == 0 {
+            continue;
+        }
+
+        let ptr = unsafe { ffi::CVI_SYS_MmapCache(pack.u64PhyAddr, pack.u32Len) };
+        if ptr.is_null() {
+            return Err(Error::invalid("CVI_VENC_GetStream (CVI_SYS_MmapCache)"));
+        }
+        // SAFETY: 刚映射了 `u32Len` 字节，且归本次拷贝所有。
+        unsafe {
+            out.extend_from_slice(slice::from_raw_parts(
+                ptr.cast::<u8>(),
+                pack.u32Len as usize,
+            ));
+            ffi::CVI_SYS_Munmap(ptr, pack.u32Len);
+        }
+    }
+    Ok((out, meta))
+}
+
 impl Drop for Encoder<'_> {
     fn drop(&mut self) {
-        unsafe {
-            ffi::CVI_VENC_StopRecvFrame(self.chn);
-            ffi::CVI_VENC_DestroyChn(self.chn);
+        // 与 C 封装（`CVI_VENC_DestroyChn`）一致：先停收帧再销毁通道，失败忽略
+        // （通道可能已被内核清掉）；fd 由 `VencDev` 析构关闭。
+        let _ = self.dev.stop_recv_frame();
+        let _ = self.dev.destroy_chn();
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* 设备层（/dev/cvi_vc_enc{chn} 的 ioctl 直连）                        */
+/* ------------------------------------------------------------------ */
+
+/// VENC 设备节点前缀（`CVI_VC_DRV_ENCODER_DEV_NAME`）。
+const VENC_DEV_PREFIX: &str = "/dev/cvi_vc_enc";
+
+/// 一条 VENC 通道的内核句柄（一个 `/dev/cvi_vc_enc{chn}` fd）。
+///
+/// 厂商的 `libvenc.so` 本身就是「open 设备 + ioctl」的浅封装（见 cvi_mpi 的
+/// `modules/venc/src/cvi_venc.c`），所以这里按
+/// `include/linux/cvi_vc_drv_ioctl.h` 的协议直接实现：全部命令都是 `_IO`
+/// （type 字符 `'V'`，命令号 = `0x5600 | nr`），`SendFrame` / `GetStream` 的
+/// 载荷是「结构体指针 + `s32MilliSec`」的 EX 包装。
+///
+/// [`VencDev::create`] 完成 `open` + `CVI_VC_VENC_CREATE_CHN`；析构时只关 fd，
+/// 通道的停止/销毁由 [`Encoder`] 的 `Drop` 调用 [`VencDev::stop_recv_frame`] /
+/// [`VencDev::destroy_chn`]（与 C 封装 `CVI_VENC_DestroyChn` 的顺序一致）。
+struct VencDev {
+    fd: RawFd,
+    chn: ffi::VENC_CHN,
+}
+
+impl VencDev {
+    /// `open("/dev/cvi_vc_enc{chn}")` + `CVI_VC_VENC_CREATE_CHN`。
+    fn create(chn: ffi::VENC_CHN, attr: &ffi::VENC_CHN_ATTR_S) -> Result<Self> {
+        let fd = open_device(VENC_DEV_PREFIX, chn, "open(/dev/cvi_vc_enc*)")?;
+        let dev = Self { fd, chn };
+        ioctl_write(fd, ffi::CVI_VC_VENC_CREATE_CHN, attr, "CVI_VENC_CreateChn")?;
+        Ok(dev)
+    }
+
+    fn channel(&self) -> ffi::VENC_CHN {
+        self.chn
+    }
+
+    /// `CVI_VENC_StartRecvFrame`（`-1` 表示不限帧数）。
+    fn start_recv_frame(&self, recv_pic_num: ffi::CVI_S32) -> Result<()> {
+        let recv = ffi::VENC_RECV_PIC_PARAM_S {
+            s32RecvPicNum: recv_pic_num,
+        };
+        ioctl_write(
+            self.fd,
+            ffi::CVI_VC_VENC_START_RECV_FRAME,
+            &recv,
+            "CVI_VENC_StartRecvFrame",
+        )
+    }
+
+    /// `CVI_VENC_StopRecvFrame`。
+    fn stop_recv_frame(&self) -> Result<()> {
+        ioctl_none(
+            self.fd,
+            ffi::CVI_VC_VENC_STOP_RECV_FRAME,
+            "CVI_VENC_StopRecvFrame",
+        )
+    }
+
+    /// `CVI_VENC_DestroyChn`。
+    fn destroy_chn(&self) -> Result<()> {
+        ioctl_none(self.fd, ffi::CVI_VC_VENC_DESTROY_CHN, "CVI_VENC_DestroyChn")
+    }
+
+    /// `CVI_VENC_SendFrame`。
+    fn send_frame(&self, frame: &ffi::VIDEO_FRAME_INFO_S, timeout_ms: ffi::CVI_S32) -> Result<()> {
+        let ex = ffi::VIDEO_FRAME_INFO_EX_S {
+            pstFrame: frame,
+            s32MilliSec: timeout_ms,
+        };
+        ioctl_write(
+            self.fd,
+            ffi::CVI_VC_VENC_SEND_FRAME,
+            &ex,
+            "CVI_VENC_SendFrame",
+        )
+    }
+
+    /// `CVI_VENC_GetStream`：内核把 pack 列表填进 `stream.pstPack`。
+    fn get_stream(&self, stream: &mut ffi::VENC_STREAM_S, timeout_ms: ffi::CVI_S32) -> Result<()> {
+        let ex = ffi::VENC_STREAM_EX_S {
+            pstStream: stream,
+            s32MilliSec: timeout_ms,
+        };
+        ioctl_write(
+            self.fd,
+            ffi::CVI_VC_VENC_GET_STREAM,
+            &ex,
+            "CVI_VENC_GetStream",
+        )
+    }
+
+    /// `CVI_VENC_ReleaseStream`。
+    fn release_stream(&self, stream: &mut ffi::VENC_STREAM_S) -> Result<()> {
+        ioctl_write(
+            self.fd,
+            ffi::CVI_VC_VENC_RELEASE_STREAM,
+            stream,
+            "CVI_VENC_ReleaseStream",
+        )
+    }
+
+    /// `CVI_VENC_SetJpegParam`。
+    fn set_jpeg_param(&self, param: &ffi::VENC_JPEG_PARAM_S) -> Result<()> {
+        ioctl_write(
+            self.fd,
+            ffi::CVI_VC_VENC_SET_JPEG_PARAM,
+            param,
+            "CVI_VENC_SetJpegParam",
+        )
+    }
+
+    /// `CVI_VENC_GetJpegParam`。
+    fn get_jpeg_param(&self, param: &mut ffi::VENC_JPEG_PARAM_S) -> Result<()> {
+        ioctl_read(
+            self.fd,
+            ffi::CVI_VC_VENC_GET_JPEG_PARAM,
+            param,
+            "CVI_VENC_GetJpegParam",
+        )
+    }
+}
+
+impl Drop for VencDev {
+    fn drop(&mut self) {
+        if self.fd >= 0 {
+            unsafe { libc::close(self.fd) };
+            self.fd = -1;
         }
     }
 }

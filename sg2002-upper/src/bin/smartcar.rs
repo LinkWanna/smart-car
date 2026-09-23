@@ -18,12 +18,14 @@
 //! 画面**严格同帧**。模型/相机不可用时降级为「仅预览」或「仅遥控」，手动模式照常。
 
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use clap::Parser;
+use log::{error, info, warn};
 use sg2002_upper::control::{Car, CarConfig};
+use sg2002_upper::logging;
 use sg2002_upper::preview::PreviewSource;
 use sg2002_upper::vision::{VisionConfig, VisionStream};
 use sg2002_upper::web::{DriveTarget, Server, TeleopConfig, WebConfig};
@@ -173,12 +175,14 @@ fn install_signals(running: &Arc<AtomicBool>) {
 }
 
 fn main() {
+    logging::init();
+
     let cli = Cli::parse();
 
-    println!("{}", "=".repeat(60));
-    println!("  SG2002 整合上位机 — 视觉追踪 + 网页遥控（手动/自动）");
-    println!("{}", "=".repeat(60));
-    println!(
+    info!("{}", "=".repeat(60));
+    info!("  SG2002 整合上位机 — 视觉追踪 + 网页遥控（手动/自动）");
+    info!("{}", "=".repeat(60));
+    info!(
         "  链路：{} @ {}  ↔  ESP32-C3（AA 55 帧协议）",
         cli.serial, cli.baud
     );
@@ -189,13 +193,13 @@ fn main() {
         ..Default::default()
     })
     .unwrap_or_else(|e| {
-        eprintln!("smartcar: 打开串口 {} 失败: {e}", cli.serial);
+        error!("打开串口 {} 失败: {e}", cli.serial);
         std::process::exit(2);
     });
     if car.ensure_ready(READY_TIMEOUT) {
-        println!("  下位机：就绪（{}）", car.last_frame());
+        info!("  下位机：就绪（{}）", car.last_frame());
     } else {
-        eprintln!("  [警告] 下位机无应答，检查接线/供电/固件；页面仍可打开，按“初始化”重试");
+        warn!("下位机无应答，检查接线/供电/固件；页面仍可打开，按“初始化”重试");
     }
     let car = Arc::new(car);
 
@@ -204,12 +208,12 @@ fn main() {
 
     // 视觉：相机以模型需要的 YUYV422 打开，预览与检测同帧（vision.rs）。
     let vision: Option<Arc<VisionStream>> = if cli.no_vision {
-        println!("  视觉：已关闭（--no-vision，自动模式不可用）");
+        info!("  视觉：已关闭（--no-vision，自动模式不可用）");
         None
     } else {
         match find_model(cli.model.as_deref()) {
             Ok(model) => {
-                println!("  模型：{model}");
+                info!("  模型：{model}");
                 Some(Arc::new(VisionStream::start(
                     VisionConfig {
                         device: cli.camera.clone(),
@@ -225,7 +229,7 @@ fn main() {
                 )))
             }
             Err(e) => {
-                eprintln!("  [警告] {e}；改为仅遥控（自动模式不可用）");
+                warn!("{e}；改为仅遥控（自动模式不可用）");
                 None
             }
         }
@@ -255,22 +259,22 @@ fn main() {
         Arc::clone(&running),
     )
     .unwrap_or_else(|e| {
-        eprintln!("smartcar: {e}");
+        error!("{e}");
         std::process::exit(2);
     });
 
     let addr = server.local_addr().expect("读取监听地址失败");
     let control = server.spawn_control();
     if cli.bind == "0.0.0.0" {
-        println!(
+        info!(
             "  页面：http://192.168.4.1{}/   （AP 热点默认地址；本机监听 {addr}）",
             port_suffix(addr.port())
         );
     } else {
-        println!("  页面：http://{addr}/");
+        info!("  页面：http://{addr}/");
     }
-    println!("  模式：默认手动（页面按钮切换自动）；Ctrl+C 停止");
-    println!("{}\n", "=".repeat(60));
+    info!("  模式：默认手动（页面按钮切换自动）；Ctrl+C 停止");
+    info!("{}", "=".repeat(60));
 
     server.run();
     running.store(false, Ordering::SeqCst);
@@ -282,11 +286,11 @@ fn main() {
     }
     car.shutdown();
     let c = car.counters();
-    println!(
+    info!(
         "链路统计：ACK={} NACK={} 校验错={} 写失败={} 看门狗={}",
         c.acks, c.nacks, c.checksum_fails, c.write_errors, c.watchdog_trips
     );
-    println!("已退出。");
+    info!("已退出。");
 }
 
 fn port_suffix(port: u16) -> String {

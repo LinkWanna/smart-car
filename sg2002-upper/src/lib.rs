@@ -8,12 +8,12 @@
 //!   `servo` 视觉伺服控制律）。
 //! - 网页遥控：`web`（零依赖 HTTP/WebSocket、手动遥控控制律、MJPEG 预览、
 //!   手动/自动仲裁）、`preview`（预览与视觉之间的中性契约）。
-//! - 观测：`stats`（管线耗时统计）。
+//! - 观测：`stats`（管线耗时统计）、`logging`（`log` + `simple_logger` 初始化）。
 //! - 硬件编解码：`hwjpeg`（SG2002 VENC 硬件 JPEG，封装在 `cvimpi-rs` 里，
 //!   编解码会话/通道/VB 池都由它管理；打不开硬件时上层降级到软件编码）。
 //!
 //! 入口 bin：`smartcar`（整合：视觉 + 网页 + 手动/自动）、`webctl`（只遥控）、
-//! `pipeline`（只视觉）、`carctl`（下位机调试）。
+//! `pipeline`（只视觉）。
 //!
 //! `camera` / `tpu` / `position` / `hwjpeg` 依赖板端 C 库与 V4L2，随 crate
 //! 无条件编译：板端直接运行，主机上可用 `cargo check` 做编译检查
@@ -22,6 +22,7 @@
 pub mod camera;
 pub mod control;
 pub mod hwjpeg;
+pub mod logging;
 pub mod position;
 pub mod preprocess;
 pub mod preview;

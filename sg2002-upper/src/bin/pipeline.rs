@@ -18,7 +18,9 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use log::{info, warn};
 use sg2002_upper::control::{Action, Car, CarConfig, ControlConfig, ControlLoop, Observation};
+use sg2002_upper::logging;
 use sg2002_upper::stats::Stats;
 use sg2002_upper::vision::{PreviewCopy, Vision, VisionConfig};
 
@@ -43,6 +45,8 @@ extern "C" fn handle_sig(_: libc::c_int) {
 }
 
 fn main() {
+    logging::init();
+
     let mut vision = Vision::new(VisionConfig {
         device: CAMERA_DEVICE.to_string(),
         model: MODEL_PATH.to_string(),
@@ -53,28 +57,32 @@ fn main() {
     })
     .unwrap_or_else(|e| panic!("打开相机 {CAMERA_DEVICE} 失败: {e}"));
 
-    println!("{}", "=".repeat(55));
-    println!("  SG2002 上位机 — 网球追踪 → ESP32-C3 下位机");
-    println!(
+    info!("{}", "=".repeat(55));
+    info!("  SG2002 上位机 — 网球追踪 → ESP32-C3 下位机");
+    info!(
         "  相机：{} {} → {}x{} CHW",
         vision.device(),
         vision.camera_format(),
         sg2002_upper::vision::FRAME_W,
         sg2002_upper::vision::FRAME_H
     );
-    println!("  模型：{}（输入 {}）", vision.model_path(), vision.model_input());
+    info!(
+        "  模型：{}（输入 {}）",
+        vision.model_path(),
+        vision.model_input()
+    );
     if let Some(err) = vision.model_error() {
-        eprintln!("  [警告] 模型不可用：{err}（将只做空检测）");
+        warn!("模型不可用：{err}（将只做空检测）");
     }
-    println!(
+    info!(
         "  链路：{} @ {} ↔ ESP32-C3（AA 55 帧协议，SetSpeeds 差速）",
         SERIAL_PORT, SERIAL_BAUD
     );
-    println!("{}", "=".repeat(55));
+    info!("{}", "=".repeat(55));
 
     let ctrl_cfg = ControlConfig::default();
     let mut ctrl = ControlLoop::new(ctrl_cfg);
-    println!(
+    info!(
         "  控制：远 {} / 中 {} / 搜索 {}，差速增益 {:.2}，丢失 {}ms 后搜索",
         ctrl_cfg.far_speed,
         ctrl_cfg.mid_speed,
@@ -90,11 +98,11 @@ fn main() {
     })
     .unwrap_or_else(|e| panic!("打开串口 {} 失败: {}", SERIAL_PORT, e));
     if car.ensure_ready(READY_TIMEOUT) {
-        println!("  下位机：就绪（{}）", car.last_frame());
+        info!("  下位机：就绪（{}）", car.last_frame());
     } else {
-        eprintln!("  [警告] 下位机无应答，检查接线/供电/固件；继续运行视觉，速度指令会被忽略");
+        warn!("下位机无应答，检查接线/供电/固件；继续运行视觉，速度指令会被忽略");
     }
-    println!("\n启动管线... 按 Ctrl+C 停止。\n");
+    info!("启动管线... 按 Ctrl+C 停止。");
 
     let mut stats = Stats::new();
     let mut last_action: Option<Action> = None;
@@ -151,13 +159,10 @@ fn main() {
                 "无".to_string()
             };
             let (sys_name, rpm) = match car.status() {
-                Some(st) => (
-                    st.sys.to_string(),
-                    format!("({},{})", st.rpm[0], st.rpm[1]),
-                ),
+                Some(st) => (st.sys.to_string(), format!("({},{})", st.rpm[0], st.rpm[1])),
                 None => ("无应答".to_string(), "(--,--)".to_string()),
             };
-            println!(
+            info!(
                 "  [{:04}] 检测={} 采集:{:.0}ms 预处理:{:.0}ms TPU:{:.0}ms NMS:{:.0}ms 位置:{:.1}ms 控制:{:.1}ms 总计:{:.0}ms fps:{:.1}\n        目标=[{} {}] 动作={} 下位机:{} rpm{} 链路={}",
                 stats.fid,
                 det_str,
@@ -181,6 +186,6 @@ fn main() {
 
     // 退出：滑行停车（Drop 兜底，这里显式执行以便打印异常）。
     car.shutdown();
-    println!("\n已停车，链路断开。");
-    stats.print_summary();
+    info!("已停车，链路断开。");
+    stats.log_summary();
 }

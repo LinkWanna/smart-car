@@ -3,12 +3,14 @@
 //! 板端（StarryOS）对 termios 的支持不保证完整，所以这里的策略是：
 //! - 打开 `/dev/ttyS1` 后尽力设置为 raw + 波特率；
 //! - `tcgetattr`/`tcsetattr` 失败不致命（板端串口可能已由内核/启动脚本配好），
-//!   只留下 stderr 提示；
+//!   只留下日志警告；
 //! - `O_NONBLOCK` 用于读线程，写侧由 [`crate::control::car`] 处理 `EAGAIN` 重试。
 
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::unix::io::AsRawFd;
+
+use log::warn;
 
 /// 以读写方式打开串口并尽力配置。
 pub fn open(path: &str, baud: u32) -> io::Result<File> {
@@ -43,7 +45,7 @@ fn configure_raw(fd: libc::c_int, baud: u32) {
     unsafe {
         let mut tio: libc::termios = std::mem::zeroed();
         if libc::tcgetattr(fd, &mut tio) != 0 {
-            eprintln!("[serial] tcgetattr 不可用（板端可能已预配置），保持默认");
+            warn!("tcgetattr 不可用（板端可能已预配置），保持默认");
             return;
         }
         libc::cfmakeraw(&mut tio);
@@ -53,10 +55,10 @@ fn configure_raw(fd: libc::c_int, baud: u32) {
             libc::cfsetispeed(&mut tio, speed);
             libc::cfsetospeed(&mut tio, speed);
         } else {
-            eprintln!("[serial] 不支持的波特率 {}，沿用当前配置", baud);
+            warn!("不支持的波特率 {}，沿用当前配置", baud);
         }
         if libc::tcsetattr(fd, libc::TCSANOW, &tio) != 0 {
-            eprintln!("[serial] tcsetattr 失败（板端可能已预配置），保持默认");
+            warn!("tcsetattr 失败（板端可能已预配置），保持默认");
         }
     }
 }

@@ -12,6 +12,10 @@ cviruntime-rs = { path = "cviruntime-rs" }
 # 硬件 JPEG 编解码（VENC/VDEC，PT_JPEG），见 src/hwjpeg.rs
 cvimpi-rs = { path = "cvimpi-rs" }
 rouille = "3.6.2"
+log = "0.4"
+# 保留 simple_logger 默认 feature（colors + timestamps = 默认输出格式），
+# 只额外打开 stderr：日志与 HUD 统一走 stderr（tty 上带色，重定向自动去色）。
+simple_logger = { version = "5.2", features = ["stderr"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 clap = { version = "4.6.7", features = ["derive"] }
@@ -21,10 +25,6 @@ protocol = { path = "../protocol" }
 [[bin]]
 name = "pipeline"
 path = "src/bin/pipeline.rs"
-
-[[bin]]
-name = "carctl"
-path = "src/bin/carctl.rs"
 
 [[bin]]
 name = "webctl"

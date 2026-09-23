@@ -4,6 +4,8 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
+use log::info;
+
 pub struct Stats {
     t0: Instant,
     pub fid: usize,
@@ -104,7 +106,7 @@ impl Stats {
         }
     }
 
-    pub fn print_summary(&mut self) {
+    pub fn log_summary(&mut self) {
         if self.printed {
             return;
         }
@@ -119,13 +121,13 @@ impl Stats {
             0.0
         };
         let recent = self.avg_fps();
-        println!("\n\n{}", "=".repeat(55));
-        println!(
+        info!("{}", "=".repeat(55));
+        info!(
             "  {} 帧，耗时 {:.1} 秒，平均 {:.1} 帧/秒",
             self.fid, elapsed, avg_fps
         );
         if !self.fps_window.is_empty() {
-            println!("  最近 {} 帧：{:.1} 帧/秒", self.fps_window.len(), recent);
+            info!("  最近 {} 帧：{:.1} 帧/秒", self.fps_window.len(), recent);
         }
         let has_stage = !self.capture_ms.is_empty()
             || !self.pre_ms.is_empty()
@@ -140,7 +142,7 @@ impl Stats {
             } else {
                 self.pre_ms.len().max(30)
             };
-            println!(
+            info!(
                 "  均值 (最近{}帧)：采集 {:.1}ms  预处理 {:.1}ms  推理 {:.1}ms (TPU {:.1}ms + NMS {:.1}ms)  位置 {:.1}ms  控制 {:.1}ms  总计 {:.1}ms",
                 n,
                 Self::avg(&self.capture_ms),
@@ -152,7 +154,7 @@ impl Stats {
                 Self::avg(&self.control_ms),
                 Self::avg(&self.total_ms)
             );
-            println!(
+            info!(
                 "  阶段：[1]采集 {:.1}ms  [2]预处理 {:.1}ms  [3]推理 {:.1}ms  [4]位置 {:.1}ms  [5]控制 {:.1}ms",
                 Self::avg(&self.capture_ms),
                 Self::avg(&self.pre_ms),
@@ -161,7 +163,7 @@ impl Stats {
                 Self::avg(&self.control_ms)
             );
         }
-        println!(
+        info!(
             "  检测帧：{}  无目标帧：{}",
             self.det_frames, self.no_target_frames
         );
@@ -171,7 +173,7 @@ impl Stats {
                 .iter()
                 .map(|(k, v)| format!("{}={}", k, v))
                 .collect();
-            println!("  计数：{}", extra.join("  "));
+            info!("  计数：{}", extra.join("  "));
         }
         if !self.extra.is_empty() {
             let extra: Vec<String> = self
@@ -179,9 +181,9 @@ impl Stats {
                 .iter()
                 .map(|(k, v)| format!("{}={}", k, v))
                 .collect();
-            println!("  额外：{}", extra.join("  "));
+            info!("  额外：{}", extra.join("  "));
         }
-        println!("{}", "=".repeat(55));
+        info!("{}", "=".repeat(55));
     }
 }
 

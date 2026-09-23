@@ -25,7 +25,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use clap::Parser;
+use log::{error, info, warn};
 use sg2002_upper::control::{Car, CarConfig};
+use sg2002_upper::logging;
 use sg2002_upper::preview::PreviewSource;
 use sg2002_upper::web::{CameraStream, DriveTarget, Server, TeleopConfig, WebConfig};
 
@@ -134,6 +136,8 @@ fn install_signals(running: &Arc<AtomicBool>) {
 }
 
 fn main() {
+    logging::init();
+
     let cli = Cli::parse();
     let teleop = TeleopConfig {
         max_speed: cli.max_speed,
@@ -143,13 +147,13 @@ fn main() {
         ..TeleopConfig::default()
     };
 
-    println!("{}", "=".repeat(60));
-    println!("  SG2002 网页遥控 — 串口链路 + WebSocket + MJPEG 预览");
-    println!(
+    info!("{}", "=".repeat(60));
+    info!("  SG2002 网页遥控 — 串口链路 + WebSocket + MJPEG 预览");
+    info!(
         "  链路：{} @ {}  ↔  ESP32-C3（AA 55 帧协议）",
         cli.serial, cli.baud
     );
-    println!("{}", "=".repeat(60));
+    info!("{}", "=".repeat(60));
 
     let car = Car::open(CarConfig {
         port: cli.serial.clone(),
@@ -157,13 +161,13 @@ fn main() {
         ..Default::default()
     })
     .unwrap_or_else(|e| {
-        eprintln!("webctl: 打开串口 {} 失败: {e}", cli.serial);
+        error!("打开串口 {} 失败: {e}", cli.serial);
         std::process::exit(2);
     });
     if car.ensure_ready(READY_TIMEOUT) {
-        println!("  下位机：就绪（{}）", car.last_frame());
+        info!("  下位机：就绪（{}）", car.last_frame());
     } else {
-        eprintln!("  [警告] 下位机无应答，检查接线/供电/固件；页面仍可打开，按“初始化”重试");
+        warn!("下位机无应答，检查接线/供电/固件；页面仍可打开，按“初始化”重试");
     }
     let car = Arc::new(car);
 
@@ -180,7 +184,7 @@ fn main() {
         )))
     };
     if camera.is_none() {
-        println!("  预览：已关闭（--no-camera）");
+        info!("  预览：已关闭（--no-camera）");
     }
     // 网页只依赖 PreviewSource 抽象（MJPG 源没有视觉结果）
     let preview: Option<Arc<dyn PreviewSource>> = camera
@@ -202,26 +206,26 @@ fn main() {
         Arc::clone(&running),
     )
     .unwrap_or_else(|e| {
-        eprintln!("webctl: {e}");
+        error!("{e}");
         std::process::exit(2);
     });
 
     let addr = server.local_addr().expect("读取监听地址失败");
     let control = server.spawn_control();
     if cli.bind == "0.0.0.0" {
-        println!(
+        info!(
             "  页面：http://192.168.4.1{}/   （AP 热点默认地址；本机监听 {}）",
             port_suffix(addr.port()),
             addr
         );
     } else {
-        println!("  页面：http://{addr}/");
+        info!("  页面：http://{addr}/");
     }
-    println!(
+    info!(
         "  控制：{:.0}Hz 节拍，状态 {:.0}Hz，预览 {:.0}fps；Ctrl+C 停止",
         control_hz, cli.status_hz, cli.video_fps
     );
-    println!("{}\n", "=".repeat(60));
+    info!("{}", "=".repeat(60));
 
     // 阻塞在这里，直到 Ctrl+C/SIGTERM 或内部错误把 running 置 false。
     server.run();
@@ -234,11 +238,11 @@ fn main() {
     }
     car.shutdown();
     let c = car.counters();
-    println!(
+    info!(
         "链路统计：ACK={} NACK={} 校验错={} 写失败={} 看门狗={}",
         c.acks, c.nacks, c.checksum_fails, c.write_errors, c.watchdog_trips
     );
-    println!("已退出。");
+    info!("已退出。");
 }
 
 fn port_suffix(port: u16) -> String {

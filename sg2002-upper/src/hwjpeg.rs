@@ -9,6 +9,9 @@
 //! 内存比 uncached 快一个数量级（实测 460KB：25ms → 3.3ms），
 //! `Encoder::send_frame` 会在送硬件前自动 flush。
 //!
+//! 每帧的转换/VENC 分项耗时可把日志级别开到 `debug`
+//! （`SMARTCAR_LOG=debug` 或 `SMARTCAR_LOG=sg2002_upper::hwjpeg=debug`）。
+//!
 //! 三个约定：
 //! - [`HwJpeg`] **不是 `Send`**：VENC 通道与线程绑定，`new`/`encode`/`Drop` 必须同一线程；
 //! - 输入固定 640x480 YUYV422（与相机一致）；
@@ -51,8 +54,6 @@ pub struct HwJpeg {
     _sys: Box<Sys>,
     /// 保持 `!Send`：VENC 通道必须固定线程使用。
     _not_send: PhantomData<*const ()>,
-    /// `HWJPEG_DEBUG=1` 时逐帧打印转换/VENC 耗时（定位性能问题用）。
-    debug: bool,
 }
 
 impl HwJpeg {
@@ -97,7 +98,6 @@ impl HwJpeg {
             frame,
             _sys: sys,
             _not_send: PhantomData,
-            debug: std::env::var_os("HWJPEG_DEBUG").is_some(),
         })
     }
 
@@ -117,15 +117,13 @@ impl HwJpeg {
             .enc
             .encode(&self.frame, ffi::CVI_IO_BLOCK)
             .map_err(|e| io::Error::other(format!("硬件编码失败: {e}")))?;
-        if self.debug {
-            eprintln!(
-                "[hwjpeg] 转换 {:.1}ms + VENC {:.1}ms = {:.1}ms（{} 字节）",
-                t1.duration_since(t0).as_secs_f64() * 1000.0,
-                t1.elapsed().as_secs_f64() * 1000.0,
-                t0.elapsed().as_secs_f64() * 1000.0,
-                jpeg.len()
-            );
-        }
+        log::debug!(
+            "转换 {:.1}ms + VENC {:.1}ms = {:.1}ms（{} 字节）",
+            t1.duration_since(t0).as_secs_f64() * 1000.0,
+            t1.elapsed().as_secs_f64() * 1000.0,
+            t0.elapsed().as_secs_f64() * 1000.0,
+            jpeg.len()
+        );
         if jpeg.is_empty() {
             return Err(io::Error::other("硬件编码输出为空"));
         }

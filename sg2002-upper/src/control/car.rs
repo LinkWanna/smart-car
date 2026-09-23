@@ -21,6 +21,8 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use log::warn;
+
 use super::protocol::{
     ErrorCode, Frame, MotorTarget, MoveDir, Request, RequestType, Response, RotateDir, RxEvent,
     RxParser, Status, SysState,
@@ -169,8 +171,8 @@ impl Inner {
         let n = st.counters.write_errors;
         drop(st);
         if n == 1 || n.is_multiple_of(200) {
-            eprintln!(
-                "[car] 串口写入失败（累计 {} 次）：{}",
+            warn!(
+                "串口写入失败（累计 {} 次）：{}",
                 n,
                 failure.unwrap_or_else(|| "写入不完整".to_string())
             );
@@ -296,7 +298,7 @@ fn writer_loop(inner: Arc<Inner>) {
             stale
         };
         if watchdog {
-            eprintln!("[car] 看门狗：Drive 意图超时未刷新，滑行停车");
+            warn!("看门狗：Drive 意图超时未刷新，滑行停车");
         }
 
         // 2) 变化立即发；否则 Drive 200ms、Coast/Brake 1s 重发一次。
@@ -413,7 +415,7 @@ impl Car {
         match request.to_frame() {
             Ok(frame) => self.inner.send(frame),
             Err(err) => {
-                eprintln!("[car] 请求编码失败：{err}");
+                warn!("请求编码失败：{err}");
                 false
             }
         }

@@ -25,6 +25,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use jpeg_encoder::{ColorType, Encoder};
+use log::{info, warn};
 
 use crate::camera::Camera;
 use crate::hwjpeg::HwJpeg;
@@ -320,7 +321,7 @@ fn open_camera(device: &str) -> io::Result<Camera> {
             continue;
         }
         if let Ok(camera) = Camera::try_new(path, "yuyv") {
-            eprintln!("[vision] {device} 不存在，改用 {path}（USB 重新枚举后编号会变）");
+            info!("{device} 不存在，改用 {path}（USB 重新枚举后编号会变）");
             return Ok(camera);
         }
     }
@@ -490,7 +491,7 @@ impl VisionStream {
             encoder_loop(packet_rx, encoder_inner, encoder_running, enc_ready_tx)
         });
         if enc_ready_rx.recv_timeout(Duration::from_secs(5)).is_err() {
-            eprintln!("[vision] 编码线程初始化超时");
+            warn!("编码线程初始化超时");
         }
 
         let thread_inner = Arc::clone(&inner);
@@ -504,10 +505,10 @@ impl VisionStream {
             Ok(Ok(format)) => {
                 let actual = inner.state.lock().unwrap().device.clone();
                 let actual = if actual.is_empty() { device } else { actual };
-                eprintln!("[vision] 相机 {actual} 已就绪（{format}）");
+                info!("相机 {actual} 已就绪（{format}）");
             }
-            Ok(Err(e)) => eprintln!("[vision] 预览不可用：{e}"),
-            Err(_) => eprintln!("[vision] 视觉线程启动超时"),
+            Ok(Err(e)) => warn!("预览不可用：{e}"),
+            Err(_) => warn!("视觉线程启动超时"),
         }
         Self {
             inner,
@@ -616,8 +617,8 @@ fn capture_loop(
                 Ok(vision) => break vision,
                 Err(e) if attempt < CAMERA_OPEN_RETRIES => {
                     attempt += 1;
-                    eprintln!(
-                        "[vision] 相机未就绪（{e}），重试 {attempt}/{CAMERA_OPEN_RETRIES}…"
+                    warn!(
+                        "相机未就绪（{e}），重试 {attempt}/{CAMERA_OPEN_RETRIES}…"
                     );
                     thread::sleep(Duration::from_millis(600));
                 }
@@ -645,7 +646,7 @@ fn capture_loop(
         let warn = state.error.clone();
         drop(state);
         if let Some(warn) = warn {
-            eprintln!("[vision] 模型不可用（仅预览，自动模式不可用）：{warn}");
+            warn!("模型不可用（仅预览，自动模式不可用）：{warn}");
         }
     }
     let _ = ready.send(Ok(vision.camera_format()));
@@ -724,7 +725,7 @@ fn capture_loop(
                     let _ = ok; // 预览成功与否由 try_send 的返回值决定，节拍已在上面记账
                 }
                 if let Some(err) = last_error.take() {
-                    eprintln!("[vision] 采集恢复：{err}");
+                    info!("采集恢复：{err}");
                 }
             }
             Err(e) => {
@@ -736,7 +737,7 @@ fn capture_loop(
                 if last_error.as_deref() != Some(msg.as_str())
                     || last_error_at.elapsed() > Duration::from_secs(1)
                 {
-                    eprintln!("[vision] 采集失败：{msg}");
+                    warn!("采集失败：{msg}");
                     last_error = Some(msg);
                     last_error_at = Instant::now();
                 }
@@ -744,7 +745,7 @@ fn capture_loop(
             }
         }
     }
-    eprintln!("[vision] 视觉线程退出");
+    info!("视觉线程退出");
 }
 
 /// 预览编码循环：优先硬件 VENC（输入 YUYV），不可用时退纯 Rust（输入 RGB 平面），
@@ -760,8 +761,8 @@ fn encoder_loop(
     // 优先尝试硬件编码；失败则软件编码（数据格式要求不同，要告诉采集线程）
     let mut hw = match HwJpeg::new(FRAME_W as u32, FRAME_H as u32, quality) {
         Ok(enc) => {
-            eprintln!(
-                "[vision] 预览编码：硬件 VENC（输入像素格式 {}，qfactor {}）",
+            info!(
+                "预览编码：硬件 VENC（输入像素格式 {}，qfactor {}）",
                 enc.input_format(),
                 quality
             );
@@ -769,7 +770,7 @@ fn encoder_loop(
             Some(enc)
         }
         Err(e) => {
-            eprintln!("[vision] 硬件编码不可用（{e}）；改用纯 Rust 编码");
+            warn!("硬件编码不可用（{e}）；改用纯 Rust 编码");
             inner.preview_format.store(PREVIEW_RGB_PLANAR, Ordering::Relaxed);
             None
         }
@@ -796,12 +797,12 @@ fn encoder_loop(
             Err(e) => {
                 // 硬件中途失败：降级软件编码（下一帧起）
                 if hw.is_some() {
-                    eprintln!("[vision] 硬件编码失败（{e}）；降级纯 Rust 编码");
+                    warn!("硬件编码失败（{e}）；降级纯 Rust 编码");
                     hw = None;
                     inner.preview_format.store(PREVIEW_RGB_PLANAR, Ordering::Relaxed);
                     inner.state.lock().unwrap().encode = "sw".into();
                 } else {
-                    eprintln!("[vision] 预览编码失败：{e}");
+                    warn!("预览编码失败：{e}");
                 }
                 continue;
             }
@@ -819,7 +820,7 @@ fn encoder_loop(
             if state.preview_published % 100 == 0 {
                 let (avg, pubs) = (state.encode_ms_avg, state.preview_published);
                 drop(state);
-                eprintln!("[vision] 预览已发布 {pubs} 帧，平均编码 {avg:.1}ms");
+                info!("预览已发布 {pubs} 帧，平均编码 {avg:.1}ms");
             }
         }
         let frame = Arc::new(PreviewFrame {
@@ -843,7 +844,7 @@ fn encoder_loop(
         state.encode_ms = encode_ms;
         state.preview = Some(frame);
     }
-    eprintln!("[vision] 预览编码线程退出");
+    info!("预览编码线程退出");
 }
 
 #[cfg(test)]

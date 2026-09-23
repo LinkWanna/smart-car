@@ -13,6 +13,8 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use log::{info, warn};
+
 use crate::camera::Camera;
 use crate::preview::{CameraStatus, PreviewFrame, PreviewSource, VisionStatus};
 
@@ -95,7 +97,7 @@ impl CameraStream {
             *thread_inner.format.lock().unwrap() = format.clone();
             if format != "MJPG" {
                 let msg = format!("相机不支持 MJPG（协商到 {format}），网页预览不可用");
-                eprintln!("[web] {device}: {msg}");
+                warn!("{device}: {msg}");
                 *thread_inner.error.lock().unwrap() = Some(msg.clone());
                 let _ = ready_tx.send(Err(msg));
                 return;
@@ -108,13 +110,13 @@ impl CameraStream {
         // 等相机打开结果，让 start 返回时状态就是确定的。
         match ready_rx.recv_timeout(Duration::from_secs(5)) {
             Ok(Ok(fmt)) => {
-                eprintln!("[web] 预览相机 {} 已就绪（{fmt}，{fps}fps）", inner.device)
+                info!("预览相机 {} 已就绪（{fmt}，{fps}fps）", inner.device)
             }
-            Ok(Err(e)) => eprintln!("[web] 预览不可用：{e}"),
+            Ok(Err(e)) => warn!("预览不可用：{e}"),
             Err(_) => {
                 let msg = "相机打开超时".to_string();
                 *inner.error.lock().unwrap() = Some(msg.clone());
-                eprintln!("[web] 预览不可用：{msg}");
+                warn!("预览不可用：{msg}");
             }
         }
 
@@ -254,7 +256,7 @@ fn capture_loop(camera: Camera, inner: Arc<Inner>, fps: f32, running: Arc<Atomic
                     *inner.last_at.lock().unwrap() = Some(now);
                     last_pub = now;
                     if let Some(err) = last_error.take() {
-                        eprintln!("[web] 相机采集恢复：{err}");
+                        info!("相机采集恢复：{err}");
                     }
                 }
                 // CaptureFrame 在这里 drop，缓冲立即归还驱动。
@@ -265,7 +267,7 @@ fn capture_loop(camera: Camera, inner: Arc<Inner>, fps: f32, running: Arc<Atomic
                 if last_error.as_deref() != Some(msg.as_str())
                     || last_error_at.elapsed() > Duration::from_secs(1)
                 {
-                    eprintln!("[web] 相机采集失败：{msg}");
+                    warn!("相机采集失败：{msg}");
                     last_error = Some(msg);
                     last_error_at = Instant::now();
                 }
@@ -273,5 +275,5 @@ fn capture_loop(camera: Camera, inner: Arc<Inner>, fps: f32, running: Arc<Atomic
             }
         }
     }
-    eprintln!("[web] 预览相机 {} 采集线程退出", inner.device);
+    info!("预览相机 {} 采集线程退出", inner.device);
 }

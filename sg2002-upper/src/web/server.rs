@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use log::{info, warn};
 use rouille::websocket::{self, Websocket};
 use rouille::{Request, Response};
 use serde::Deserialize;
@@ -155,7 +156,7 @@ impl Shared {
         *self.mode.lock().unwrap() = mode;
         self.teleop.lock().unwrap().reset_inputs();
         self.target.coast();
-        eprintln!("[web] 输入模式 → {}", mode);
+        info!("输入模式 → {}", mode);
         Ok(())
     }
 
@@ -192,7 +193,7 @@ impl Shared {
                 next = now;
             }
         }
-        eprintln!("[web] 控制线程退出，滑行停车");
+        info!("控制线程退出，滑行停车");
         self.target.coast();
     }
 
@@ -413,7 +414,7 @@ impl Server {
             self.inner.poll_timeout(POLL_INTERVAL);
         }
         self.inner.join();
-        eprintln!("[web] 已停止监听");
+        info!("已停止监听");
     }
 }
 
@@ -479,7 +480,7 @@ fn websocket_route(request: &Request, shared: &Arc<Shared>) -> Response {
     let shared = Arc::clone(shared);
     thread::spawn(move || match receiver.recv() {
         Ok(socket) => websocket_session(socket, shared),
-        Err(_) => eprintln!("[web] WebSocket 升级失败"),
+        Err(_) => warn!("WebSocket 升级失败"),
     });
     response
 }
@@ -545,7 +546,7 @@ fn vision_frame_value(seq: u64, snap: &VisionSnapshot) -> Value {
 fn websocket_session(mut socket: Websocket, shared: Arc<Shared>) {
     let id = shared.next_client_id.fetch_add(1, Ordering::Relaxed) + 1;
     shared.clients.fetch_add(1, Ordering::Relaxed);
-    println!("[web] WebSocket #{id} 已连接");
+    info!("WebSocket #{id} 已连接");
 
     let status_period = Duration::from_secs_f32(1.0 / shared.cfg.status_hz.max(0.5));
     let video_period = Duration::from_secs_f32(1.0 / shared.cfg.video_fps.max(0.5));
@@ -594,7 +595,7 @@ fn websocket_session(mut socket: Websocket, shared: Arc<Shared>) {
 
     shared.teleop.lock().unwrap().release_keys(id);
     shared.clients.fetch_sub(1, Ordering::Relaxed);
-    println!("[web] WebSocket #{id} 已断开");
+    info!("WebSocket #{id} 已断开");
 }
 
 /// 处理客户端文本消息；返回连接是否仍可写。

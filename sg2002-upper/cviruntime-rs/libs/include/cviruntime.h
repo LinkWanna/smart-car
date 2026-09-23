@@ -13,7 +13,6 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdarg.h>
-#include "cvitpu_debug.h"
 
 #ifdef __cplusplus
 extern "C" {

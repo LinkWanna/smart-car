@@ -15,7 +15,7 @@ pub struct Tensor {
 }
 
 impl Tensor {
-    /// # Safety: ptr 必须来自 CVI 运行时且生命周期由 Model 保证
+    /// Safety: ptr 必须来自 CVI 运行时且生命周期由 Model 保证
     pub unsafe fn from_raw(ptr: *mut c_void) -> Self {
         if ptr.is_null() {
             panic!("Tensor::from_raw null");

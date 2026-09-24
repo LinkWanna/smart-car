@@ -1,44 +1,37 @@
-//! 视觉域：相机 YUYV → 预处理 → TPU 推理 →（同帧）JPEG 预览。
+//! 视觉域：相机 YUYV → VPSS 硬件 CSC → TPU 推理 →（同帧）JPEG 预览。
 //!
 //! 视觉只负责「检测框」：本模块的输出是 [`crate::yolo::Detection`]（像素坐标）
 //! 与统计信息，不做分区/距离/控制律输入这类高层语义（那是追踪侧的事，
 //! 见 [`crate::control::position`]）。
 //!
-//! 两条管线，共用本模块的状态与契约（选择在 `smartcar`，VPSS 不可用时回退 CPU）：
-//!
-//! - [`VisionStream`]（`cpu` 子模块）：CPU 版，采集/推理一个线程、JPEG 编码另一个线程。
-//!   采集线程把**模型真正消费的那一帧**（YUYV 或 RGB 缓冲拷贝 + 检测帧）投给
-//!   编码线程，编码线程编码完把 `(JPEG, 同帧检测)` 发布给网页；
-//! - [`VpssStream`]（`vpss` 子模块）：VPSS 硬件版，单线程：相机 YUYV 只 memcpy 一次
-//!   进 VB 块，硬件 CSC 出 RGB 平面（TPU 零拷贝）与 NV12（VENC 硬编预览）。
-//!
-//! 两者都实现 [`crate::preview::PreviewSource`]，网页/控制侧看到的接口与状态完全一致。
+//! 唯一管线 [`VpssStream`]（`vpss` 子模块）：单线程，相机 YUYV 只 memcpy 一次
+//! 进 VB 块，硬件 CSC 出 RGB 平面（TPU 零拷贝）与 NV12（VENC 硬编预览）。
+//! 相机/会话/建组/bind/模型任何一步失败都返回错误，由入口报错退出——没有
+//! 降级或回退路径。
 //!
 //! 子模块分工：
 //!
-//! - `core`：[`Vision`] 单帧步进（采集 → 预处理 → 推理）；
-//! - `state`：两条管线共用的线程状态（`StreamInner`/`StreamState`）与
-//!   [`crate::preview::PreviewSource`] 实现；
-//! - `cpu`：CPU 管线的线程编排；
-//! - `vpss`：VPSS 管线的会话/组/VENC 生命周期与帧循环。
+//! - `camera`：V4L2 零拷贝采集（YUYV 节点发现 + mmap 帧）；
+//! - `preview`：与网页/控制之间的中性契约（JPEG + 同帧检测框）；
+//! - `state`：线程状态（`StreamInner`/`StreamState`）与
+//!   [`crate::vision::preview::PreviewSource`] 实现；
+//! - `vpss`：会话/组/VENC 生命周期与帧循环。
 //!
-//! 相机必须以模型需要的 **YUYV422** 打开；模型输入（YUYV→RGB 平面）与预览 JPEG
-//! 都由同一帧得到，因此不需要第二路相机。模型加载失败不致命：退化为「仅预览」
-//! （`model_ok == false`），手动遥控照常，自动模式不可用（见 [`crate::preview::PreviewSource::auto_ready`]）。
+//! 相机必须以模型需要的 **YUYV422** 打开；模型输入（硬件 CSC 出的 RGB 平面）与
+//! 预览 JPEG 都由同一帧得到，因此不需要第二路相机。
 
 use std::time::Instant;
 
-use crate::preview::{DetectionFrame, VisionTimings};
+use self::preview::{DetectionFrame, VisionTimings};
 use crate::yolo::Detection;
 
-mod core;
-mod cpu;
+pub mod camera;
+pub mod preview;
+
 mod state;
 mod vpss;
 
 pub use crate::preprocess::{FRAME_H, FRAME_W};
-pub use core::Vision;
-pub use cpu::VisionStream;
 pub use vpss::VpssStream;
 
 /// 视觉配置。
@@ -54,10 +47,6 @@ pub struct VisionConfig {
     pub label: String,
     /// 预览 JPEG 质量（1..=100）。
     pub quality: u8,
-    /// 预览降采样倍数（1 = 原尺寸，2 = 320x240，省 CPU）。
-    pub scale: usize,
-    /// 预览帧率上限（编码线程的投递节拍；0 = 不限制）。
-    pub preview_fps: f32,
 }
 
 impl Default for VisionConfig {
@@ -69,8 +58,6 @@ impl Default for VisionConfig {
             iou_threshold: 0.45,
             label: "tennis_ball".to_string(),
             quality: 75,
-            scale: 1,
-            preview_fps: 10.0,
         }
     }
 }
@@ -81,8 +68,6 @@ pub struct VisionStep {
     pub at: Instant,
     /// 检测框（像素坐标）。
     pub dets: Vec<Detection>,
-    /// 给预览线程的数据（按 `PreviewInput` 拷贝，`None` = 不带）。
-    pub preview: Option<Vec<u8>>,
     pub timings: VisionTimings,
 }
 
@@ -117,7 +102,6 @@ mod tests {
             seq: 7,
             at: Instant::now(),
             dets: vec![det],
-            preview: None,
             timings: VisionTimings::default(),
         };
         let frame = detection_frame(&step);

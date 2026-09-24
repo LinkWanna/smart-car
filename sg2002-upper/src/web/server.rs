@@ -31,7 +31,7 @@ use serde_json::{Value, json};
 use crate::control::ControlSession;
 use crate::control::session::{AutoState, Mode};
 use crate::control::teleop::{Action, Keys};
-use crate::preview::{DetectionFrame, PreviewSource};
+use crate::vision::preview::{DetectionFrame, PreviewSource};
 use crate::vision::{FRAME_H, FRAME_W};
 
 /// WebSocket 每轮主动推送的时长（略小于页面 100ms 的 WS 心跳间隔）。
@@ -189,12 +189,10 @@ impl Shared {
             return Value::Null;
         };
         json!({
-            "model_ok": st.model_ok,
             "model": st.model,
             "input": st.input,
             "encode": st.encode,
             "sent": st.sent,
-            "dropped": st.dropped,
             "published": st.published,
             "encode_avg_ms": st.encode_avg_ms,
             "fps": st.fps,
@@ -203,7 +201,6 @@ impl Shared {
             "nms_ms": st.nms_ms,
             "encode_ms": st.encode_ms,
             "dets": st.dets,
-            "error": st.error,
         })
     }
 }

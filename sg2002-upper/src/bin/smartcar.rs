@@ -6,26 +6,21 @@
 //! smartcar --model /root/xxx.cvimodel
 //! smartcar --no-vision            # 只遥控（无视觉，自动模式不可用）
 //! smartcar --quality 80          # 预览 JPEG 质量
-//! smartcar --video-fps 10        # 限制预览帧率（默认 0 = 不锁帧，跟相机）
-//! smartcar --vpss off            # 只用 CPU 路径（YUYV→RGB 直写 VB 帧，零拷贝喂 TPU）
+//! smartcar --video-fps 10        # 限制预览推送帧率（默认 0 = 不锁帧，跟相机）
 //! ```
 //!
-//! 视觉后端（`--vpss auto` 默认）：
-//! - **VPSS 硬件**（`vision::vpss`）：相机 YUYV 只 memcpy 一次进 VB 块，硬件 CSC
-//!   同时出 chn0 RGB 平面（物理地址零拷贝喂 TPU）与 chn1 NV12（VENC 硬编 JPEG，
-//!   640x480 原尺寸、每帧都出；`--video-fps` 只作为可选的推送上限）；
-//! - **CPU 路径**（`vision::cpu`，回退）：YUYV→RGB 直接写进 VB 帧（CPU 转换），
-//!   物理地址零拷贝喂 TPU；预览走 VENC/软件编码。VPSS 建组失败、组号用尽或
-//!   模型尺寸不匹配时自动回退。
+//! 视觉后端只有 **VPSS 硬件管线**（`vision::vpss`）：相机 YUYV 只 memcpy 一次
+//! 进 VB 块，硬件 CSC 同时出 chn0 RGB 平面（物理地址零拷贝喂 TPU）与 chn1 NV12
+//! （VENC 硬编 JPEG，640x480 原尺寸、每帧都出；`--video-fps` 只作为可选的推送
+//! 上限）。相机/会话/建组/bind/模型任何一步失败都直接报错退出——没有回退路径。
 //!
 //! 输入模式由页面按钮切换（默认手动，不允许键盘悄悄切换）：
 //! - **手动**：WASD（`control::teleop`：油门斜坡 + 转向 + 输入看门狗）；
 //! - **自动**：视觉伺服（`control::servo`），丢失目标原地旋转搜索、近距刹车。
 //!   视觉观测超过 500ms 未更新按“看不到”处理（滑行）。
 //!
-//! 相机按模型需要的 **YUYV422** 打开（`camera.rs`），网页预览由同一帧编码
-//! 得到（优先硬件 VENC，失败降级软件编码，见 `hwjpeg.rs`），因此检测框与
-//! 画面**严格同帧**。模型/相机不可用时降级为「仅预览」或「仅遥控」，手动模式照常。
+//! 相机按模型需要的 **YUYV422** 打开（`camera.rs`），网页预览由同一帧硬件编码
+//! 得到，因此检测框与画面**严格同帧**；`--no-vision` 时只遥控。
 
 use std::path::Path;
 use std::sync::Arc;
@@ -36,9 +31,9 @@ use clap::Parser;
 use log::{error, info, warn};
 use sg2002_upper::control::{ControlSession, TeleopConfig};
 use sg2002_upper::logging;
-use sg2002_upper::preview::PreviewSource;
+use sg2002_upper::vision::preview::PreviewSource;
 use sg2002_upper::transport::{Car, CarConfig};
-use sg2002_upper::vision::{VisionConfig, VisionStream, VpssStream};
+use sg2002_upper::vision::{VisionConfig, VpssStream};
 use sg2002_upper::web::{Server, WebConfig};
 
 /// 等待下位机 `Init` 应答的超时。
@@ -80,10 +75,6 @@ struct Cli {
     /// 关闭视觉（只遥控；自动模式不可用）
     #[arg(long)]
     no_vision: bool,
-
-    /// 视觉后端：`auto` = 优先 VPSS 硬件（失败回退 CPU），`off` = 只用 CPU 路径
-    #[arg(long, value_enum, default_value_t = VpssMode::Auto)]
-    vpss: VpssMode,
 
     /// 预览 JPEG 质量（1..=100）
     #[arg(long, value_parser = clap::value_parser!(u8).range(1..=100), default_value_t = 70)]
@@ -146,16 +137,6 @@ fn fps_or_unlimited(text: &str) -> Result<f32, String> {
         return Err("需为 0（不限制）或 0.5..=60".to_string());
     }
     Ok(value)
-}
-
-/// 视觉处理后端。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-enum VpssMode {
-    /// 优先 VPSS 硬件 CSC（chn0 RGB 平面零拷贝喂 TPU + chn1 NV12 硬编预览），
-    /// 建组失败/组号用尽/模型尺寸不匹配时自动回退 CPU 路径。
-    Auto,
-    /// 只用 CPU 路径（YUYV→RGB 直写 VB 帧，零拷贝喂 TPU）。
-    Off,
 }
 
 /// 找模型：`--model` > 已知部署路径 > `/root` 下第一个 `*.cvimodel`。
@@ -236,42 +217,31 @@ fn main() {
     let startup_alive = Arc::new(AtomicBool::new(true));
     install_signals(&startup_alive);
 
-    // 视觉：相机以模型需要的 YUYV422 打开，预览与检测同帧（vision）。
-    // `--vpss auto` 时优先走硬件 CSC 管线（vision::vpss）：相机 YUYV 只 memcpy 一次
-    // 进 VB 块，VPSS 同时出 RGB 平面（零拷贝喂 TPU）与 NV12（VENC 硬编预览，
-    // 640x480 原尺寸、每帧都出）；VPSS 不可用时自动回退 CPU 路径。
+    // 视觉：VPSS 硬件管线（vision::vpss）是唯一后端——相机 YUYV 只 memcpy 一次
+    // 进 VB 块，硬件 CSC 同时出 RGB 平面（零拷贝喂 TPU）与 NV12（VENC 硬编预览，
+    // 640x480 原尺寸、每帧都出）。相机/会话/建组/bind/模型任何一步失败都报错退出。
     let preview: Option<Arc<dyn PreviewSource>> = if cli.no_vision {
         info!("  视觉：已关闭（--no-vision，自动模式不可用）");
         None
     } else {
-        match find_model(cli.model.as_deref()) {
-            Ok(model) => {
-                info!("  模型：{model}");
-                let cfg = VisionConfig {
-                    device: cli.camera.clone(),
-                    model,
-                    conf_threshold: cli.conf,
-                    iou_threshold: cli.iou,
-                    label: "tennis_ball".to_string(),
-                    quality: cli.quality,
-                    scale: 1,
-                    preview_fps: cli.video_fps,
-                };
-                let mut stream: Option<Arc<dyn PreviewSource>> = None;
-                if cli.vpss == VpssMode::Auto {
-                    match VpssStream::try_start(cfg.clone()) {
-                        Ok(vpss) => stream = Some(Arc::new(vpss) as Arc<dyn PreviewSource>),
-                        Err(e) => warn!("VPSS 管线不可用（{e}）；回退 CPU 路径"),
-                    }
-                }
-                stream
-                    .or_else(|| Some(Arc::new(VisionStream::start(cfg)) as Arc<dyn PreviewSource>))
-            }
-            Err(e) => {
-                warn!("{e}；改为仅遥控（自动模式不可用）");
-                None
-            }
-        }
+        let model = find_model(cli.model.as_deref()).unwrap_or_else(|e| {
+            error!("{e}");
+            std::process::exit(2);
+        });
+        info!("  模型：{model}");
+        let cfg = VisionConfig {
+            device: cli.camera.clone(),
+            model,
+            conf_threshold: cli.conf,
+            iou_threshold: cli.iou,
+            label: "tennis_ball".to_string(),
+            quality: cli.quality,
+        };
+        let stream = VpssStream::start(cfg).unwrap_or_else(|e| {
+            error!("VPSS 视觉管线启动失败: {e}");
+            std::process::exit(2);
+        });
+        Some(Arc::new(stream) as Arc<dyn PreviewSource>)
     };
 
     let teleop = TeleopConfig {

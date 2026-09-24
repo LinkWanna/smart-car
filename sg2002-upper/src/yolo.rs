@@ -1,6 +1,6 @@
 //! yolo.rs — YOLOv8 单类检测：TPU 零拷贝推理 + NMS。
 //!
-//! 只保留零拷贝路径：输入张量直接指向 VPSS chn0 或 CPU 路径 VB 帧的物理地址
+//! 只保留零拷贝路径：输入张量直接指向 VPSS chn0 输出帧的物理地址
 //! （`Model::forward_physical`），CPU 不搬运像素；模型、阈值、标签、计时都在
 //! [`Yolo`] 一个结构里（原 `tpu.rs` 的 `TpuEngine` / `TpuInference` 两层包装已去掉）。
 //!
@@ -292,7 +292,7 @@ mod tests {
         );
     }
 
-    /// 真机校验（需要 SG2002 + 厂商库 + 模型）：CPU 路径往 VB 帧里写 RGB 平面，
+    /// 真机校验（需要 SG2002 + 厂商库 + 模型）：手工往 VB 帧里写 RGB 平面，
     /// 零拷贝（物理地址）与 memcpy 两条喂法必须逐字节一致。
     ///
     /// `cargo test --release --target riscv64gc-unknown-linux-musl -- --ignored --nocapture`

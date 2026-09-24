@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use log::info;
 
-use crate::preview::{DetectionFrame, PreviewSource};
+use crate::vision::preview::{DetectionFrame, PreviewSource};
 use crate::transport::car::{Car, LinkState};
 use crate::transport::protocol::{ErrorCode, RequestType, Response, SysState};
 

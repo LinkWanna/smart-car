@@ -5,9 +5,8 @@
 //!
 //! 本模块只负责「页面/接口」：路由、WebSocket 会话、JSON 组装。控制节拍与
 //! 手动/自动仲裁在 [`crate::control::ControlSession`]（按键 -> 控制律 -> 链路），
-//! 预览来自 `VisionStream`（CPU 管线）或 [`crate::vision::VpssStream`]（VPSS
-//! 管线）——网页层只依赖 [`crate::preview::PreviewSource`] 抽象，拿到的 JPEG
-//! 与检测框**同帧**。
+//! 预览来自 [`crate::vision::VpssStream`]（VPSS 硬件管线）——网页层只依赖
+//! [`crate::vision::preview::PreviewSource`] 抽象，拿到的 JPEG 与检测框**同帧**。
 //!
 //! # 接口
 //!

@@ -6,13 +6,12 @@
 //!                                                   └─ chn1 NV12 ─bind─► VENC PT_JPEG ─► 网页
 //! ```
 //!
-//! 与 CPU 版 [`super::VisionStream`] 的关系：
-//! - 两者都实现 [`PreviewSource`]，网页/控制侧看到的接口与状态完全一致；
-//! - 本模块**单线程**：采集、送帧、推理、JPEG 都在一个线程里顺序执行
-//!   （硬件路径每帧 ~45ms，相机 16.5fps 的预算 60ms，够用），
-//!   因此所有中间件句柄都由管线自己持有，没有跨线程共享；
-//! - VPSS 建组失败 / 组号用尽 / bind 失败 / 模型输入尺寸不匹配时，
-//!   [`VpssStream::try_start`] 直接返回错误，由 `smartcar` 回退到 CPU 管线。
+//! 本模块**单线程**：采集、送帧、推理、JPEG 都在一个线程里顺序执行
+//! （硬件路径每帧 ~45ms，相机 16.5fps 的预算 60ms，够用），因此所有中间件
+//! 句柄都由管线自己持有，没有跨线程共享。
+//!
+//! VPSS 建组失败 / 组号用尽 / bind 失败 / 模型加载或输入尺寸不匹配时，
+//! [`VpssStream::start`] 直接返回错误，由 `smartcar` 报错退出——没有回退路径。
 //!
 //! 关键实现细节（真机验证，见 `bin/vpss_probe.rs`）：
 //! - 组 CSC 要设成 **BT.601 limited → full**（`Vpss::set_yuv601_limited_to_full`），
@@ -36,8 +35,8 @@ use cvimpi_rs::sys::{Sys, VbPoolConfig};
 use cvimpi_rs::venc_input_layout;
 use cvimpi_rs::vpss::{VPSS_GRP_AUTO, Vpss, VpssChnConfig, VpssConfig};
 
-use crate::camera::open_yuyv;
-use crate::preview::{
+use super::camera::{Camera, open_yuyv};
+use super::preview::{
     CameraStatus, DetectionFrame, PreviewFrame, PreviewSource, VisionStatus, VisionTimings,
 };
 use crate::yolo::Yolo;
@@ -60,7 +59,7 @@ const ENCODE_LABEL: &str = "vpss+bind";
 
 /// VPSS 视觉管线（实现 [`PreviewSource`]）。
 ///
-/// 自带停止标志：`try_start` 之后 [`stop`](VpssStream::stop) 只停自己的线程
+/// 自带停止标志：`start` 之后 [`stop`](VpssStream::stop) 只停自己的线程
 /// （幂等，`Drop` 兜底），不影响进程里的其它组件。
 pub struct VpssStream {
     inner: Arc<StreamInner>,
@@ -69,9 +68,9 @@ pub struct VpssStream {
 }
 
 impl VpssStream {
-    /// 启动 VPSS 管线：**同步**建好会话/组/VENC/相机/模型（任何一步失败都能回退），
+    /// 启动 VPSS 管线：**同步**建好会话/组/VENC/相机/模型（任何一步失败都返回错误），
     /// 之后线程只跑帧循环。
-    pub fn try_start(cfg: VisionConfig) -> io::Result<Self> {
+    pub fn start(cfg: VisionConfig) -> io::Result<Self> {
         let inner = Arc::new(StreamInner::new(cfg.clone()));
         let pipeline = VpssPipeline::new(cfg.clone())?;
         let running = Arc::new(AtomicBool::new(true));
@@ -149,10 +148,8 @@ struct VpssPipeline {
     enc: Encoder<'static>,
     /// YUYV 输入帧（cached 映射：CPU 写入快，送 VPSS 前 flush）。
     input: Frame<'static>,
-    camera: crate::camera::Camera,
-    /// `None` = 模型不可用（仅预览，自动模式不可用）。
-    infer: Option<Yolo>,
-    model_error: Option<String>,
+    camera: Camera,
+    infer: Yolo,
     model_input: String,
     cfg: VisionConfig,
     seq: u64,
@@ -243,31 +240,22 @@ impl VpssPipeline {
             .alloc_frame_cached(FRAME_W as u32, FRAME_H as u32, ffi::PIXEL_FORMAT_YUYV)
             .map_err(|e| io::Error::other(format!("输入帧分配失败: {e}")))?;
 
-        // 7) 模型：加载失败/输入尺寸不匹配都只降级为"仅预览"
-        let (infer, model_error, model_input) = match Yolo::from_file(
+        // 7) 模型：加载失败/输入尺寸不匹配都视为启动失败（没有「仅预览」降级）
+        let infer = Yolo::from_file(
             &cfg.model,
             cfg.conf_threshold,
             cfg.iou_threshold,
             vec![cfg.label.clone()],
-        ) {
-            Ok(infer) => {
-                let input_fmt = format!("{:?}", infer.input_shape());
-                if infer.input_bytes() != rgb.vb_size as usize {
-                    let msg = format!(
-                        "模型输入 {} 字节与 VPSS RGB 帧 {} 字节不一致，零拷贝不可用",
-                        infer.input_bytes(),
-                        rgb.vb_size
-                    );
-                    (None, Some(msg), input_fmt)
-                } else {
-                    (Some(infer), None, input_fmt)
-                }
-            }
-            Err(e) => (None, Some(e.to_string()), "-".to_string()),
-        };
-        if let Some(err) = &model_error {
-            warn!("VPSS 管线模型不可用（仅预览，自动模式不可用）：{err}");
+        )
+        .map_err(|e| io::Error::other(format!("模型加载失败: {e}")))?;
+        if infer.input_bytes() != rgb.vb_size as usize {
+            return Err(io::Error::other(format!(
+                "模型输入 {} 字节与 VPSS RGB 帧 {} 字节不一致，零拷贝不可用",
+                infer.input_bytes(),
+                rgb.vb_size
+            )));
         }
+        let model_input = format!("{:?}", infer.input_shape());
 
         Ok(Self {
             vpss,
@@ -275,7 +263,6 @@ impl VpssPipeline {
             input,
             camera,
             infer,
-            model_error,
             model_input,
             cfg,
             seq: 0,
@@ -292,10 +279,8 @@ impl VpssPipeline {
             state.device = self.camera.device().to_string();
             state.camera_format = self.camera.pixel_format();
             state.available = true;
-            state.model_ok = self.infer.is_some();
             state.model = self.cfg.model.clone();
             state.model_input = self.model_input.clone();
-            state.error = self.model_error.clone();
             state.encode = ENCODE_LABEL.to_string();
         }
 
@@ -312,10 +297,10 @@ impl VpssPipeline {
                     {
                         let mut state = inner.state.lock().unwrap();
                         state.record_model_frame(Instant::now(), &step.timings, step.frame);
-                        state.error = self.model_error.clone();
                         state.encode = ENCODE_LABEL.to_string();
                         state.encode_ms = step.timings.encode_ms;
                         state.preview_sent += 1; // 每帧都投递预览（不锁帧）
+                        state.error = None; // 恢复后不再展示旧错误
                     }
                     if let Some(paired) = step.preview {
                         let frame = Arc::new(PreviewFrame {
@@ -336,7 +321,7 @@ impl VpssPipeline {
                     let msg = e.to_string();
                     {
                         let mut state = inner.state.lock().unwrap();
-                        state.camera_error = Some(msg.clone());
+                        state.error = Some(msg.clone());
                     }
                     if last_error.as_deref() != Some(msg.as_str())
                         || last_error_at.elapsed() > Duration::from_secs(1)
@@ -384,32 +369,22 @@ impl VpssPipeline {
         let vpss_ms = elapsed_ms(t1);
 
         // 3) 推理（零拷贝：输入张量直接指向 chn0 的物理地址）
-        let mut infer_error = None;
-        let (dets, infer_ms, nms_ms) = match self.infer.as_mut() {
-            Some(infer) => match infer.infer(rgb.phy_addr(0)) {
-                Ok(dets) => {
-                    let (tpu, nms) = infer.last_timing();
-                    (dets, tpu, nms)
-                }
-                Err(e) => {
-                    infer_error = Some(e.to_string());
-                    (Vec::new(), 0.0, 0.0)
-                }
-            },
-            None => (Vec::new(), 0.0, 0.0),
-        };
+        let infer_result = self.infer.infer(rgb.phy_addr(0));
+        let (infer_ms, nms_ms) = self.infer.last_timing();
         drop(rgb); // ReleaseChnFrame：TPU 读完即可复用
-        if let Some(e) = infer_error {
-            self.model_error = Some(e);
-            self.infer = None;
-        }
+        // 推理失败不降级（模型保持加载，下一帧继续尝试）：本帧按无检测处理，
+        // 但**仍要把码流取走**，否则 VENC 队列积压会顶住整条链路；
+        // 错误在收完本帧后上报给帧循环（节流日志 + 状态）。
+        let infer_error = infer_result
+            .as_ref()
+            .err()
+            .map(|e| format!("TPU 推理失败: {e}"));
 
         // 4) 检测帧（位置/距离等语义由追踪侧自己算）+ 预览与检测严格同帧
         let step = VisionStep {
             seq: self.seq,
             at: t_frame,
-            dets,
-            preview: None,
+            dets: infer_result.unwrap_or_default(),
             timings: VisionTimings {
                 capture_ms,
                 preprocess_ms: vpss_ms,
@@ -450,6 +425,9 @@ impl VpssPipeline {
             encode_ms,
             ..step.timings
         };
+        if let Some(msg) = infer_error {
+            return Err(io::Error::other(msg));
+        }
         Ok(VpssStep {
             timings,
             frame,

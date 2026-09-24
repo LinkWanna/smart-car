@@ -17,7 +17,6 @@ time = { version = "0.3", features = ["macros"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 clap = { version = "4.6.7", features = ["derive"] }
-jpeg-encoder = "0.7.1"
 protocol = { path = "../protocol" }
 
 # 整合入口：视觉（相机 YUYV + TPU + 同帧预览）+ 网页遥控（手动/自动切换）。
@@ -36,4 +35,3 @@ codegen-units = 1
 
 [dev-dependencies]
 tungstenite = "0.30.0"
-jpeg-decoder = "0.3.2"

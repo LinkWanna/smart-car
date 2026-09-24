@@ -1,29 +1,19 @@
-//! 两条管线共用的线程状态与 [`PreviewSource`] 实现。
+//! VPSS 管线的线程状态与 [`PreviewSource`] 实现。
 //!
 //! [`StreamInner`] 是「一次锁拿到全部」的共享状态（模型/预览统计 + 最新帧 +
-//! 相机/模型元信息），CPU 与 VPSS 管线都写它；网页/控制侧通过
-//! [`PreviewSource`] 只读访问，因此两条管线的对外表现完全一致。
+//! 相机/模型元信息）：VPSS 管线（`vpss`）在线程内写它，网页/控制侧通过
+//! [`PreviewSource`] 只读访问。
 
-use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use crate::preview::{
+use super::preview::{
     CameraStatus, DetectionFrame, PreviewFrame, PreviewSource, VisionStatus, VisionTimings,
 };
 
 use super::VisionConfig;
 
-/// 投给预览线程的一帧：数据（YUYV 或 RGB 平面）+ 同帧检测帧。
-pub(crate) struct EncodePacket {
-    pub(crate) data: Vec<u8>,
-    pub(crate) frame: Arc<DetectionFrame>,
-}
-
 /// 线程共享状态（一次锁拿到全部，避免撕裂读）。
-///
-/// 两条管线（CPU 版 [`VisionStream`] 与 VPSS 版 `VpssStream`）共用这份状态、
-/// 状态更新方法与 [`PreviewSource`] 实现，所以网页/控制侧看到的字段完全一致。
 #[derive(Default)]
 pub(crate) struct StreamState {
     /// 模型帧（采集/推理）统计。
@@ -31,9 +21,8 @@ pub(crate) struct StreamState {
     pub(crate) fps: f64,
     pub(crate) last_at: Option<Instant>,
     pub(crate) latest_dets: Option<Arc<DetectionFrame>>,
-    /// 预览投递计数（诊断：模型帧 → 预览线程）。
+    /// 预览投递/发布计数（诊断：模型帧 → VENC → 网页）。
     pub(crate) preview_sent: u64,
-    pub(crate) preview_dropped: u64,
     pub(crate) preview_published: u64,
     pub(crate) encode_ms_avg: f64,
     /// 预览（JPEG）统计；`frame_if_new` 只认它。
@@ -41,20 +30,19 @@ pub(crate) struct StreamState {
     pub(crate) preview_at: Option<Instant>,
     pub(crate) preview_fps: f64,
     pub(crate) encode_ms: f64,
-    /// 预览编码后端（`hw` / `sw` / `vpss`）。
+    /// 预览编码后端（固定 `vpss+bind`）。
     pub(crate) encode: String,
     /// 实际使用的相机节点（USB 重新枚举后会变）。
     pub(crate) device: String,
     pub(crate) camera_format: String,
     pub(crate) available: bool,
-    pub(crate) camera_error: Option<String>,
-    pub(crate) model_ok: bool,
+    /// 采集/管线错误（相机、VPSS、VENC、推理）。
+    pub(crate) error: Option<String>,
     pub(crate) model: String,
     pub(crate) model_input: String,
     pub(crate) infer_ms: f64,
     pub(crate) nms_ms: f64,
     pub(crate) dets: usize,
-    pub(crate) error: Option<String>,
 }
 
 impl StreamState {
@@ -91,7 +79,7 @@ impl StreamState {
         self.latest_dets = Some(frame);
     }
 
-    /// 记一帧已发布的预览（投递/发布计数、编码耗时 EMA、预览帧率）。
+    /// 记一帧已发布的预览（发布计数、编码耗时 EMA、预览帧率）。
     pub(crate) fn record_preview(
         &mut self,
         frame: Arc<PreviewFrame>,
@@ -123,8 +111,6 @@ impl StreamState {
 pub(crate) struct StreamInner {
     pub(crate) cfg: VisionConfig,
     pub(crate) state: Mutex<StreamState>,
-    /// 预览线程要的数据格式：true = YUYV（硬件编码），false = RGB 平面（软件编码）。
-    pub(crate) preview_yuyv: AtomicBool,
 }
 
 impl StreamInner {
@@ -132,8 +118,6 @@ impl StreamInner {
         Self {
             cfg,
             state: Mutex::new(StreamState::default()),
-            // 先按软件编码（RGB 平面）兜底，编码线程定下后端后会更新
-            preview_yuyv: AtomicBool::new(false),
         }
     }
 }
@@ -168,19 +152,17 @@ impl PreviewSource for StreamInner {
                 state.fps
             },
             age_ms: state.preview_age_ms().or_else(|| state.model_age_ms()),
-            error: state.camera_error.clone(),
+            error: state.error.clone(),
         }
     }
 
     fn vision_status(&self) -> Option<VisionStatus> {
         let state = self.state.lock().unwrap();
         Some(VisionStatus {
-            model_ok: state.model_ok,
             model: state.model.clone(),
             input: state.model_input.clone(),
             encode: state.encode.clone(),
             sent: state.preview_sent,
-            dropped: state.preview_dropped,
             published: state.preview_published,
             encode_avg_ms: state.encode_ms_avg,
             fps: state.fps,
@@ -189,7 +171,6 @@ impl PreviewSource for StreamInner {
             nms_ms: state.nms_ms,
             encode_ms: state.encode_ms,
             dets: state.dets,
-            error: state.error.clone(),
         })
     }
 

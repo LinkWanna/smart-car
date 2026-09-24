@@ -45,14 +45,6 @@ SMARTCAR_LOG=warn,sg2002_upper::vision=debug ./smartcar --bind 192.168.1.2  # �
 - 组 CSC 默认是 full range，必须 `set_yuv601_limited_to_full()`，
   否则画面偏灰、模型置信度从 0.71 掉到 0.61。
 
-板端复现命令：
-
-```sh
-./vpss_probe --step init                    # 只验证驱动可用
-./vpss_probe --csc expand601 --venc --model /root/yolov8n_tennis_v3.cvimodel --frames 30
-./vpss_probe --csc expand601 --bind --model /root/yolov8n_tennis_v3.cvimodel --frames 30
-```
-
 ### 预览交接
 
 VPSS chn1 用 `CVI_SYS_Bind` **直连 VENC**（内核内交接），用户态只 `GetStream`；
@@ -72,8 +64,6 @@ VPSS chn1 用 `CVI_SYS_Bind` **直连 VENC**（内核内交接），用户态只
 | 预览编码耗时 | **~4ms**（avg，编码在 TPU 期间完成） |
 | 视觉帧率 | 贴着相机（16.5~19.8fps，随光照） |
 | smartcar CPU | 6% |
-
-探针对比（30 帧含零拷贝模型）：bind + 延迟取流 **25.6fps**，同步编码路径 20.4fps。
 
 > `/proc/cvitek/vpss` 可以放心读（之前那次看门狗重启是电池松动，不是它）。
 > 另外别用 sysfs `unbind`/`bind` 重绑 `uvcvideo`：做完 `/dev/video0` 不会回来，

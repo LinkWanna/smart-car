@@ -1,9 +1,9 @@
 //! SG2002 上位机：视觉检测（相机 + TPU）与 ESP32-C3 下位机的串口控制。
 //!
 //! 模块分层：
-//! - 感知：`preprocess`（YUYV→RGB CPU 参考转换，探针用）、`yolo`（TPU 零拷贝
-//!   推理 + NMS）、`vision`（视觉域：`camera` V4L2 零拷贝采集、`preview` 与
-//!   网页/控制的中性契约、VPSS 硬件管线；只输出检测框，不做位置/追踪语义）；
+//! - 感知：`yolo`（TPU 零拷贝推理 + NMS）、`vision`（视觉域：`camera` V4L2
+//!   零拷贝采集、`preview` 与网页/控制的中性契约、VPSS 硬件管线；只输出检测框，
+//!   不做位置/追踪语义）；
 //! - 下位机通信：`transport`（`protocol` 线协议——与固件共用的 `protocol`
 //!   crate、`link` 串口链路（字节流）、`car` 传输层（协议对话 + 心跳/死手
 //!   开关））；
@@ -13,7 +13,7 @@
 //!   手动/自动仲裁）。
 //! - 观测：`logging`（`log` + `simple_logger` 初始化）。
 //!
-//! 入口 bin：`smartcar`（整合：视觉 + 网页 + 手动/自动）、`vpss_probe`（上板探针）。
+//! 入口 bin：`smartcar`（整合：视觉 + 网页 + 手动/自动）。
 //!
 //! `yolo` / `position` / `vision` 依赖板端 C 库与 V4L2，随 crate
 //! 无条件编译：板端直接运行，主机上可用 `cargo check` 做编译检查
@@ -50,7 +50,6 @@
 
 pub mod control;
 pub mod logging;
-pub mod preprocess;
 pub mod transport;
 pub mod vision;
 pub mod web;

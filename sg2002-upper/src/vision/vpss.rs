@@ -13,7 +13,7 @@
 //! VPSS 建组失败 / 组号用尽 / bind 失败 / 模型加载或输入尺寸不匹配时，
 //! [`VpssStream::start`] 直接返回错误，由 `smartcar` 报错退出——没有回退路径。
 //!
-//! 关键实现细节（真机验证，见 `bin/vpss_probe.rs`）：
+//! 关键实现细节（真机验证）：
 //! - 组 CSC 要设成 **BT.601 limited → full**（`Vpss::set_yuv601_limited_to_full`），
 //!   否则模型看到的是"没做量程扩张"的偏灰画面，置信度明显下降；
 //! - chn0 的输出 stride = 640 且三平面物理地址连续，正好是 `[1,3,480,640]`
@@ -166,13 +166,9 @@ impl VpssPipeline {
         let camera = open_yuyv(&cfg.device)?;
 
         // 2) 会话 + VB 池：块要放得下最大的一帧（RGB 平面 921600）
-        let yuyv = layout(FRAME_W as u32, FRAME_H as u32, ffi::PIXEL_FORMAT_YUYV)?;
-        let rgb = layout(
-            FRAME_W as u32,
-            FRAME_H as u32,
-            ffi::PIXEL_FORMAT_RGB_888_PLANAR,
-        )?;
-        let nv12 = layout(FRAME_W as u32, FRAME_H as u32, ffi::PIXEL_FORMAT_NV12)?;
+        let yuyv = layout(FRAME_W, FRAME_H, ffi::PIXEL_FORMAT_YUYV)?;
+        let rgb = layout(FRAME_W, FRAME_H, ffi::PIXEL_FORMAT_RGB_888_PLANAR)?;
+        let nv12 = layout(FRAME_W, FRAME_H, ffi::PIXEL_FORMAT_NV12)?;
         let blk = yuyv.vb_size.max(rgb.vb_size).max(nv12.vb_size);
         let sys = Box::new(
             Sys::init(&[VbPoolConfig::new(blk, 6).with_name("vpss")])
@@ -192,17 +188,12 @@ impl VpssPipeline {
         let vpss = session
             .create_vpss(&VpssConfig {
                 grp: VPSS_GRP_AUTO, // 组号一个 boot 只能建一次，自动往后取
-                max_w: FRAME_W as u32,
-                max_h: FRAME_H as u32,
+                max_w: FRAME_W,
+                max_h: FRAME_H,
                 in_format: ffi::PIXEL_FORMAT_YUYV,
                 chns: vec![
-                    VpssChnConfig::new(
-                        0,
-                        FRAME_W as u32,
-                        FRAME_H as u32,
-                        ffi::PIXEL_FORMAT_RGB_888_PLANAR,
-                    ),
-                    VpssChnConfig::new(1, FRAME_W as u32, FRAME_H as u32, ffi::PIXEL_FORMAT_NV12)
+                    VpssChnConfig::new(0, FRAME_W, FRAME_H, ffi::PIXEL_FORMAT_RGB_888_PLANAR),
+                    VpssChnConfig::new(1, FRAME_W, FRAME_H, ffi::PIXEL_FORMAT_NV12)
                         .with_depth(PREVIEW_DEPTH),
                 ],
             })
@@ -218,7 +209,7 @@ impl VpssPipeline {
         let enc = session
             .create_encoder_pending(
                 0,
-                &EncoderConfig::new(FRAME_W as u32, FRAME_H as u32, ffi::PIXEL_FORMAT_NV12)
+                &EncoderConfig::new(FRAME_W, FRAME_H, ffi::PIXEL_FORMAT_NV12)
                     .with_quality(u32::from(quality)),
             )
             .map_err(|e| io::Error::other(format!("VENC 通道创建失败: {e}")))?;
@@ -237,7 +228,7 @@ impl VpssPipeline {
 
         // 6) 输入帧
         let input = session
-            .alloc_frame_cached(FRAME_W as u32, FRAME_H as u32, ffi::PIXEL_FORMAT_YUYV)
+            .alloc_frame_cached(FRAME_W, FRAME_H, ffi::PIXEL_FORMAT_YUYV)
             .map_err(|e| io::Error::other(format!("输入帧分配失败: {e}")))?;
 
         // 7) 模型：加载失败/输入尺寸不匹配都视为启动失败（没有「仅预览」降级）

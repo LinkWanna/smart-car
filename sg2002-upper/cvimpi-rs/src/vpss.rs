@@ -394,9 +394,8 @@ impl<'a> Vpss<'a> {
 
     /// 把 YUV 输入按 **BT.601 limited → full range** 转到 RGB。
     ///
-    /// 系数与 `sg2002_upper::preprocess::yuyv422_to_rgb` 的整数公式一致
-    /// （`298/409/100/208/516` ÷ 256），所以 VPSS 的 RGB 输出与现有 CPU 路径
-    /// 基本逐像素相同，模型看到的输入分布不变。
+    /// 系数是 BT.601 limited → full 的整数公式
+    /// （`298/409/100/208/516` ÷ 256），模型看到的输入分布与预期一致。
     pub fn set_yuv601_limited_to_full(&self) -> Result<()> {
         self.set_grp_csc(
             [

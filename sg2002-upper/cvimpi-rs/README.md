@@ -163,8 +163,6 @@ let jpeg_input = vpss.get_chn_frame(1, 1000)?;
 * 实测（640x480，YUYV 进、RGB 平面 + NV12 出）：`SendFrame` 0.3~1.7ms、
   `GetChnFrame` 0.1~1.3ms，纯流水线 50fps；RGB 平面 stride = 640 且三个平面物理地址
   连续，可以直接当 `[1,3,480,640]` 的 NCHW 模型输入。
-* 上板探针：`sg2002-upper/src/bin/vpss_probe.rs`（`--step init|frame|twice`、
-  `--csc default|expand601`、`--venc`、`--model`、`--frames N`）。
 
 ## 缓冲池大小怎么算
 

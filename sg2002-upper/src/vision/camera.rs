@@ -8,6 +8,11 @@ use v4l::format::FourCC;
 use v4l::v4l_sys::{v4l2_buffer, v4l2_capability, v4l2_format, v4l2_requestbuffers};
 use v4l::v4l2::vidioc;
 
+/// 采集帧宽（相机协商格式 / 模型输入 / 预览编码一致）。
+pub const FRAME_W: u32 = 640;
+/// 采集帧高。
+pub const FRAME_H: u32 = 480;
+
 /// mmap 缓冲的只读句柄
 pub struct CaptureFrame<'a> {
     camera: &'a Camera,
@@ -72,8 +77,8 @@ impl Camera {
         let mut cam = Self {
             fd,
             bufs: Vec::new(),
-            w: 640,
-            h: 480,
+            w: FRAME_W,
+            h: FRAME_H,
             fourcc,
             device: device.to_string(),
         };

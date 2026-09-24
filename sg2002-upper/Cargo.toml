@@ -24,11 +24,6 @@ protocol = { path = "../protocol" }
 name = "smartcar"
 path = "src/bin/smartcar.rs"
 
-# Phase 0 探针：VPSS（YUYV → RGB 平面 + NV12）上板验证，只做验证不做业务。
-[[bin]]
-name = "vpss_probe"
-path = "src/bin/vpss_probe.rs"
-
 [profile.release]
 lto = true
 codegen-units = 1

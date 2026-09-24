@@ -31,8 +31,8 @@ use clap::Parser;
 use log::{error, info, warn};
 use sg2002_upper::control::{ControlSession, TeleopConfig};
 use sg2002_upper::logging;
-use sg2002_upper::vision::preview::PreviewSource;
 use sg2002_upper::transport::{Car, CarConfig};
+use sg2002_upper::vision::preview::PreviewSource;
 use sg2002_upper::vision::{VisionConfig, VpssStream};
 use sg2002_upper::web::{Server, WebConfig};
 

@@ -17,9 +17,9 @@ use std::time::{Duration, Instant};
 
 use log::info;
 
-use crate::vision::preview::{DetectionFrame, PreviewSource};
 use crate::transport::car::{Car, LinkState};
 use crate::transport::protocol::{ErrorCode, RequestType, Response, SysState};
+use crate::vision::preview::{DetectionFrame, PreviewSource};
 
 use super::position::{Observation, PositionAnalyzer};
 use super::servo::{Action as ServoAction, ControlConfig, ControlLoop};

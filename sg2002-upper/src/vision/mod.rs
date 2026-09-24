@@ -31,7 +31,7 @@ pub mod preview;
 mod state;
 mod vpss;
 
-pub use crate::preprocess::{FRAME_H, FRAME_W};
+pub use camera::{FRAME_H, FRAME_W};
 pub use vpss::VpssStream;
 
 /// 视觉配置。

@@ -2,11 +2,12 @@
 //!
 //! 线程模型：
 //! - 主线程（视觉管线）只调用 [`Car::set_desired`] / [`Car::brake`] /
-//!   [`Car::coast`] 表达“意图”；
-//! - 写线程每 25ms 检查一次意图：变化或超过刷新周期就重发，保证 UART 上
-//!   丢帧后仍能恢复；同时按 [`CarConfig::heartbeat_period`] 自动发心跳轮询
-//!   `Status`（不受视觉管线卡顿影响）；`Drive` 意图超过
-//!   [`CarConfig::watchdog_timeout`] 没有被主线程刷新时自动滑行停车；
+//!   [`Car::coast`] 表达“意图”，[`Car::init`] / [`Car::reset`] 排一条控制面请求；
+//! - **串口只由写线程写**（每 25ms 一拍）：控制面请求优先发，意图
+//!   **变化才下发**（UART 是可信链路，协议有校验和、固件逐条 ACK，不做周期
+//!   重发）；同时按 [`CarConfig::heartbeat_period`] 自动发心跳轮询 `Status`
+//!   （不受视觉管线卡顿影响）；驱动意图超过 [`CarConfig::watchdog_timeout`]
+//!   没有被主线程刷新时自动滑行停车；
 //! - 读线程以 `O_NONBLOCK` 轮询串口，把 ACK/NACK/Status 解析进共享状态。
 //!
 //! 说明：ESP32-C3 固件的 700ms 指令超时只在 BLE 已连接时生效，UART 链路
@@ -23,8 +24,8 @@ use std::time::{Duration, Instant};
 use log::warn;
 
 use super::protocol::{
-    ErrorCode, Frame, MotorTarget, MoveDir, Request, RequestType, Response, RotateDir, RxEvent,
-    RxParser, Status, SysState,
+    ErrorCode, Frame, MotorTarget, Request, RequestType, Response, RxEvent, RxParser, Status,
+    SysState,
 };
 use super::serial;
 
@@ -38,10 +39,13 @@ fn frame_of(request: Request) -> Frame {
 pub struct CarConfig {
     pub port: String,
     pub baud: u32,
+    /// 心跳周期：周期发 `Heartbeat` 轮询 `Status`（探活 + 刷新 HUD；
+    /// 也是链路上唯一的周期性报文）。
     pub heartbeat_period: Duration,
-    pub drive_refresh: Duration,
-    pub hold_refresh: Duration,
+    /// 驱动意图超过这么久没有被调用方刷新（[`Car::set_desired`]）→
+    /// 本地改成滑行下发（控制线程卡死的兜底；固件侧没有指令超时）。
     pub watchdog_timeout: Duration,
+    /// 多久没收到 `Status` 算链路不可用（[`Car::link_ok`] / HUD 判定，不发报文）。
     pub status_timeout: Duration,
 }
 
@@ -51,36 +55,9 @@ impl Default for CarConfig {
             port: "/dev/ttyS1".to_string(),
             baud: 115_200,
             heartbeat_period: Duration::from_millis(500),
-            drive_refresh: Duration::from_millis(200),
-            hold_refresh: Duration::from_millis(1000),
             watchdog_timeout: Duration::from_millis(800),
             status_timeout: Duration::from_millis(1500),
         }
-    }
-}
-
-/// 上位机想表达的小车状态。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Desired {
-    /// 滑行（两个 H 桥断开）。
-    Coast,
-    /// 短接制动（保持到下一条指令）。
-    Brake,
-    /// 双轮目标速度 -100..100。
-    Drive(i16, i16),
-}
-
-impl Desired {
-    fn frame(self) -> Frame {
-        frame_of(match self {
-            Desired::Coast => Request::Stop {
-                target: MotorTarget::Both,
-            },
-            Desired::Brake => Request::Brake {
-                target: MotorTarget::Both,
-            },
-            Desired::Drive(left, right) => Request::SetSpeeds { left, right },
-        })
     }
 }
 
@@ -117,12 +94,10 @@ pub struct LinkSnapshot {
 }
 
 struct InnerState {
-    /// manual 模式：下发线程完全放手，只允许 [`Car::send_frame`] 直接发。
-    manual: bool,
-    desired: Desired,
+    desired: Request,
     desired_at: Instant,
-    last_sent: Option<Desired>,
-    last_sent_at: Instant,
+    last_sent: Option<Request>,
+    pending: Option<Request>,
     last_heartbeat_at: Instant,
     last_init_at: Instant,
     status: Option<Status>,
@@ -241,52 +216,41 @@ impl Inner {
 
     fn writer_task(self: Arc<Self>) {
         while self.running.load(Ordering::Relaxed) {
-            // 0) manual 模式：固件闭环动作（Move/Rotate）由调用方直接发帧，
-            //    下发线程不碰串口，避免周期性 Stop 打断闭环。
-            if self.state.lock().unwrap().manual {
-                thread::sleep(Duration::from_millis(25));
-                continue;
-            }
-
-            // 1) 看门狗：Drive 意图长时间没有被刷新 -> 改成 Coast（下面统一下发）。
+            // 1) 看门狗：驱动意图长时间没有被刷新 -> 改成滑行（下面统一下发）。
             let watchdog = {
                 let mut st = self.state.lock().unwrap();
-                let stale = matches!(st.desired, Desired::Drive(..))
+                let stale = matches!(st.desired, Request::SetSpeeds { .. })
                     && st.desired_at.elapsed() > self.cfg.watchdog_timeout;
                 if stale {
-                    st.desired = Desired::Coast;
+                    st.desired = Request::Stop {
+                        target: MotorTarget::Both,
+                    };
                     st.desired_at = Instant::now();
                     st.counters.watchdog_trips += 1;
                 }
                 stale
             };
             if watchdog {
-                warn!("看门狗：Drive 意图超时未刷新，滑行停车");
+                warn!("看门狗：驱动意图超时未刷新，滑行停车");
             }
 
-            // 2) 变化立即发；否则 Drive 200ms、Coast/Brake 1s 重发一次。
+            // 2) 控制面请求（Init/Reset）优先发。
+            if let Some(request) = self.state.lock().unwrap().pending.take() {
+                self.send(frame_of(request));
+            }
+
+            // 3) 意图只在变化时下发（UART 可信 + 固件 ACK，不做周期重发）。
             let pending = {
                 let st = self.state.lock().unwrap();
-                let changed = st.last_sent != Some(st.desired);
-                let period = match st.desired {
-                    Desired::Drive(..) => self.cfg.drive_refresh,
-                    _ => self.cfg.hold_refresh,
-                };
-                if changed || st.last_sent_at.elapsed() >= period {
-                    Some(st.desired)
-                } else {
-                    None
-                }
+                (st.last_sent != Some(st.desired)).then_some(st.desired)
             };
             if let Some(desired) = pending
-                && self.send(desired.frame())
+                && self.send(frame_of(desired))
             {
-                let mut st = self.state.lock().unwrap();
-                st.last_sent = Some(desired);
-                st.last_sent_at = Instant::now();
+                self.state.lock().unwrap().last_sent = Some(desired);
             }
 
-            // 3) 自动心跳：Status 轮询不依赖视觉管线是否卡顿。
+            // 4) 自动心跳：Status 轮询不依赖视觉管线是否卡顿。
             let heartbeat_due = {
                 let st = self.state.lock().unwrap();
                 st.last_heartbeat_at.elapsed() >= self.cfg.heartbeat_period
@@ -317,21 +281,17 @@ fn describe(cmd: u8, payload: &[u8]) -> String {
             pid.ki as f32 / 100.0,
             pid.kd as f32 / 100.0
         ),
-        Err(_) => hex(payload),
+        Err(_) => payload
+            .iter()
+            .map(|b| format!("{:02X}", b))
+            .collect::<Vec<_>>()
+            .join(" "),
     }
 }
 
 /// 回显命令号的可读名字。
 fn request_name(cmd: u8) -> String {
     RequestType::from_u8(cmd).map_or_else(|| format!("0x{cmd:02X}"), |c| c.to_string())
-}
-
-fn hex(payload: &[u8]) -> String {
-    payload
-        .iter()
-        .map(|b| format!("{:02X}", b))
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 /// 与下位机的链路句柄；`Drop` 时自动滑行停车并退出线程。
@@ -354,11 +314,12 @@ impl Car {
             running: AtomicBool::new(true),
             write_lock: Mutex::new(()),
             state: Mutex::new(InnerState {
-                manual: false,
-                desired: Desired::Coast,
+                pending: None,
+                desired: Request::Stop {
+                    target: MotorTarget::Both,
+                },
                 desired_at: now,
                 last_sent: None,
-                last_sent_at: now,
                 last_heartbeat_at: now.checked_sub(Duration::from_secs(1)).unwrap_or(now),
                 last_init_at: now,
                 status: None,
@@ -384,88 +345,41 @@ impl Car {
         })
     }
 
-    /// 手动/自动模式切换。
-    ///
-    /// - 自动（默认）：调用方表达意图，下发线程负责重发与看门狗；
-    /// - 手动：下发线程停手，调用方用 [`Car::send_frame`] 直接发帧——固件闭环
-    ///   `Move`/`Rotate` 期间必须用它，否则周期性 `Stop` 会打断闭环。
-    ///   切回自动时会强制重发一次当前意图，让下位机与上位机状态对齐。
-    pub fn set_manual(&self, manual: bool) {
-        let mut st = self.inner.state.lock().unwrap();
-        st.manual = manual;
-        if !manual {
-            st.last_sent = None;
-            st.desired_at = Instant::now();
-        }
-    }
-
-    /// 手动发一帧（manual 模式/调试用）。
-    pub fn send_frame(&self, frame: Frame) -> bool {
-        self.inner.send(frame)
-    }
-
-    /// 手动发一条命令（manual 模式/调试用）；编码失败（Move/Rotate 参数越界）返回 `false`。
-    pub fn send_request(&self, request: Request) -> bool {
-        match request.to_frame() {
-            Ok(frame) => self.inner.send(frame),
-            Err(err) => {
-                warn!("请求编码失败：{err}");
-                false
-            }
-        }
-    }
-
-    /// 表达双轮速度意图（`-100..100`）；由下发线程负责发送与重发。
+    /// 表达双轮速度意图（`-100..100`）；由下发线程在变化时下发。
     pub fn set_desired(&self, left: i16, right: i16) {
         let mut st = self.inner.state.lock().unwrap();
-        st.desired = Desired::Drive(left, right);
+        st.desired = Request::SetSpeeds { left, right };
         st.desired_at = Instant::now();
     }
 
     /// 意图改为滑行。
     pub fn coast(&self) {
         let mut st = self.inner.state.lock().unwrap();
-        st.desired = Desired::Coast;
+        st.desired = Request::Stop {
+            target: MotorTarget::Both,
+        };
         st.desired_at = Instant::now();
     }
 
     /// 意图改为短接制动（保持到下一条速度指令）。
     pub fn brake(&self) {
         let mut st = self.inner.state.lock().unwrap();
-        st.desired = Desired::Brake;
+        st.desired = Request::Brake {
+            target: MotorTarget::Both,
+        };
         st.desired_at = Instant::now();
     }
 
-    /// 立即发送 `Init`（编码器清零 + 进入 Ready）。
-    pub fn init(&self) -> bool {
-        {
-            let mut st = self.inner.state.lock().unwrap();
-            st.last_init_at = Instant::now();
-        }
-        self.send_request(Request::Init)
+    /// 请求 `Init`（编码器清零 + 进入 `Ready`）；由下发线程发出。
+    pub fn init(&self) {
+        let mut st = self.inner.state.lock().unwrap();
+        st.last_init_at = Instant::now();
+        st.pending = Some(Request::Init);
     }
 
-    /// 立即发送 `Reset`（回 Uninit，未初始化状态下电机滑行）。
-    pub fn reset(&self) -> bool {
-        self.send_request(Request::Reset)
-    }
-
-    /// 发送闭环 `Move`（固件按编码器闭环，到位自动刹车）。
-    pub fn move_goal(&self, dir: MoveDir, speed: u8, mm: u32) -> bool {
-        self.send_request(Request::Move {
-            dir,
-            speed,
-            distance_mm: mm,
-        })
-    }
-
-    /// 发送闭环 `Rotate`（单位 0.1°）。
-    pub fn rotate_goal(&self, dir: RotateDir, speed: u8, tenths_deg: u32) -> bool {
-        self.send_request(Request::Rotate {
-            dir,
-            speed,
-            tenths_deg,
-        })
+    /// 请求 `Reset`（回 Uninit，未初始化状态下电机滑行）；由下发线程发出。
+    pub fn reset(&self) {
+        self.inner.state.lock().unwrap().pending = Some(Request::Reset);
     }
 
     /// 最近一次 `Status`。
@@ -550,33 +464,25 @@ impl Car {
         }
     }
 
-    /// 向下位机“补初始化”：处于 Uninit 或最近因状态不对被 NACK 时重发
-    /// `Init`（限频 1Hz）。返回是否触发了重发。
-    pub fn maybe_reinit(&self) -> bool {
-        let due = {
-            let mut st = self.inner.state.lock().unwrap();
-            if st.last_init_at.elapsed() < Duration::from_secs(1) {
-                return false;
-            }
-            let uninit = st.status.map(|s| s.sys) == Some(SysState::Uninit);
-            let wrong_state = matches!(
-                st.last_nack,
-                Some((cmd, err, at))
-                    if cmd == RequestType::SetSpeeds.as_u8()
-                        && err == ErrorCode::WrongState.as_u8()
-                        && at.elapsed() < Duration::from_secs(2)
-            );
-            if uninit || wrong_state {
-                st.last_init_at = Instant::now();
-                true
-            } else {
-                false
-            }
-        };
-        if due {
-            self.inner.send(frame_of(Request::Init));
+    /// 向下位机“补初始化”：处于 Uninit 或最近因状态不对被 NACK 时请求
+    /// `Init`（限频 1Hz，由下发线程发出）。
+    pub fn maybe_reinit(&self) {
+        let mut st = self.inner.state.lock().unwrap();
+        if st.last_init_at.elapsed() < Duration::from_secs(1) {
+            return;
         }
-        due
+        let uninit = st.status.map(|s| s.sys) == Some(SysState::Uninit);
+        let wrong_state = matches!(
+            st.last_nack,
+            Some((cmd, err, at))
+                if cmd == RequestType::SetSpeeds.as_u8()
+                    && err == ErrorCode::WrongState.as_u8()
+                    && at.elapsed() < Duration::from_secs(2)
+        );
+        if uninit || wrong_state {
+            st.last_init_at = Instant::now();
+            st.pending = Some(Request::Init);
+        }
     }
 
     /// 停车并退出收发线程；幂等（多线程同时调用也只执行一次），`Drop` 会自动调用。
@@ -687,7 +593,6 @@ mod tests {
         let cfg = CarConfig {
             port: slave_path,
             watchdog_timeout: Duration::from_millis(150),
-            drive_refresh: Duration::from_millis(50),
             heartbeat_period: Duration::from_millis(50),
             status_timeout: Duration::from_millis(300),
             ..Default::default()
@@ -753,7 +658,7 @@ mod tests {
             Some(vec![MotorTarget::Both.as_u8()])
         );
         assert!(car.counters().watchdog_trips >= 1);
-        // 停车后不再重发 Drive
+        // 停车后不会再触发看门狗（意图已经是 Stop）
         thread::sleep(Duration::from_millis(80));
         assert_eq!(car.counters().watchdog_trips, 1);
 

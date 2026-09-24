@@ -64,7 +64,3 @@ VPSS chn1 用 `CVI_SYS_Bind` **直连 VENC**（内核内交接），用户态只
 | 预览编码耗时 | **~4ms**（avg，编码在 TPU 期间完成） |
 | 视觉帧率 | 贴着相机（16.5~19.8fps，随光照） |
 | smartcar CPU | 6% |
-
-> `/proc/cvitek/vpss` 可以放心读（之前那次看门狗重启是电池松动，不是它）。
-> 另外别用 sysfs `unbind`/`bind` 重绑 `uvcvideo`：做完 `/dev/video0` 不会回来，
-> 相机卡住（S_FMT `Resource busy` 但没进程持有）时直接重启板子最省事。

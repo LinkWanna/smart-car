@@ -19,8 +19,9 @@ use log::info;
 
 use crate::preview::{DetectionFrame, PreviewSource};
 
-use super::car::{Car, LinkSnapshot};
+use super::car::{Car, LinkState};
 use super::position::{Observation, PositionAnalyzer};
+use super::protocol::{ErrorCode, RequestType, Response, SysState};
 use super::servo::{Action as ServoAction, ControlConfig, ControlLoop};
 use super::teleop::{Action, Hud, Keys, Output, Teleop, TeleopConfig};
 
@@ -65,6 +66,11 @@ pub struct AutoState {
     pub cmd: [i16; 2],
 }
 
+/// 自动补 `Init` 的限频（应用策略：下位机掉回 Uninit 时不要猛刷）。
+const REINIT_PERIOD: Duration = Duration::from_secs(1);
+/// 观察窗口：`WrongState` NACK 在这段时间内才算“当前状态不对”。
+const WRONG_STATE_WINDOW: Duration = Duration::from_secs(2);
+
 /// 控制层状态快照（网页 JSON 用；一次取全，避免撕裂读）。
 pub struct ControlStatus {
     pub mode: Mode,
@@ -75,7 +81,7 @@ pub struct ControlStatus {
     pub input_age: Option<Duration>,
     /// 自动模式最近一次输出（手动模式为 `None`）。
     pub auto: Option<AutoState>,
-    pub link: LinkSnapshot,
+    pub link: LinkState,
 }
 
 /// 控制会话：持有链路、手动控制律、模式与视觉伺服。
@@ -93,6 +99,8 @@ pub struct ControlSession {
     auto: Mutex<Option<AutoState>>,
     /// 自动模式的数据源；`None` = 未启用视觉。
     vision: Option<Arc<dyn PreviewSource>>,
+    /// 上次请求 `Init` 的时刻（自动补 `Init` 的限频；只有控制线程写）。
+    reinit_at: Mutex<Instant>,
     running: AtomicBool,
     handle: Mutex<Option<JoinHandle<()>>>,
 }
@@ -112,6 +120,7 @@ impl ControlSession {
             analyzer: PositionAnalyzer::for_640x480(),
             auto: Mutex::new(None),
             vision,
+            reinit_at: Mutex::new(Instant::now()),
             running: AtomicBool::new(true),
             handle: Mutex::new(None),
         })
@@ -200,7 +209,7 @@ impl ControlSession {
             auto: (mode == Mode::Auto)
                 .then(|| self.auto.lock().unwrap().clone())
                 .flatten(),
-            link: self.target.snapshot(),
+            link: self.target.state(),
         }
     }
 
@@ -225,7 +234,7 @@ impl ControlSession {
                 Mode::Auto => self.auto_output(&mut servo, now),
             };
             apply(&self.target, out);
-            self.target.maybe_reinit();
+            self.maybe_reinit();
             next += period;
             let now = Instant::now();
             if next > now {
@@ -262,10 +271,41 @@ impl ControlSession {
         });
         action_output(action)
     }
+
+    /// 应用策略：下位机掉回 `Uninit`、或刚因状态不对拒过速度指令时，补发
+    /// `Init`（限频 [`REINIT_PERIOD`]）。传输层只提供状态与 [`Car::init`]，
+    /// 不做这个判断。
+    fn maybe_reinit(&self) {
+        let LinkState {
+            status,
+            last_response,
+            ..
+        } = self.target.state();
+        let uninit = status.map(|s| s.sys) == Some(SysState::Uninit);
+        let wrong_state = matches!(
+            last_response,
+            Some((Response::Nack { cmd, error }, at))
+                if cmd == RequestType::SetSpeeds.as_u8()
+                    && error == ErrorCode::WrongState
+                    && at.elapsed() < WRONG_STATE_WINDOW
+        );
+        if !uninit && !wrong_state {
+            return;
+        }
+        let mut last = self.reinit_at.lock().unwrap();
+        if last.elapsed() < REINIT_PERIOD {
+            return;
+        }
+        *last = Instant::now();
+        drop(last);
+        self.target.init();
+    }
 }
 
 /// 把控制律输出落到链路。
 fn apply(target: &Car, out: Output) {
+    // 应用每拍都在说话：刷新死手开关（`Output::Hold` 不改意图，但证明控制线程活着）
+    target.refresh_intent();
     match out {
         Output::Drive { left, right } => target.set_desired(left, right),
         Output::Coast => target.coast(),

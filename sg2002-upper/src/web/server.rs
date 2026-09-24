@@ -2,11 +2,12 @@
 //!
 //! 线程模型：
 //!
-//! - **HTTP 请求**：`rouille::Server` 用线程池处理，[`Server::run`] 每 200ms
-//!   轮询 `running`（`poll_timeout`），退出前 `join` 等在途请求；
+//! - **HTTP 请求**：`rouille::Server` 用线程池处理，[`Server::run`] 每
+//!   [`POLL_INTERVAL`] 排空一次在途请求并检查停止标志，退出前 `join` 等在途请求；
 //! - **WebSocket 会话**：握手交给 `rouille::websocket`，每个连接一个线程——
 //!   `Websocket::next()` 阻塞读客户端消息，收到消息后按 `status_hz` /
-//!   `video_fps` 推送状态与 JPEG（页面每 100ms 发按键心跳，天然给出推送节奏）；
+//!   `video_fps` 推送状态与 JPEG（页面每 100ms 发一条 WS ping 当推送时钟；
+//!   **按键/动作/模式走 HTTP**，见下）；
 //!   客户端静默时输入看门狗（[`Teleop`](crate::control::Teleop)）会把车停下。
 //!
 //! 控制节拍与手动/自动仲裁在 [`crate::control::ControlSession`]（本模块只把
@@ -33,7 +34,7 @@ use crate::control::teleop::{Action, Keys};
 use crate::preview::{DetectionFrame, PreviewSource};
 use crate::vision::{FRAME_H, FRAME_W};
 
-/// WebSocket 每轮主动推送的时长（略小于页面 100ms 的按键心跳间隔）。
+/// WebSocket 每轮主动推送的时长（略小于页面 100ms 的 WS 心跳间隔）。
 const PUSH_WINDOW: Duration = Duration::from_millis(90);
 /// 推送窗口内的检查粒度。
 const PUSH_TICK: Duration = Duration::from_millis(5);
@@ -42,8 +43,9 @@ const PUSH_TICK: Duration = Duration::from_millis(5);
 const INDEX_HTML: &str = include_str!("assets/index.html");
 /// HTTP 请求线程池大小（WebSocket 会话有独立线程，不占池子）。
 const POOL_SIZE: usize = 8;
-/// `run` 的轮询间隔（决定 Ctrl+C 后的退出延迟上限）。
-const POLL_INTERVAL: Duration = Duration::from_millis(200);
+/// `run` 的轮询节拍：既决定空闲时 HTTP 请求的最大等待，也决定停止标志的
+/// 检查粒度（即 Ctrl+C 后的退出延迟上限）。
+const POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 /// 网页服务配置。
 #[derive(Debug, Clone)]
@@ -113,11 +115,14 @@ impl Shared {
         json!({
             "type": "status",
             "uptime": self.started.elapsed().as_secs_f32(),
-            "link": st.link.link_ok,
-            "link_age_ms": st.link.link_age.map(|d| d.as_millis() as u64),
-            "sys": st.link.sys,
-            "rpm": st.link.rpm,
-            "dist": { "active": st.link.dist_active, "result": st.link.dist_result },
+            "link": st.link.up,
+            "link_age_ms": st.link.age.map(|d| d.as_millis() as u64),
+            "sys": st.link.status.map(|s| s.sys.to_string()),
+            "rpm": st.link.status.map_or([0, 0], |s| s.rpm),
+            "dist": {
+                "active": st.link.status.is_some_and(|s| s.dist_active),
+                "result": st.link.status.map_or(0, |s| s.dist_result),
+            },
             "drive": {
                 "throttle": st.hud.throttle,
                 "steer": st.hud.steer,
@@ -136,7 +141,7 @@ impl Shared {
                 "write_errors": st.link.counters.write_errors,
                 "watchdog_trips": st.link.counters.watchdog_trips,
             },
-            "last_frame": st.link.last_frame,
+            "last_frame": st.link.last_response.map(|(r, _)| r.to_string()),
             "camera": self.camera_value(),
             "vision": self.vision_value(),
             "clients": self.clients.load(Ordering::Relaxed),
@@ -255,9 +260,13 @@ impl Server {
     /// 请求循环；`running` 为 false 时排空在途请求并返回。
     pub fn run(&self) {
         // rouille 没有公开的停止接口，这里用轮询 `running` 的方式收尾。
-        // WebSocket 会话在独立线程里阻塞读，进程退出时一并结束。
+        // **不能用 `poll_timeout`**：它的内层循环在请求持续到达（间隔小于超时）
+        // 时不会返回，外层的停止标志就永远检查不到——页面 100ms 的
+        // `/api/input` 心跳正好会把它钉死。这里用非阻塞的 `poll` 排空队列、
+        // 自己控节拍：请求处理与停止标志检查都不挨饿。
         while self.running.load(Ordering::Relaxed) {
-            self.inner.poll_timeout(POLL_INTERVAL);
+            self.inner.poll();
+            thread::sleep(POLL_INTERVAL);
         }
         self.inner.join();
         info!("已停止监听");
@@ -358,11 +367,17 @@ fn vision_frame_value(seq: u64, frame: &DetectionFrame) -> Value {
     })
 }
 
-/// WebSocket 会话：阻塞读客户端消息，期间按节拍推送状态与预览帧。
+/// WebSocket 会话：**只做下行推送**（状态 / JPEG / 检测框）。
 ///
-/// 注意推送**不能只依赖客户端心跳**：页面的按键心跳是 100ms 一次，如果每收到
-/// 一条消息才推一帧，预览就被锁在 10fps。所以每轮先跑一个 [`PUSH_WINDOW`]
-/// 长的推送窗口（每 [`PUSH_TICK`] 检查一次有没有新帧），再阻塞等消息。
+/// 注意推送**不能只依赖客户端消息**：页面每 100ms 发一条 WS ping 当推送时钟，
+/// 如果每收到一条消息才推一帧，预览就被锁在 10fps。所以每轮先跑一个
+/// [`PUSH_WINDOW`] 长的推送窗口（每 [`PUSH_TICK`] 检查一次有没有新帧），
+/// 再阻塞等消息。
+///
+/// 上行（按键 / 动作 / 模式）走 HTTP 路由（`/api/input`、`/api/action`、
+/// `/api/mode`）：本线程每轮只读一条消息，且要被推送窗口挡住，输入会被推送
+/// 节奏绑架；HTTP 由线程池即时处理、不排队。下面仍保留 WS 的上行分支，
+/// 供 `webctl` 一类的调试客户端使用。
 fn websocket_session(mut socket: Websocket, shared: Arc<Shared>) {
     let id = shared.next_client_id.fetch_add(1, Ordering::Relaxed) + 1;
     shared.clients.fetch_add(1, Ordering::Relaxed);
@@ -416,7 +431,7 @@ fn websocket_session(mut socket: Websocket, shared: Arc<Shared>) {
         if !alive {
             break;
         }
-        // 阻塞等待客户端消息（页面每 100ms 发一次按键心跳）。
+        // 阻塞等待客户端消息（页面每 100ms 发一条 WS ping 当推送时钟）。
         match socket.next() {
             Some(websocket::Message::Text(text)) => {
                 alive = handle_message(&text, &mut socket, &shared, id);
@@ -474,7 +489,98 @@ fn send_json(socket: &mut Websocket, value: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control::{Car, CarConfig, ControlSession, TeleopConfig};
     use crate::yolo::Detection;
+    use std::ffi::CStr;
+    use std::fs::File;
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    use std::os::unix::io::FromRawFd;
+    use std::thread;
+
+    /// 用 PTY 当串口（`Car::open` 只要能打开就行，不需要固件应答）。
+    fn open_pty() -> Option<(File, String)> {
+        unsafe {
+            let master = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
+            if master < 0 {
+                return None; // 环境不支持 PTY，跳过测试
+            }
+            if libc::grantpt(master) != 0 || libc::unlockpt(master) != 0 {
+                libc::close(master);
+                return None;
+            }
+            let mut name = [0 as libc::c_char; 256];
+            if libc::ptsname_r(master, name.as_mut_ptr(), name.len()) != 0 {
+                libc::close(master);
+                return None;
+            }
+            let path = CStr::from_ptr(name.as_ptr()).to_string_lossy().into_owned();
+            Some((File::from_raw_fd(master), path))
+        }
+    }
+
+    /// 发一条 GET（只关心请求到达服务端，不解析响应）。
+    fn http_get(addr: SocketAddr, path: &str) {
+        let Ok(mut stream) = TcpStream::connect(addr) else {
+            return;
+        };
+        let req = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+        let _ = stream.write_all(req.as_bytes());
+        let mut buf = [0u8; 256];
+        let _ = stream.read(&mut buf);
+    }
+
+    /// 回归：`run()` 必须在停止标志置位后返回——**即使 HTTP 请求持续到达**。
+    ///
+    /// 旧实现用 `poll_timeout(200ms)`，其内层循环在请求间隔小于超时（页面的
+    /// `/api/input` 心跳是 100ms）时永不返回，停止标志永远检查不到，Ctrl+C 失效。
+    #[test]
+    fn run_exits_under_http_traffic() {
+        let Some((_master, port)) = open_pty() else {
+            eprintln!("跳过：当前环境不支持 PTY");
+            return;
+        };
+        let car = Arc::new(Car::open(CarConfig {
+            port,
+            ..Default::default()
+        })
+        .expect("打开 PTY 失败"));
+        let session = ControlSession::new(car.clone(), TeleopConfig::default(), None);
+        let server = Server::bind(
+            WebConfig {
+                bind: "127.0.0.1".to_string(),
+                port: 0,
+                status_hz: 10.0,
+                video_fps: 0.0,
+            },
+            Arc::clone(&session),
+            None,
+        )
+        .expect("绑定端口失败");
+        let stop = server.stop_flag();
+        let addr = server.local_addr().unwrap();
+        let running = thread::spawn(move || server.run());
+
+        // 持续发请求（间隔 < 旧实现的 200ms 超时），**在请求不停的情况下**置停止标志：
+        // 旧实现会一直卡在 `poll_timeout` 的内层循环里，永远看不到标志。
+        let stop_at = Instant::now() + Duration::from_millis(300);
+        let give_up = Instant::now() + Duration::from_secs(2);
+        let mut stopped = false;
+        while Instant::now() < give_up {
+            http_get(addr, "/api/input?keys=");
+            if !stopped && Instant::now() >= stop_at {
+                stop.store(false, Ordering::SeqCst);
+                stopped = true;
+            }
+            if stopped && running.is_finished() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(running.is_finished(), "停止标志置位后 run() 应在 2s 内返回");
+        running.join().unwrap();
+        session.stop();
+    }
 
     /// 视觉消息只发检测框（归一化到 0..1）与帧号，不带任何高层语义。
     #[test]

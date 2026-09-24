@@ -109,7 +109,7 @@ struct Cli {
     max_reverse: f32,
 
     /// 控制节拍（Hz）
-    #[arg(long, value_parser = fast_hz, default_value_t = 20.0)]
+    #[arg(long, value_parser = fast_hz, default_value_t = 50.0)]
     control_hz: f32,
 
     /// 反转转向
@@ -220,7 +220,11 @@ fn main() {
         std::process::exit(2);
     });
     if car.ensure_ready(READY_TIMEOUT) {
-        info!("  下位机：就绪（{}）", car.last_frame());
+        let last = car
+            .state()
+            .last_response
+            .map_or_else(|| "(尚未收到应答)".to_string(), |(r, _)| r.to_string());
+        info!("  下位机：就绪（{last}）");
     } else {
         warn!("下位机无应答，检查接线/供电/固件；页面仍可打开，按“初始化”重试");
     }
@@ -322,7 +326,7 @@ fn main() {
         preview.stop();
     }
     car.shutdown();
-    let c = car.counters();
+    let c = car.state().counters;
     info!(
         "链路统计：ACK={} NACK={} 校验错={} 写失败={} 看门狗={}",
         c.acks, c.nacks, c.checksum_fails, c.write_errors, c.watchdog_trips

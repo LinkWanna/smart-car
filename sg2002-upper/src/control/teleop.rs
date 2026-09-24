@@ -111,13 +111,13 @@ impl Default for TeleopConfig {
         Self {
             max_speed: 55.0,
             max_reverse: 40.0,
-            accel_rate: 90.0,
+            accel_rate: 150.0,
             brake_rate: 350.0,
-            decay_rate: 50.0,
+            decay_rate: 120.0,
             turn_gain: 40.0,
             steer_rate: 6.0,
             pivot_speed: 40.0,
-            control_hz: 20.0,
+            control_hz: 50.0,
             input_timeout: Duration::from_millis(600),
             invert_steer: false,
         }
@@ -490,7 +490,7 @@ mod tests {
         let mut teleop = Teleop::new(cfg());
         let mut now = Instant::now();
         teleop.set_keys(Keys::parse("w"), 1, now);
-        // 1 秒 * 90/s = 90 -> 封顶 55
+        // 1 秒 * 150/s = 150 -> 封顶 55
         let out = run_held(&mut teleop, &mut now, 1.0);
         assert_eq!(
             out,

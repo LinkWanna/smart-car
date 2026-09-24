@@ -199,11 +199,20 @@ function renderKeys() {
   });
   $("f-keys").textContent = "按键 " + (keysString() || "--");
 }
+/* 按键走 HTTP（`/api/input`）：WS 会话每轮只读一条消息、还被 90ms 推送窗口
+   挡着，输入会被推送节奏绑架；HTTP 由线程池即时处理，不排队。
+   单请求在飞 + 最新覆盖：保证按顺序落地，且总是收敛到最新快照。 */
+let keysInFlight = false;
+let keysDirty = false;
 function sendKeys() {
-  const ws = state.ws;
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify({ type: "keys", keys: keysString() }));
-  }
+  if (keysInFlight) { keysDirty = true; return; }
+  keysInFlight = true;
+  fetch("/api/input?keys=" + encodeURIComponent(keysString()))
+    .catch(() => {})
+    .finally(() => {
+      keysInFlight = false;
+      if (keysDirty) { keysDirty = false; sendKeys(); }
+    });
 }
 function setKey(key, down) {
   if (state.mode === "auto") return; // 自动模式只能由按钮切换，避免误触接管
@@ -218,11 +227,8 @@ function clearKeys() {
   sendKeys();
 }
 function action(name) {
-  const ws = state.ws;
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    if (name === "stop" || name === "init") { state.keys.clear(); renderKeys(); }
-    ws.send(JSON.stringify({ type: "action", action: name }));
-  }
+  if (name === "stop" || name === "init") { state.keys.clear(); renderKeys(); }
+  fetch("/api/action?action=" + encodeURIComponent(name)).catch(() => {});
 }
 
 /* ---------- 键盘 / 触摸 ---------- */
@@ -267,13 +273,20 @@ document.querySelectorAll("[data-action]").forEach((el) => {
 
 /* 模式切换：只能点按钮（键盘/触摸盘在自动模式下不生效） */
 $("btn-mode").addEventListener("click", () => {
-  const ws = state.ws;
-  if (!ws || ws.readyState !== WebSocket.OPEN) return;
-  ws.send(JSON.stringify({ type: "mode", mode: state.mode === "auto" ? "manual" : "auto" }));
+  const mode = state.mode === "auto" ? "manual" : "auto";
+  fetch("/api/mode?set=" + mode).then((r) => {
+    if (!r.ok) r.text().then((t) => console.warn("server:", t));
+  }).catch(() => {});
 });
 
-/* 心跳：每 100ms 重发一份完整快照，服务端超时未收到就松开所有键。 */
+/* 输入心跳：每 100ms 重发一份完整按键快照（HTTP），服务端超时未收到就松开所有键。 */
 setInterval(sendKeys, 100);
+/* WS 心跳：WS 只做下行推送，服务端每轮"推送窗口 + 读一条消息"，
+   这条心跳是它的推送时钟（没有它，视频/状态会停在阻塞读上）。 */
+setInterval(() => {
+  const ws = state.ws;
+  if (ws && ws.readyState === WebSocket.OPEN) ws.send('{"type":"ping"}');
+}, 100);
 
 /* ---------- WebSocket ---------- */
 function connect() {
@@ -284,7 +297,7 @@ function connect() {
   ws.onopen = () => {
     state.reconnectMs = 500;
     badge("b-ws", "已连接", "ok");
-    sendKeys();
+    sendKeys(); // 重连后立刻同步一次按键状态（HTTP）
   };
   ws.onmessage = (ev) => {
     if (typeof ev.data === "string") {

@@ -176,3 +176,44 @@ impl Response {
         Frame::new(self.response_type().as_u8(), &payload[..len])
     }
 }
+
+/// 应答的规范文本
+impl core::fmt::Display for Response {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Ack { cmd } => {
+                f.write_str("ACK ")?;
+                fmt_request_name(f, *cmd)
+            }
+            Self::Nack { cmd, error } => {
+                f.write_str("NACK ")?;
+                fmt_request_name(f, *cmd)?;
+                write!(f, " {error}")
+            }
+            Self::Status(status) => write!(
+                f,
+                "Status {} rpm=({}, {}) dist_active={} dist_result={}",
+                status.sys,
+                status.rpm[0],
+                status.rpm[1],
+                status.dist_active as u8,
+                status.dist_result
+            ),
+            Self::PidData(pid) => write!(
+                f,
+                "PidData kp={:.2} ki={:.2} kd={:.2}",
+                pid.kp as f32 / 100.0,
+                pid.ki as f32 / 100.0,
+                pid.kd as f32 / 100.0
+            ),
+        }
+    }
+}
+
+/// 回显命令号的可读名字（未知命令显示十六进制）。
+fn fmt_request_name(f: &mut core::fmt::Formatter<'_>, cmd: u8) -> core::fmt::Result {
+    match super::types::RequestType::from_u8(cmd) {
+        Some(ty) => write!(f, "{ty}"),
+        None => write!(f, "0x{cmd:02X}"),
+    }
+}

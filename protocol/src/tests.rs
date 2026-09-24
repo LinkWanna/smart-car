@@ -4,7 +4,7 @@
 //! `test_little_endian_is_pinned` 同源，任何一端字节序/长度改动都会在这里暴露。
 
 use super::*;
-use crate::frame::{checksum, MAX_PAYLOAD};
+use crate::frame::{MAX_PAYLOAD, checksum};
 use core::fmt::Write;
 
 const ALL_REQUESTS: [Request; 12] = [
@@ -463,7 +463,13 @@ fn parser_reports_bad_checksum_and_recovers() {
     for &b in heartbeat.as_bytes() {
         last = parser.feed(b);
     }
-    assert_eq!(last, RxEvent::Frame { cmd: 0xFE, payload: &[] });
+    assert_eq!(
+        last,
+        RxEvent::Frame {
+            cmd: 0xFE,
+            payload: &[]
+        }
+    );
 }
 
 #[test]
@@ -510,13 +516,7 @@ fn checksum_matches_the_wire_rule() {
 #[test]
 fn display_names_match_the_docs() {
     let mut out = Rendered::new();
-    write!(
-        out,
-        "{}/{}",
-        RequestType::SetSpeeds,
-        ResponseType::PidData
-    )
-    .unwrap();
+    write!(out, "{}/{}", RequestType::SetSpeeds, ResponseType::PidData).unwrap();
     assert_eq!(out.as_str(), "SetSpeeds/PidData");
 
     let mut out = Rendered::new();
@@ -546,4 +546,66 @@ fn display_names_match_the_docs() {
     )
     .unwrap();
     assert_eq!(out.as_str(), "负载长度 1 != 3");
+}
+
+/// `Response` 的规范文本（HUD/日志用；改格式要一起改页面/日志的预期）。
+#[test]
+fn response_display_is_canonical() {
+    let mut out = Rendered::new();
+    write!(
+        out,
+        "{}",
+        Response::Ack {
+            cmd: RequestType::SetSpeeds.as_u8()
+        }
+    )
+    .unwrap();
+    assert_eq!(out.as_str(), "ACK SetSpeeds");
+
+    let mut out = Rendered::new();
+    write!(
+        out,
+        "{}",
+        Response::Nack {
+            cmd: RequestType::SetSpeeds.as_u8(),
+            error: ErrorCode::WrongState
+        }
+    )
+    .unwrap();
+    assert_eq!(out.as_str(), "NACK SetSpeeds WrongState");
+
+    let mut out = Rendered::new();
+    write!(
+        out,
+        "{}",
+        Response::Status(Status {
+            sys: SysState::Ready,
+            rpm: [0, 0],
+            dist_active: false,
+            dist_result: 0,
+        })
+    )
+    .unwrap();
+    assert_eq!(
+        out.as_str(),
+        "Status Ready rpm=(0, 0) dist_active=0 dist_result=0"
+    );
+
+    let mut out = Rendered::new();
+    write!(
+        out,
+        "{}",
+        Response::PidData(PidData {
+            kp: 150,
+            ki: 0,
+            kd: -50
+        })
+    )
+    .unwrap();
+    assert_eq!(out.as_str(), "PidData kp=1.50 ki=0.00 kd=-0.50");
+
+    // 未知命令号回显成十六进制
+    let mut out = Rendered::new();
+    write!(out, "{}", Response::Ack { cmd: 0x7F }).unwrap();
+    assert_eq!(out.as_str(), "ACK 0x7F");
 }

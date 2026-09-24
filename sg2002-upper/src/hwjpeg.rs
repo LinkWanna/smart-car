@@ -20,7 +20,7 @@
 //!
 //! 编解码会话（`CVI_SYS_Init` + 公共 VB 池）**由调用方提供**：进程里只能有一个
 //! [`Sys`]（`CVI_SYS_Init` 是进程级状态），CPU 管线把它和 TPU 零拷贝输入帧
-//! 共用（见 [`crate::vision::cpu`]），所以这里只借用、不拥有。池的 block 要
+//! 共用（见 `crate::vision::cpu`），所以这里只借用、不拥有。池的 block 要
 //! 放得下 NV12 输入帧（`venc_input_layout`）。
 
 use std::io;

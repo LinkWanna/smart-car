@@ -1,33 +1,37 @@
 //! ESP32-C3 下位机链路：命令下发、应答解析、状态缓存与安全看门狗。
 //!
+//! 传输层：与 ESP32-C3 下位机的协议对话（命令下发、应答解析、状态缓存）
+//! 与节奏/安全机制（变化才发、心跳、死手开关）。
+//!
+//! 分层：串口字节流在 `super::link`（链路层，只搬字节/帧）；协议编解码与
+//! 消息类型在 `protocol` crate；**应用策略**（什么时候补 `Init`、模式仲裁、
+//! 控制律）在 [`super::session`]，本模块不解释业务语义。
+//!
 //! 线程模型：
 //! - 主线程（视觉管线）只调用 [`Car::set_desired`] / [`Car::brake`] /
 //!   [`Car::coast`] 表达“意图”，[`Car::init`] / [`Car::reset`] 排一条控制面请求；
 //! - **串口只由写线程写**（每 25ms 一拍）：控制面请求优先发，意图
 //!   **变化才下发**（UART 是可信链路，协议有校验和、固件逐条 ACK，不做周期
 //!   重发）；同时按 [`CarConfig::heartbeat_period`] 自动发心跳轮询 `Status`
-//!   （不受视觉管线卡顿影响）；驱动意图超过 [`CarConfig::watchdog_timeout`]
-//!   没有被主线程刷新时自动滑行停车；
-//! - 读线程以 `O_NONBLOCK` 轮询串口，把 ACK/NACK/Status 解析进共享状态。
+//!   （不受视觉管线卡顿影响）；意图超过 [`CarConfig::watchdog_timeout`] 没被
+//!   调用方报活（[`Car::refresh_intent`] 等）时下发 [`CarConfig::fallback`]
+//!   （死手开关，不解释意图语义）；
+//! - 读线程在链路层：帧解析后回调到状态机，把 ACK/NACK/Status 归入类型化状态。
 //!
 //! 说明：ESP32-C3 固件的 700ms 指令超时只在 BLE 已连接时生效，UART 链路
 //! 由上位机负责看门狗；进程退出（含 panic 展开）时 [`Drop`] 会补一帧
 //! `Stop`，被 SIGKILL 则没有机会发送。
 
-use std::fs::File;
-use std::io::{self, Read, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::io;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use log::warn;
 
-use super::protocol::{
-    ErrorCode, Frame, MotorTarget, Request, RequestType, Response, RxEvent, RxParser, Status,
-    SysState,
-};
-use super::serial;
+use super::link::Link;
+use super::protocol::{Frame, MotorTarget, Request, RequestType, Response, RxEvent, Status, SysState};
 
 /// 这些请求的负载固定，组帧不可能失败。
 fn frame_of(request: Request) -> Frame {
@@ -42,10 +46,14 @@ pub struct CarConfig {
     /// 心跳周期：周期发 `Heartbeat` 轮询 `Status`（探活 + 刷新 HUD；
     /// 也是链路上唯一的周期性报文）。
     pub heartbeat_period: Duration,
-    /// 驱动意图超过这么久没有被调用方刷新（[`Car::set_desired`]）→
-    /// 本地改成滑行下发（控制线程卡死的兜底；固件侧没有指令超时）。
+    /// 意图刷新超时（应用安全策略）：调用方这么久没有报活
+    /// （[`Car::refresh_intent`] / [`Car::set_desired`] / [`Car::coast`] /
+    /// [`Car::brake`]）→ 下发 [`CarConfig::fallback`]。控制线程卡死时车不会带着
+    /// 最后一条速度指令跑。
     pub watchdog_timeout: Duration,
-    /// 多久没收到 `Status` 算链路不可用（[`Car::link_ok`] / HUD 判定，不发报文）。
+    /// 意图刷新超时后下发的兜底意图（默认滑行）。
+    pub fallback: Request,
+    /// 多久没收到 `Status` 算链路不可用（[`LinkState::up`] / HUD 判定，不发报文）。
     pub status_timeout: Duration,
 }
 
@@ -56,6 +64,9 @@ impl Default for CarConfig {
             baud: 115_200,
             heartbeat_period: Duration::from_millis(500),
             watchdog_timeout: Duration::from_millis(800),
+            fallback: Request::Stop {
+                target: MotorTarget::Both,
+            },
             status_timeout: Duration::from_millis(1500),
         }
     }
@@ -72,25 +83,19 @@ pub struct Counters {
     pub watchdog_trips: u32,
 }
 
-/// 下位机链路快照（HUD 用）。
+/// 链路状态（类型化快照；表现层自己决定怎么展示）。
 #[derive(Debug, Clone, Default)]
-pub struct LinkSnapshot {
-    /// 最近是否收到过 `Status`（链路可用）。
-    pub link_ok: bool,
+pub struct LinkState {
+    /// 最近是否收到过 `Status`（[`CarConfig::status_timeout`] 内）。
+    pub up: bool,
     /// 最近一次 `Status` 距今的时间。
-    pub link_age: Option<Duration>,
-    /// 固件状态机（`Uninit`/`Ready`/`Running`），无应答为 `None`。
-    pub sys: Option<String>,
-    /// 双轮实测转速（RPM），`[左, 右]`。
-    pub rpm: [i16; 2],
-    /// 固件闭环运动是否运行中。
-    pub dist_active: bool,
-    /// 0 = 无/运行中，1 = 已到达目标。
-    pub dist_result: u8,
+    pub age: Option<Duration>,
+    /// 固件状态快照（无应答为 `None`）。
+    pub status: Option<Status>,
     /// 链路计数。
     pub counters: Counters,
-    /// 最近一帧应答的可读文本。
-    pub last_frame: String,
+    /// 最近一帧可解析的应答（含到达时刻；文本/展示由调用方决定）。
+    pub last_response: Option<(Response, Instant)>,
 }
 
 struct InnerState {
@@ -99,139 +104,92 @@ struct InnerState {
     last_sent: Option<Request>,
     pending: Option<Request>,
     last_heartbeat_at: Instant,
-    last_init_at: Instant,
     status: Option<Status>,
     status_at: Option<Instant>,
     last_ack: Option<(u8, Instant)>,
     last_nack: Option<(u8, u8, Instant)>,
-    last_frame: String,
+    /// 最近一帧可解析的应答（含到达时刻）。
+    last_response: Option<(Response, Instant)>,
     counters: Counters,
 }
 
 struct Inner {
-    file: File,
+    /// 链路层：串口 + 读线程（帧事件回调到 [`Inner::feed`]）。
+    link: Link,
     cfg: CarConfig,
-    running: AtomicBool,
-    write_lock: Mutex<()>,
     state: Mutex<InnerState>,
 }
 
 impl Inner {
-    /// 写一帧到串口（`O_NONBLOCK` 下对 `EAGAIN`/`WouldBlock` 做 50ms 重试）。
+    /// 写一帧到链路（失败计数 + 节流告警）。
     fn send(&self, frame: Frame) -> bool {
-        let _guard = self.write_lock.lock().unwrap();
-        let data = frame.as_bytes();
-        let deadline = Instant::now() + Duration::from_millis(50);
-        let mut file = &self.file;
-        let mut off = 0;
-        let mut failure: Option<String> = None;
-        while off < data.len() {
-            match file.write(&data[off..]) {
-                Ok(0) => {
-                    failure = Some("写入返回 0".to_string());
-                    break;
+        match self.link.write(frame.as_bytes()) {
+            Ok(()) => true,
+            Err(e) => {
+                let mut st = self.state.lock().unwrap();
+                st.counters.write_errors += 1;
+                let n = st.counters.write_errors;
+                drop(st);
+                if n == 1 || n.is_multiple_of(200) {
+                    warn!("串口写入失败（累计 {n} 次）：{e}");
                 }
-                Ok(n) => off += n,
-                Err(e) => {
-                    failure = Some(e.to_string());
-                    match e.kind() {
-                        io::ErrorKind::Interrupted => continue,
-                        io::ErrorKind::WouldBlock => {
-                            if Instant::now() >= deadline {
-                                break;
-                            }
-                            thread::sleep(Duration::from_millis(1));
-                        }
-                        _ => break,
-                    }
-                }
+                false
             }
         }
-        if off == data.len() {
-            return true;
-        }
-        let mut st = self.state.lock().unwrap();
-        st.counters.write_errors += 1;
-        let n = st.counters.write_errors;
-        drop(st);
-        if n == 1 || n.is_multiple_of(200) {
-            warn!(
-                "串口写入失败（累计 {} 次）：{}",
-                n,
-                failure.unwrap_or_else(|| "写入不完整".to_string())
-            );
-        }
-        false
     }
 
-    fn reader_task(self: Arc<Self>) {
-        let mut parser = RxParser::new();
-        let mut buf = [0u8; 128];
-        let mut file = &self.file;
-        while self.running.load(Ordering::Relaxed) {
-            match file.read(&mut buf) {
-                // 读到 0 字节（非阻塞下少见）：歇一下再看退出标志。
-                Ok(0) => thread::sleep(Duration::from_millis(5)),
-                Ok(n) => {
-                    for &byte in &buf[..n] {
-                        match parser.feed(byte) {
-                            RxEvent::Frame { cmd, payload } => {
-                                let text = describe(cmd, payload);
-                                let mut st = self.state.lock().unwrap();
-                                st.last_frame = text;
-                                match Response::decode(cmd, payload) {
-                                    Ok(Response::Ack { cmd }) => {
-                                        st.counters.acks += 1;
-                                        st.last_ack = Some((cmd, Instant::now()));
-                                    }
-                                    Ok(Response::Nack { cmd, error }) => {
-                                        st.counters.nacks += 1;
-                                        st.last_nack = Some((cmd, error.as_u8(), Instant::now()));
-                                    }
-                                    Ok(Response::Status(status)) => {
-                                        st.status = Some(status);
-                                        st.status_at = Some(Instant::now());
-                                    }
-                                    // PidData 只用于调试；无法解码的应答（未知应答号/长度不符）忽略。
-                                    Ok(Response::PidData(_)) | Err(_) => {}
-                                }
-                            }
-                            RxEvent::ChecksumFail { .. } => {
-                                self.state.lock().unwrap().counters.checksum_fails += 1;
-                            }
-                            RxEvent::TooLong { .. } | RxEvent::None => {}
-                        }
+    /// 处理链路事件：帧 → 类型化状态；校验失败只计数。
+    fn feed(&self, event: RxEvent<'_>) {
+        match event {
+            RxEvent::Frame { cmd, payload } => {
+                // 协议是闭合的：未知应答号/长度不符直接忽略（校验错另有计数）。
+                let Ok(response) = Response::decode(cmd, payload) else {
+                    return;
+                };
+                let now = Instant::now();
+                let mut st = self.state.lock().unwrap();
+                st.last_response = Some((response, now));
+                match response {
+                    Response::Ack { cmd } => {
+                        st.counters.acks += 1;
+                        st.last_ack = Some((cmd, now));
                     }
+                    Response::Nack { cmd, error } => {
+                        st.counters.nacks += 1;
+                        st.last_nack = Some((cmd, error.as_u8(), now));
+                    }
+                    Response::Status(status) => {
+                        st.status = Some(status);
+                        st.status_at = Some(now);
+                    }
+                    // PidData 只用于调试。
+                    Response::PidData(_) => {}
                 }
-                Err(e) => match e.kind() {
-                    io::ErrorKind::Interrupted => {}
-                    // Linux 上 EWOULDBLOCK == EAGAIN
-                    io::ErrorKind::WouldBlock => thread::sleep(Duration::from_millis(5)),
-                    // 设备拔出/异常：慢速重试，避免刷屏。
-                    _ => thread::sleep(Duration::from_millis(50)),
-                },
             }
+            RxEvent::ChecksumFail { .. } => {
+                self.state.lock().unwrap().counters.checksum_fails += 1;
+            }
+            RxEvent::TooLong { .. } | RxEvent::None => {}
         }
     }
 
     fn writer_task(self: Arc<Self>) {
-        while self.running.load(Ordering::Relaxed) {
-            // 1) 看门狗：驱动意图长时间没有被刷新 -> 改成滑行（下面统一下发）。
+        while self.link.running().load(Ordering::Relaxed) {
+            // 1) 死手开关：应用这么久没刷新意图（`set_desired`/`coast`/`brake`）
+            //    -> 下发兜底意图（下面统一下发）。传输层不解释意图语义。
             let watchdog = {
                 let mut st = self.state.lock().unwrap();
-                let stale = matches!(st.desired, Request::SetSpeeds { .. })
+                let stale = st.desired != self.cfg.fallback
                     && st.desired_at.elapsed() > self.cfg.watchdog_timeout;
                 if stale {
-                    st.desired = Request::Stop {
-                        target: MotorTarget::Both,
-                    };
+                    st.desired = self.cfg.fallback;
                     st.desired_at = Instant::now();
                     st.counters.watchdog_trips += 1;
                 }
                 stale
             };
             if watchdog {
-                warn!("看门狗：驱动意图超时未刷新，滑行停车");
+                warn!("看门狗：意图超时未刷新，下发兜底意图");
             }
 
             // 2) 控制面请求（Init/Reset）优先发。
@@ -266,34 +224,6 @@ impl Inner {
     }
 }
 
-/// 一帧应答的可读文本（HUD/日志用）。
-fn describe(cmd: u8, payload: &[u8]) -> String {
-    match Response::decode(cmd, payload) {
-        Ok(Response::Ack { cmd }) => format!("ACK {}", request_name(cmd)),
-        Ok(Response::Nack { cmd, error }) => format!("NACK {} {error}", request_name(cmd)),
-        Ok(Response::Status(status)) => format!(
-            "Status {} rpm=({}, {}) dist_active={} dist_result={}",
-            status.sys, status.rpm[0], status.rpm[1], status.dist_active as u8, status.dist_result
-        ),
-        Ok(Response::PidData(pid)) => format!(
-            "PidData kp={:.2} ki={:.2} kd={:.2}",
-            pid.kp as f32 / 100.0,
-            pid.ki as f32 / 100.0,
-            pid.kd as f32 / 100.0
-        ),
-        Err(_) => payload
-            .iter()
-            .map(|b| format!("{:02X}", b))
-            .collect::<Vec<_>>()
-            .join(" "),
-    }
-}
-
-/// 回显命令号的可读名字。
-fn request_name(cmd: u8) -> String {
-    RequestType::from_u8(cmd).map_or_else(|| format!("0x{cmd:02X}"), |c| c.to_string())
-}
-
 /// 与下位机的链路句柄；`Drop` 时自动滑行停车并退出线程。
 ///
 /// 收/发线程在内部，句柄本身是 `Sync` 的：可以放进 `Arc` 供网页服务等多线程
@@ -306,13 +236,11 @@ pub struct Car {
 impl Car {
     /// 打开串口并启动收发线程。打开失败直接返回错误（上位机启动时应当报错退出）。
     pub fn open(cfg: CarConfig) -> io::Result<Self> {
-        let file = serial::open(&cfg.port, cfg.baud)?;
+        let link = Link::open(&cfg.port, cfg.baud)?;
         let now = Instant::now();
         let inner = Arc::new(Inner {
-            file,
+            link,
             cfg,
-            running: AtomicBool::new(true),
-            write_lock: Mutex::new(()),
             state: Mutex::new(InnerState {
                 pending: None,
                 desired: Request::Stop {
@@ -321,28 +249,35 @@ impl Car {
                 desired_at: now,
                 last_sent: None,
                 last_heartbeat_at: now.checked_sub(Duration::from_secs(1)).unwrap_or(now),
-                last_init_at: now,
                 status: None,
                 status_at: None,
                 last_ack: None,
                 last_nack: None,
-                last_frame: String::from("(尚未收到应答)"),
+                last_response: None,
                 counters: Counters::default(),
             }),
         });
-        let mut threads = Vec::with_capacity(2);
-        threads.push({
+        // 读线程在链路层：解析出的事件回调到状态机（链路只管字节/帧）
+        inner.link.spawn_reader({
             let inner = Arc::clone(&inner);
-            thread::spawn(move || inner.reader_task())
+            move |event| inner.feed(event)
         });
-        threads.push({
+        // 写线程在传输层：意图/心跳/死手开关的节奏由它掌握
+        let writer = {
             let inner = Arc::clone(&inner);
             thread::spawn(move || inner.writer_task())
-        });
+        };
         Ok(Self {
             inner,
-            threads: Mutex::new(threads),
+            threads: Mutex::new(vec![writer]),
         })
+    }
+
+    /// 刷新意图时间戳（死手开关）：应用**每个控制节拍**都应调用——即使这一拍
+    /// 不改变意图（比如锁存制动期间返回 `Output::Hold`）。停止调用
+    /// [`CarConfig::watchdog_timeout`] 之后，下发线程会切到 [`CarConfig::fallback`]。
+    pub fn refresh_intent(&self) {
+        self.inner.state.lock().unwrap().desired_at = Instant::now();
     }
 
     /// 表达双轮速度意图（`-100..100`）；由下发线程在变化时下发。
@@ -372,9 +307,7 @@ impl Car {
 
     /// 请求 `Init`（编码器清零 + 进入 `Ready`）；由下发线程发出。
     pub fn init(&self) {
-        let mut st = self.inner.state.lock().unwrap();
-        st.last_init_at = Instant::now();
-        st.pending = Some(Request::Init);
+        self.inner.state.lock().unwrap().pending = Some(Request::Init);
     }
 
     /// 请求 `Reset`（回 Uninit，未初始化状态下电机滑行）；由下发线程发出。
@@ -382,49 +315,17 @@ impl Car {
         self.inner.state.lock().unwrap().pending = Some(Request::Reset);
     }
 
-    /// 最近一次 `Status`。
-    pub fn status(&self) -> Option<Status> {
-        self.inner.state.lock().unwrap().status
-    }
-
-    /// 链路是否可用：最近 [`CarConfig::status_timeout`] 内收到过 `Status`。
-    pub fn link_ok(&self) -> bool {
+    /// 当前链路状态（一次锁拿到全部；HUD 与应用策略共用）。
+    pub fn state(&self) -> LinkState {
         let st = self.inner.state.lock().unwrap();
-        st.status_at
-            .is_some_and(|at| at.elapsed() < self.inner.cfg.status_timeout)
-    }
-
-    /// 最近一次收到 `Status` 距今的时间。
-    pub fn link_age(&self) -> Option<Duration> {
-        self.inner
-            .state
-            .lock()
-            .unwrap()
-            .status_at
-            .map(|at| at.elapsed())
-    }
-
-    pub fn counters(&self) -> Counters {
-        self.inner.state.lock().unwrap().counters
-    }
-
-    /// 最近一帧应答的可读文本（HUD 用）。
-    pub fn last_frame(&self) -> String {
-        self.inner.state.lock().unwrap().last_frame.clone()
-    }
-
-    /// 当前链路快照（HUD 用；一次锁拿到全部）。
-    pub fn snapshot(&self) -> LinkSnapshot {
-        let status = self.status();
-        LinkSnapshot {
-            link_ok: self.link_ok(),
-            link_age: self.link_age(),
-            sys: status.map(|s| s.sys.to_string()),
-            rpm: status.map_or([0, 0], |s| s.rpm),
-            dist_active: status.is_some_and(|s| s.dist_active),
-            dist_result: status.map_or(0, |s| s.dist_result),
-            counters: self.counters(),
-            last_frame: self.last_frame(),
+        LinkState {
+            up: st
+                .status_at
+                .is_some_and(|at| at.elapsed() < self.inner.cfg.status_timeout),
+            age: st.status_at.map(|at| at.elapsed()),
+            status: st.status,
+            counters: st.counters,
+            last_response: st.last_response,
         }
     }
 
@@ -464,35 +365,15 @@ impl Car {
         }
     }
 
-    /// 向下位机“补初始化”：处于 Uninit 或最近因状态不对被 NACK 时请求
-    /// `Init`（限频 1Hz，由下发线程发出）。
-    pub fn maybe_reinit(&self) {
-        let mut st = self.inner.state.lock().unwrap();
-        if st.last_init_at.elapsed() < Duration::from_secs(1) {
-            return;
-        }
-        let uninit = st.status.map(|s| s.sys) == Some(SysState::Uninit);
-        let wrong_state = matches!(
-            st.last_nack,
-            Some((cmd, err, at))
-                if cmd == RequestType::SetSpeeds.as_u8()
-                    && err == ErrorCode::WrongState.as_u8()
-                    && at.elapsed() < Duration::from_secs(2)
-        );
-        if uninit || wrong_state {
-            st.last_init_at = Instant::now();
-            st.pending = Some(Request::Init);
-        }
-    }
-
     /// 停车并退出收发线程；幂等（多线程同时调用也只执行一次），`Drop` 会自动调用。
     pub fn shutdown(&self) {
-        if self.inner.running.swap(false, Ordering::SeqCst) {
+        if self.inner.link.running().swap(false, Ordering::SeqCst) {
             // 直接补一帧 Stop（滑行），不依赖下发线程的时序。
             self.inner.send(frame_of(Request::Stop {
                 target: MotorTarget::Both,
             }));
         }
+        self.inner.link.stop(); // 读线程（链路层）先收
         let mut threads = self.threads.lock().unwrap();
         for handle in threads.drain(..) {
             crate::join_with_timeout(handle, "链路");
@@ -509,8 +390,9 @@ impl Drop for Car {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::control::protocol::ResponseType;
+    use crate::control::protocol::{ResponseType, RxParser};
     use std::ffi::CStr;
+    use std::fs::File;
     use std::os::unix::io::{AsRawFd, FromRawFd};
 
     /// 用 PTY 模拟 ESP32-C3：测试持 master 侧，Car 用 slave 侧。
@@ -636,11 +518,26 @@ mod tests {
             ],
         );
         thread::sleep(Duration::from_millis(100));
-        assert!(car.link_ok());
-        let st = car.status().unwrap();
+        let state = car.state();
+        assert!(state.up);
+        let st = state.status.unwrap();
         assert_eq!(st.rpm, [11, -11]);
         assert_eq!(st.sys, SysState::Running);
-        assert!(car.last_frame().contains("Status Running"));
+        assert!(
+            state
+                .last_response
+                .unwrap()
+                .0
+                .to_string()
+                .contains("Status Running")
+        );
+
+        // 只报活、不改变意图（`Output::Hold` 的情形）→ 死手开关不触发
+        for _ in 0..6 {
+            thread::sleep(Duration::from_millis(40));
+            car.refresh_intent();
+        }
+        assert_eq!(car.state().counters.watchdog_trips, 0);
 
         // 心跳：应当过一段时间出现 Heartbeat 帧
         assert_eq!(
@@ -657,10 +554,10 @@ mod tests {
             read_until(&master, RequestType::Stop.as_u8(), Duration::from_secs(1)),
             Some(vec![MotorTarget::Both.as_u8()])
         );
-        assert!(car.counters().watchdog_trips >= 1);
+        assert!(car.state().counters.watchdog_trips >= 1);
         // 停车后不会再触发看门狗（意图已经是 Stop）
         thread::sleep(Duration::from_millis(80));
-        assert_eq!(car.counters().watchdog_trips, 1);
+        assert_eq!(car.state().counters.watchdog_trips, 1);
 
         car.shutdown();
     }
@@ -677,8 +574,8 @@ mod tests {
         };
         let car = Car::open(cfg).expect("打开 PTY slave 失败");
         assert!(!car.ensure_ready(Duration::from_millis(250)));
-        assert!(!car.link_ok());
-        assert!(car.counters().write_errors == 0);
+        assert!(!car.state().up);
+        assert!(car.state().counters.write_errors == 0);
         car.shutdown();
     }
 }

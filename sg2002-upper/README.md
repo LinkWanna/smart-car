@@ -19,7 +19,8 @@ SMARTCAR_LOG=warn,hwjpeg=debug ./smartcar --bind 192.168.1.2  # 默认 warn，�
   需要限速时用 `--video-fps N`）。
 
 网页侧的 JPEG 也不再被客户端心跳卡住：WebSocket 会话每轮跑 90ms 的推送窗口
-（`PUSH_WINDOW`，5ms 粒度查新帧），页面 100ms 的按键心跳只负责按键看门狗。
+（`PUSH_WINDOW`，5ms 粒度查新帧）；**上行（按键/动作/模式）走 HTTP**，由线程池
+即时处理，不受推送窗口与"每轮读一条消息"的限制（WS 每 100ms 的 ping 只当推送时钟）。
 
 VPSS 建组失败 / 组号用尽 / 模型输入尺寸不匹配 → 自动回退 `--vpss off`（CPU 路径）。
 

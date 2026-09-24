@@ -18,10 +18,10 @@ use std::time::{Duration, Instant};
 use log::info;
 
 use crate::preview::{DetectionFrame, PreviewSource};
+use crate::transport::car::{Car, LinkState};
+use crate::transport::protocol::{ErrorCode, RequestType, Response, SysState};
 
-use super::car::{Car, LinkState};
 use super::position::{Observation, PositionAnalyzer};
-use super::protocol::{ErrorCode, RequestType, Response, SysState};
 use super::servo::{Action as ServoAction, ControlConfig, ControlLoop};
 use super::teleop::{Action, Hud, Keys, Output, Teleop, TeleopConfig};
 
@@ -311,12 +311,8 @@ fn apply(target: &Car, out: Output) {
         Output::Coast => target.coast(),
         Output::Brake => target.brake(),
         Output::Hold => {}
-        Output::Init => {
-            target.init();
-        }
-        Output::Reset => {
-            target.reset();
-        }
+        Output::Init => target.init(),
+        Output::Reset => target.reset(),
     }
 }
 

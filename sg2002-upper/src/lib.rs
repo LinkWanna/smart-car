@@ -5,10 +5,11 @@
 //!   的像素工作流）、`yolo`（TPU 零拷贝推理 + NMS）、`vision`（视觉域：单帧核心 +
 //!   两条管线 —— CPU `cpu` 与 VPSS 硬件 `vpss`，共用线程状态与同帧预览契约；
 //!   只输出检测框，不做位置/追踪语义）；
-//! - 下位机通信与控制：`control`（`protocol` 线协议——与固件共用的
-//!   `protocol` crate、`link` 串口链路（字节流）、`car` 传输层（协议对话 +
-//!   心跳/死手开关）、
-//!   `position` 位置/距离分级（追踪侧语义）、`servo` 视觉伺服控制律）。
+//! - 下位机通信：`transport`（`protocol` 线协议——与固件共用的 `protocol`
+//!   crate、`link` 串口链路（字节流）、`car` 传输层（协议对话 + 心跳/死手
+//!   开关））；
+//! - 控制：`control`（`position` 位置/距离分级（追踪侧语义）、`servo` 视觉
+//!   伺服控制律、`teleop` 手动遥控控制律、`session` 控制节拍 + 手动/自动仲裁）。
 //! - 网页遥控：`web`（零依赖 HTTP/WebSocket、手动遥控控制律、MJPEG 预览、
 //!   手动/自动仲裁）、`preview`（预览与视觉之间的中性契约）。
 //! - 观测：`logging`（`log` + `simple_logger` 初始化）。
@@ -29,7 +30,7 @@
 //!
 //! | 组件 | 线程 | 停止 |
 //! | --- | --- | --- |
-//! | [`control::Car`] | 串口收 + 发 | `Car::shutdown`（`Drop` 兜底） |
+//! | [`transport::Car`] | 串口收 + 发 | `Car::shutdown`（`Drop` 兜底） |
 //! | [`control::ControlSession`] | 控制节拍 | `ControlSession::stop` |
 //! | [`vision::VisionStream`] | 采集/推理 + 预览编码 | `stop`（`Drop` 兜底） |
 //! | [`vision::VpssStream`] | 单线程管线 | `stop`（`Drop` 兜底） |
@@ -63,6 +64,7 @@ pub mod hwjpeg;
 pub mod logging;
 pub mod preprocess;
 pub mod preview;
+pub mod transport;
 pub mod vision;
 pub mod web;
 pub mod yolo;

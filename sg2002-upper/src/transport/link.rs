@@ -1,16 +1,4 @@
-//! 链路层：串口字节流（打开、termios 配置、非阻塞读写、读线程）。
-//!
-//! 只管搬字节/帧：不认识 `Request`/`Response` 的语义，也不做策略——重试节奏、
-//! 心跳、看门狗都在传输层（见 [`super::car`]）。
-//!
-//! - 读线程把 [`RxParser`] 解析出的事件回调给调用方（传输层的状态机）；
-//! - 写侧由 [`Link::write`] 串行化，`O_NONBLOCK` 下的 `WouldBlock` 在内部重试。
-//!
-//! 板端（StarryOS）对 termios 的支持不保证完整，所以配置策略是：
-//! - 打开 `/dev/ttyS1` 后尽力设置为 raw + 波特率；
-//! - `tcgetattr`/`tcsetattr` 失败不致命（板端串口可能已由内核/启动脚本配好），
-//!   只留下日志警告；
-//! - `O_NONBLOCK` 用于读线程（见 [`Link::open`]）。
+//! 链路层：串口字节流（打开、termios 配置、非阻塞读写、读线程）
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};

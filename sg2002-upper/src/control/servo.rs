@@ -1,25 +1,4 @@
-//! 视觉伺服控制律：检测结果 -> 左右轮速度（ESP32-C3 `SetSpeeds`）。
-//!
-//! 与 `sg2002_inference` 的“离散命令字符串”（FORWARD/TURN_LEFT/...）不同，
-//! 这里输出连续差速：
-//!
-//! ```text
-//! 基础速度 base = far_speed / mid_speed        （near 直接刹车）
-//! 差速     turn = turn_gain × err_x × base      （带中心死区与最小差速）
-//! 左轮     left  = clamp(base + turn)
-//! 右轮     right = clamp(base - turn)
-//! ```
-//!
-//! 其中 `err_x = (中心x / 画面宽 - 0.5) × 2`，目标在右侧为正；右偏时左轮
-//! 加速、右轮减速（`left > right`）实现右转，`err_x` 大到使内轮反转时自然
-//! 变成原地转向。
-//!
-//! 目标丢失：先按 [`ControlConfig::lost_hold`] 保持上一动作（避免单帧漏检
-//! 造成抖停），随后原地旋转搜索；搜索方向优先延续目标最后出现的方向，每
-//! [`ControlConfig::search_flip`] 换一次向。
-//!
-//! 本模块只做决策，不碰串口：输出 [`Action`] 由调用方落地成小车指令，
-//! 因此可以在主机上 `cargo test --lib` 单独验证。
+//! 视觉伺服控制律：检测结果 -> 左右轮速度（ESP32-C3 `SetSpeeds`）
 
 use std::fmt;
 use std::time::{Duration, Instant};

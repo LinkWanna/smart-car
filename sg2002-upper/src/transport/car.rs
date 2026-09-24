@@ -5,7 +5,7 @@
 //!
 //! 分层：串口字节流在 `super::link`（链路层，只搬字节/帧）；协议编解码与
 //! 消息类型在 `protocol` crate；**应用策略**（什么时候补 `Init`、模式仲裁、
-//! 控制律）在 [`super::session`]，本模块不解释业务语义。
+//! 控制律）在 [`crate::control::session`]，本模块不解释业务语义。
 //!
 //! 线程模型：
 //! - 主线程（视觉管线）只调用 [`Car::set_desired`] / [`Car::brake`] /
@@ -17,10 +17,6 @@
 //!   调用方报活（[`Car::refresh_intent`] 等）时下发 [`CarConfig::fallback`]
 //!   （死手开关，不解释意图语义）；
 //! - 读线程在链路层：帧解析后回调到状态机，把 ACK/NACK/Status 归入类型化状态。
-//!
-//! 说明：ESP32-C3 固件的 700ms 指令超时只在 BLE 已连接时生效，UART 链路
-//! 由上位机负责看门狗；进程退出（含 panic 展开）时 [`Drop`] 会补一帧
-//! `Stop`，被 SIGKILL 则没有机会发送。
 
 use std::io;
 use std::sync::atomic::Ordering;
@@ -31,7 +27,9 @@ use std::time::{Duration, Instant};
 use log::warn;
 
 use super::link::Link;
-use super::protocol::{Frame, MotorTarget, Request, RequestType, Response, RxEvent, Status, SysState};
+use super::protocol::{
+    Frame, MotorTarget, Request, RequestType, Response, RxEvent, Status, SysState,
+};
 
 /// 这些请求的负载固定，组帧不可能失败。
 fn frame_of(request: Request) -> Frame {
@@ -43,13 +41,7 @@ fn frame_of(request: Request) -> Frame {
 pub struct CarConfig {
     pub port: String,
     pub baud: u32,
-    /// 心跳周期：周期发 `Heartbeat` 轮询 `Status`（探活 + 刷新 HUD；
-    /// 也是链路上唯一的周期性报文）。
     pub heartbeat_period: Duration,
-    /// 意图刷新超时（应用安全策略）：调用方这么久没有报活
-    /// （[`Car::refresh_intent`] / [`Car::set_desired`] / [`Car::coast`] /
-    /// [`Car::brake`]）→ 下发 [`CarConfig::fallback`]。控制线程卡死时车不会带着
-    /// 最后一条速度指令跑。
     pub watchdog_timeout: Duration,
     /// 意图刷新超时后下发的兜底意图（默认滑行）。
     pub fallback: Request,
@@ -390,7 +382,7 @@ impl Drop for Car {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::control::protocol::{ResponseType, RxParser};
+    use crate::transport::protocol::{ResponseType, RxParser};
     use std::ffi::CStr;
     use std::fs::File;
     use std::os::unix::io::{AsRawFd, FromRawFd};

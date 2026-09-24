@@ -26,7 +26,7 @@
 //! 浏览器每 100ms 发一次完整按键快照（变化时立即发），服务端
 //! [`TeleopConfig::input_timeout`](crate::control::TeleopConfig::input_timeout)
 //! 收不到就松开所有键；WebSocket 断开时只清理该客户端的按键；模式切换、控制
-//! 线程退出前都会滑行停车，[`Car`](crate::control::Car) 自己的看门狗与 `Drop`
+//! 线程退出前都会滑行停车，[`Car`](crate::transport::Car) 自己的看门狗与 `Drop`
 //! 再兜底一层；自动模式下视觉观测过期（>500ms）按“看不到”处理并滑行。
 
 mod server;

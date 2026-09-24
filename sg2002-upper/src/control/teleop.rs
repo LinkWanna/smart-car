@@ -1,20 +1,4 @@
-//! 手动遥控控制律：按键快照 -> 左右轮速度（`esp32c3-smart-car/tools/play.py`
-//! 的等价实现）。
-//!
-//! 驾驶手感与 play.py 一致：
-//!
-//! - W/S 把油门斜坡推向 `max_speed` / `-max_reverse`；反向时先用 `brake_rate`
-//!   刹停再反向，松开所有油门键按 `decay_rate` 衰减到 0；
-//! - A/D 把转向以 `steer_rate`（每秒）推向 ±1，正 = 左转；
-//! - 油门绝对值小于 [`PIVOT_THRESHOLD`] 时两轮反向旋转（原地转向），否则按
-//!   `turn_gain × |油门| / max_speed` 做差速；
-//! - 超过 [`TeleopConfig::input_timeout`] 没有收到按键快照（浏览器卡死/断网）
-//!   就当作全部松开，让车自己停下来；
-//! - 制动/复位动作会把输出锁存（`Latch`），直到有新按键或 Init。
-//!
-//! 本模块只做决策，不碰链路：输出 [`Output`] 由 [`crate::control::session`]
-//! 落地成 [`Car`](crate::control::Car) 调用，因此可以在主机上
-//! 单独测试。
+//! 手动遥控控制律：按键快照 -> 左右轮速度
 
 use std::fmt;
 use std::time::{Duration, Instant};

@@ -489,7 +489,8 @@ fn send_json(socket: &mut Websocket, value: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::control::{Car, CarConfig, ControlSession, TeleopConfig};
+    use crate::control::{ControlSession, TeleopConfig};
+    use crate::transport::{Car, CarConfig};
     use crate::yolo::Detection;
     use std::ffi::CStr;
     use std::fs::File;

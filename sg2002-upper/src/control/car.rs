@@ -14,8 +14,7 @@
 //! `Stop`，被 SIGKILL 则没有机会发送。
 
 use std::fs::File;
-use std::io;
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::io::{self, Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -37,19 +36,12 @@ fn frame_of(request: Request) -> Frame {
 /// 链路配置。
 #[derive(Debug, Clone)]
 pub struct CarConfig {
-    /// 串口设备（SG2002 侧接 ESP32-C3 UART0）。
     pub port: String,
-    /// 波特率（与固件一致：115200）。
     pub baud: u32,
-    /// 心跳周期，用于轮询 [`Status`]（同时兼作 BLE 侧的看门狗喂狗）。
     pub heartbeat_period: Duration,
-    /// `Drive` 意图无变化时的重发周期（UART 丢帧兜底）。
     pub drive_refresh: Duration,
-    /// `Coast`/`Brake` 意图无变化时的重发周期。
     pub hold_refresh: Duration,
-    /// 主线程停止刷新 `Drive` 意图多久后强制滑行停车。
     pub watchdog_timeout: Duration,
-    /// 多久没有收到 `Status` 就认为链路不可用（仅用于上报，不停车）。
     pub status_timeout: Duration,
 }
 
@@ -124,7 +116,7 @@ pub struct LinkSnapshot {
     pub last_frame: String,
 }
 
-struct CarState {
+struct InnerState {
     /// manual 模式：下发线程完全放手，只允许 [`Car::send_frame`] 直接发。
     manual: bool,
     desired: Desired,
@@ -142,46 +134,42 @@ struct CarState {
 }
 
 struct Inner {
-    _file: File,
-    fd: RawFd,
+    file: File,
     cfg: CarConfig,
     running: AtomicBool,
     write_lock: Mutex<()>,
-    state: Mutex<CarState>,
+    state: Mutex<InnerState>,
 }
 
 impl Inner {
-    /// 写一帧到串口（`O_NONBLOCK` 下对 `EAGAIN` 做 50ms 重试）。
+    /// 写一帧到串口（`O_NONBLOCK` 下对 `EAGAIN`/`WouldBlock` 做 50ms 重试）。
     fn send(&self, frame: Frame) -> bool {
         let _guard = self.write_lock.lock().unwrap();
         let data = frame.as_bytes();
         let deadline = Instant::now() + Duration::from_millis(50);
+        let mut file = &self.file;
         let mut off = 0;
         let mut failure: Option<String> = None;
         while off < data.len() {
-            let n = unsafe {
-                libc::write(
-                    self.fd,
-                    data[off..].as_ptr() as *const libc::c_void,
-                    data.len() - off,
-                )
-            };
-            if n > 0 {
-                off += n as usize;
-                continue;
-            }
-            let err = io::Error::last_os_error();
-            failure = Some(err.to_string());
-            match err.raw_os_error() {
-                Some(libc::EINTR) => continue,
-                // Linux 上 EWOULDBLOCK == EAGAIN
-                Some(libc::EAGAIN) => {
-                    if Instant::now() >= deadline {
-                        break;
-                    }
-                    thread::sleep(Duration::from_millis(1));
+            match file.write(&data[off..]) {
+                Ok(0) => {
+                    failure = Some("写入返回 0".to_string());
+                    break;
                 }
-                _ => break,
+                Ok(n) => off += n,
+                Err(e) => {
+                    failure = Some(e.to_string());
+                    match e.kind() {
+                        io::ErrorKind::Interrupted => continue,
+                        io::ErrorKind::WouldBlock => {
+                            if Instant::now() >= deadline {
+                                break;
+                            }
+                            thread::sleep(Duration::from_millis(1));
+                        }
+                        _ => break,
+                    }
+                }
             }
         }
         if off == data.len() {
@@ -201,34 +189,115 @@ impl Inner {
         false
     }
 
-    /// 解析一帧应答并更新共享状态。
-    fn feed(&self, b: u8, parser: &mut RxParser) {
-        match parser.feed(b) {
-            RxEvent::Frame { cmd, payload } => {
-                let text = describe(cmd, payload);
-                let mut st = self.state.lock().unwrap();
-                st.last_frame = text;
-                match Response::decode(cmd, payload) {
-                    Ok(Response::Ack { cmd }) => {
-                        st.counters.acks += 1;
-                        st.last_ack = Some((cmd, Instant::now()));
+    fn reader_task(self: Arc<Self>) {
+        let mut parser = RxParser::new();
+        let mut buf = [0u8; 128];
+        let mut file = &self.file;
+        while self.running.load(Ordering::Relaxed) {
+            match file.read(&mut buf) {
+                // 读到 0 字节（非阻塞下少见）：歇一下再看退出标志。
+                Ok(0) => thread::sleep(Duration::from_millis(5)),
+                Ok(n) => {
+                    for &byte in &buf[..n] {
+                        match parser.feed(byte) {
+                            RxEvent::Frame { cmd, payload } => {
+                                let text = describe(cmd, payload);
+                                let mut st = self.state.lock().unwrap();
+                                st.last_frame = text;
+                                match Response::decode(cmd, payload) {
+                                    Ok(Response::Ack { cmd }) => {
+                                        st.counters.acks += 1;
+                                        st.last_ack = Some((cmd, Instant::now()));
+                                    }
+                                    Ok(Response::Nack { cmd, error }) => {
+                                        st.counters.nacks += 1;
+                                        st.last_nack = Some((cmd, error.as_u8(), Instant::now()));
+                                    }
+                                    Ok(Response::Status(status)) => {
+                                        st.status = Some(status);
+                                        st.status_at = Some(Instant::now());
+                                    }
+                                    // PidData 只用于调试；无法解码的应答（未知应答号/长度不符）忽略。
+                                    Ok(Response::PidData(_)) | Err(_) => {}
+                                }
+                            }
+                            RxEvent::ChecksumFail { .. } => {
+                                self.state.lock().unwrap().counters.checksum_fails += 1;
+                            }
+                            RxEvent::TooLong { .. } | RxEvent::None => {}
+                        }
                     }
-                    Ok(Response::Nack { cmd, error }) => {
-                        st.counters.nacks += 1;
-                        st.last_nack = Some((cmd, error.as_u8(), Instant::now()));
-                    }
-                    Ok(Response::Status(status)) => {
-                        st.status = Some(status);
-                        st.status_at = Some(Instant::now());
-                    }
-                    // PidData 只用于调试；无法解码的应答（未知应答号/长度不符）忽略。
-                    Ok(Response::PidData(_)) | Err(_) => {}
                 }
+                Err(e) => match e.kind() {
+                    io::ErrorKind::Interrupted => {}
+                    // Linux 上 EWOULDBLOCK == EAGAIN
+                    io::ErrorKind::WouldBlock => thread::sleep(Duration::from_millis(5)),
+                    // 设备拔出/异常：慢速重试，避免刷屏。
+                    _ => thread::sleep(Duration::from_millis(50)),
+                },
             }
-            RxEvent::ChecksumFail { .. } => {
-                self.state.lock().unwrap().counters.checksum_fails += 1;
+        }
+    }
+
+    fn writer_task(self: Arc<Self>) {
+        while self.running.load(Ordering::Relaxed) {
+            // 0) manual 模式：固件闭环动作（Move/Rotate）由调用方直接发帧，
+            //    下发线程不碰串口，避免周期性 Stop 打断闭环。
+            if self.state.lock().unwrap().manual {
+                thread::sleep(Duration::from_millis(25));
+                continue;
             }
-            RxEvent::TooLong { .. } | RxEvent::None => {}
+
+            // 1) 看门狗：Drive 意图长时间没有被刷新 -> 改成 Coast（下面统一下发）。
+            let watchdog = {
+                let mut st = self.state.lock().unwrap();
+                let stale = matches!(st.desired, Desired::Drive(..))
+                    && st.desired_at.elapsed() > self.cfg.watchdog_timeout;
+                if stale {
+                    st.desired = Desired::Coast;
+                    st.desired_at = Instant::now();
+                    st.counters.watchdog_trips += 1;
+                }
+                stale
+            };
+            if watchdog {
+                warn!("看门狗：Drive 意图超时未刷新，滑行停车");
+            }
+
+            // 2) 变化立即发；否则 Drive 200ms、Coast/Brake 1s 重发一次。
+            let pending = {
+                let st = self.state.lock().unwrap();
+                let changed = st.last_sent != Some(st.desired);
+                let period = match st.desired {
+                    Desired::Drive(..) => self.cfg.drive_refresh,
+                    _ => self.cfg.hold_refresh,
+                };
+                if changed || st.last_sent_at.elapsed() >= period {
+                    Some(st.desired)
+                } else {
+                    None
+                }
+            };
+            if let Some(desired) = pending
+                && self.send(desired.frame())
+            {
+                let mut st = self.state.lock().unwrap();
+                st.last_sent = Some(desired);
+                st.last_sent_at = Instant::now();
+            }
+
+            // 3) 自动心跳：Status 轮询不依赖视觉管线是否卡顿。
+            let heartbeat_due = {
+                let st = self.state.lock().unwrap();
+                st.last_heartbeat_at.elapsed() >= self.cfg.heartbeat_period
+            };
+            if heartbeat_due {
+                self.send(frame_of(Request::Heartbeat));
+                let mut st = self.state.lock().unwrap();
+                st.last_heartbeat_at = Instant::now();
+            }
+
+            thread::sleep(Duration::from_millis(25));
         }
     }
 }
@@ -265,100 +334,6 @@ fn hex(payload: &[u8]) -> String {
         .join(" ")
 }
 
-/// 收帧线程：`O_NONBLOCK` 轮询，5ms 一个周期检查退出标志。
-fn reader_loop(inner: Arc<Inner>) {
-    let mut parser = RxParser::new();
-    let mut buf = [0u8; 128];
-    while inner.running.load(Ordering::Relaxed) {
-        let n = unsafe { libc::read(inner.fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-        if n > 0 {
-            for &b in &buf[..n as usize] {
-                inner.feed(b, &mut parser);
-            }
-        } else if n == 0 {
-            thread::sleep(Duration::from_millis(5));
-        } else {
-            let err = io::Error::last_os_error();
-            match err.raw_os_error() {
-                Some(libc::EINTR) => {}
-                // Linux 上 EWOULDBLOCK == EAGAIN
-                Some(libc::EAGAIN) => {
-                    thread::sleep(Duration::from_millis(5));
-                }
-                // 设备拔出/异常：慢速重试，避免刷屏。
-                _ => thread::sleep(Duration::from_millis(50)),
-            }
-        }
-    }
-}
-
-/// 下发线程：看门狗 + 意图重发。
-fn writer_loop(inner: Arc<Inner>) {
-    loop {
-        if !inner.running.load(Ordering::Relaxed) {
-            break;
-        }
-
-        // 0) manual 模式：固件闭环动作（Move/Rotate）由调用方直接发帧，
-        //    下发线程不碰串口，避免周期性 Stop 打断闭环。
-        if inner.state.lock().unwrap().manual {
-            thread::sleep(Duration::from_millis(25));
-            continue;
-        }
-
-        // 1) 看门狗：Drive 意图长时间没有被刷新 -> 改成 Coast（下面统一下发）。
-        let watchdog = {
-            let mut st = inner.state.lock().unwrap();
-            let stale = matches!(st.desired, Desired::Drive(..))
-                && st.desired_at.elapsed() > inner.cfg.watchdog_timeout;
-            if stale {
-                st.desired = Desired::Coast;
-                st.desired_at = Instant::now();
-                st.counters.watchdog_trips += 1;
-            }
-            stale
-        };
-        if watchdog {
-            warn!("看门狗：Drive 意图超时未刷新，滑行停车");
-        }
-
-        // 2) 变化立即发；否则 Drive 200ms、Coast/Brake 1s 重发一次。
-        let pending = {
-            let st = inner.state.lock().unwrap();
-            let changed = st.last_sent != Some(st.desired);
-            let period = match st.desired {
-                Desired::Drive(..) => inner.cfg.drive_refresh,
-                _ => inner.cfg.hold_refresh,
-            };
-            if changed || st.last_sent_at.elapsed() >= period {
-                Some(st.desired)
-            } else {
-                None
-            }
-        };
-        if let Some(desired) = pending
-            && inner.send(desired.frame())
-        {
-            let mut st = inner.state.lock().unwrap();
-            st.last_sent = Some(desired);
-            st.last_sent_at = Instant::now();
-        }
-
-        // 3) 自动心跳：Status 轮询不依赖视觉管线是否卡顿。
-        let heartbeat_due = {
-            let st = inner.state.lock().unwrap();
-            st.last_heartbeat_at.elapsed() >= inner.cfg.heartbeat_period
-        };
-        if heartbeat_due {
-            inner.send(frame_of(Request::Heartbeat));
-            let mut st = inner.state.lock().unwrap();
-            st.last_heartbeat_at = Instant::now();
-        }
-
-        thread::sleep(Duration::from_millis(25));
-    }
-}
-
 /// 与下位机的链路句柄；`Drop` 时自动滑行停车并退出线程。
 ///
 /// 收/发线程在内部，句柄本身是 `Sync` 的：可以放进 `Arc` 供网页服务等多线程
@@ -372,15 +347,13 @@ impl Car {
     /// 打开串口并启动收发线程。打开失败直接返回错误（上位机启动时应当报错退出）。
     pub fn open(cfg: CarConfig) -> io::Result<Self> {
         let file = serial::open(&cfg.port, cfg.baud)?;
-        let fd = file.as_raw_fd();
         let now = Instant::now();
         let inner = Arc::new(Inner {
-            _file: file,
-            fd,
+            file,
             cfg,
             running: AtomicBool::new(true),
             write_lock: Mutex::new(()),
-            state: Mutex::new(CarState {
+            state: Mutex::new(InnerState {
                 manual: false,
                 desired: Desired::Coast,
                 desired_at: now,
@@ -399,11 +372,11 @@ impl Car {
         let mut threads = Vec::with_capacity(2);
         threads.push({
             let inner = Arc::clone(&inner);
-            thread::spawn(move || reader_loop(inner))
+            thread::spawn(move || inner.reader_task())
         });
         threads.push({
             let inner = Arc::clone(&inner);
-            thread::spawn(move || writer_loop(inner))
+            thread::spawn(move || inner.writer_task())
         });
         Ok(Self {
             inner,
@@ -632,7 +605,7 @@ mod tests {
     use super::*;
     use crate::control::protocol::ResponseType;
     use std::ffi::CStr;
-    use std::os::unix::io::FromRawFd;
+    use std::os::unix::io::{AsRawFd, FromRawFd};
 
     /// 用 PTY 模拟 ESP32-C3：测试持 master 侧，Car 用 slave 侧。
     fn open_pty() -> Option<(File, String)> {

@@ -53,7 +53,6 @@ fn configure_raw(fd: libc::c_int, baud: u32) {
         tio.c_cc[libc::VTIME] = 0;
         if let Some(speed) = baud_flag(baud) {
             libc::cfsetispeed(&mut tio, speed);
-            libc::cfsetospeed(&mut tio, speed);
         } else {
             warn!("不支持的波特率 {}，沿用当前配置", baud);
         }

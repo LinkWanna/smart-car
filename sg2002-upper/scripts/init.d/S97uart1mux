@@ -1,0 +1,58 @@
+#!/bin/sh
+# =============================================================================
+# S97uart1mux —— 开机把 UART1 复用到 GPIOA18/A19（ESP32-C3 下位机接线处）
+#
+# 背景:
+#   LicheeRV Nano 默认 pinmux 是
+#     A18/A19 = UART1 CTS/RTS，A28/A29 = UART1 TX/RX；
+#   本车把 ESP32-C3 接在 A18/A19 上，所以按 Sipeed wiki（外设/UART）写寄存器：
+#     A18 -> UART1 RX (0x6)
+#     A19 -> UART1 TX (0x6)
+#     A28 -> UART2 TX (0x2)   # 让出 UART1 默认引脚，避免 RX 并联两个输入
+#     A29 -> UART2 RX (0x2)
+#
+# 用法:
+#   S97uart1mux {start|stop|restart|status}
+#
+# 说明:
+#   - 寄存器改动掉电不保存，每次开机都要写；
+#   - 排在 S99smartcar 之前（应用要开 /dev/ttyS1 和下位机通信）；
+#   - stop 不做事：无法（也不需要）恢复默认复用。
+#
+# 部署: flash.sh → /etc/init.d/S97uart1mux
+# =============================================================================
+set -u
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+log() {
+    echo "[uart1mux] $*"
+    command -v logger >/dev/null 2>&1 && logger -t uart1mux "$*" 2>/dev/null
+}
+
+apply() {
+    devmem 0x03001068 32 0x6   # GPIOA 18 UART1 RX
+    devmem 0x03001064 32 0x6   # GPIOA 19 UART1 TX
+    devmem 0x03001070 32 0x2   # GPIOA 28 UART2 TX
+    devmem 0x03001074 32 0x2   # GPIOA 29 UART2 RX
+    log "UART1 -> A18(RX)/A19(TX)，A28/A29 -> UART2"
+}
+
+case "${1:-start}" in
+    start|restart)
+        apply
+        ;;
+    stop)
+        : # 掉电即恢复默认，无需操作
+        ;;
+    status)
+        printf 'GPIOA18(UART1 RX)=0x%x  GPIOA19(UART1 TX)=0x%x  GPIOA28=0x%x  GPIOA29=0x%x\n' \
+            "$(devmem 0x03001068 32)" "$(devmem 0x03001064 32)" \
+            "$(devmem 0x03001070 32)" "$(devmem 0x03001074 32)"
+        ;;
+    *)
+        echo "用法: $0 {start|stop|restart|status}" >&2
+        exit 2
+        ;;
+esac
+exit 0

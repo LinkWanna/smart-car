@@ -50,9 +50,9 @@ const POLL_INTERVAL: Duration = Duration::from_millis(5);
 /// 网页服务配置。
 #[derive(Debug, Clone)]
 pub struct WebConfig {
-    /// 监听地址（`0.0.0.0` 表示所有网卡，AP 模式下即 `192.168.4.1`）。
+    /// 监听地址（`0.0.0.0` 表示所有网卡，AP 模式下即 `192.168.1.2`）。
     pub bind: String,
-    /// 监听端口（默认 80，直接浏览器访问 `http://192.168.4.1`）。
+    /// 监听端口（默认 80，直接浏览器访问 `http://192.168.1.2`）。
     pub port: u16,
     /// 状态 JSON 推送频率（Hz）。
     pub status_hz: f32,
@@ -538,11 +538,13 @@ mod tests {
             eprintln!("跳过：当前环境不支持 PTY");
             return;
         };
-        let car = Arc::new(Car::open(CarConfig {
-            port,
-            ..Default::default()
-        })
-        .expect("打开 PTY 失败"));
+        let car = Arc::new(
+            Car::open(CarConfig {
+                port,
+                ..Default::default()
+            })
+            .expect("打开 PTY 失败"),
+        );
         let session = ControlSession::new(car.clone(), TeleopConfig::default(), None);
         let server = Server::bind(
             WebConfig {

@@ -1,170 +1,179 @@
 #!/usr/bin/env bash
 # =============================================================================
-# flash.sh —— 编译 SG2002 上位机（src/bin 三个 bin）并部署到板端 /root
-#
-#   网口直连  本机 192.168.1.1/24 ⇄ 板端 192.168.1.2
-#   串口控制台  /dev/ttyACM0  115200（--serial-ip 兜底时用）
-#   交叉编译配置见 .cargo/config.toml（linker = riscv64-linux-musl-gcc）
+# flash.sh —— 编译并部署 SG2002 上位机（本机 ⇄ 网口直连 root@192.168.1.2）
 #
 # 用法:
-#   ./flash.sh              # release 交叉编译 → scp 到 root@192.168.1.2:/root
-#   ./flash.sh -n           # 跳过编译，只部署已有产物
-#   ./flash.sh --serial-ip  # ssh 不通时，先经串口下发 ip addr add ... 再重试
+#   ./flash.sh
 #
-# 其它选项: -d/--dest <目录>（默认 /root）、-s/--serial <设备>、-t/--target <triple>、
-#           --linker <路径>（覆盖 .cargo/config.toml）
-# 板端登录目标固定在下面的 BOARD，不提供选项。
+# 做三件事:
+#   1. 交叉编译 src/bin 全部 [[bin]]（release / riscv64gc-unknown-linux-musl）；
+#   2. 部署可执行文件与模型到板端 /root（模型取 assets/*.cvimodel）；
+#   3. 部署启动脚本与 AP 配置:
+#        scripts/init.d/S97uart1mux  → /etc/init.d/S97uart1mux（UART1 复用）
+#        scripts/init.d/S98apstart   → /etc/init.d/S98apstart （AP 热点）
+#        scripts/init.d/S99smartcar  → /etc/init.d/S99smartcar（smartcar 上位机）
+#        scripts/smartcar-ap.conf    → /etc/smartcar-ap.conf （AP 端点配置）
+#      顺带补 libsys/libvenc 符号链接（硬件 JPEG），并清理板端旧版脚本
+#      （/etc/init.d/S99uart1mux、/root/scripts/*）。
+#
+# 前置:
+#   板子已开机、eth0 为 192.168.1.2，且本机已配置免密登录 root@192.168.1.2。
 # =============================================================================
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 cd "$SCRIPT_DIR"
 
-# --- 配置 -------------------------------------------------------------------
-BOARD=root@192.168.1.2   # 板端 ssh 目标；板端禁用 root 登录时改成 linkwanna@192.168.1.2
-DEST=/root               # 板端安装目录
-SERIAL=/dev/ttyACM0      # 板端串口控制台
+BOARD=root@192.168.1.2          # 板端 ssh 目标（网口直连）
+DEST=/root                      # 可执行文件/模型安装目录
 TARGET=riscv64gc-unknown-linux-musl
-LINKER=                  # 非空则覆盖 .cargo/config.toml 的 linker
+SSH_OPTS=(-o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new)
 
-DO_BUILD=1
-SERIAL_IP=0
-
-usage() { sed -n '3,/^# ====/p' "$0" | sed 's/^# \{0,1\}//' | head -n -1; }
-
-while [ $# -gt 0 ]; do
-    case "$1" in
-        -d|--dest)     DEST=$2; shift 2 ;;
-        -s|--serial)   SERIAL=$2; shift 2 ;;
-        -t|--target)   TARGET=$2; shift 2 ;;
-        --linker)      LINKER=$2; shift 2 ;;
-        -n|--no-build) DO_BUILD=0; shift ;;
-        --serial-ip)   SERIAL_IP=1; shift ;;
-        -h|--help)     usage; exit 0 ;;
-        *) echo "flash.sh: 未知参数 $1（-h 查看用法）" >&2; exit 2 ;;
-    esac
-done
-
-# --- 链接器（默认由 .cargo/config.toml 指定，--linker 可覆盖）----------------
-if [ -n "$LINKER" ]; then
-    LINKER_VAR="CARGO_TARGET_$(printf '%s' "$TARGET" | tr 'a-z-' 'A-Z_')_LINKER"
-    export "$LINKER_VAR=$LINKER"
-    echo "== 链接器: $LINKER_VAR=$LINKER"
+if [ $# -gt 0 ]; then
+    echo "用法: ./flash.sh（无参数）" >&2
+    exit 2
 fi
 
-# --- 待部署的 bin：从 Cargo.toml 的 [[bin]] 读，避免和配置漂移 ----------------
+fail() { echo "✗ $*" >&2; exit 1; }
+
+# --- 部署清单 -----------------------------------------------------------------
+
+# 待部署的 bin：从 Cargo.toml 的 [[bin]] 读，避免和配置漂移
 mapfile -t BINS < <(awk -F'=' '
     /^\[\[bin\]\]/ { want = 1; next }
     want && $1 ~ /^name[ \t]*$/ { gsub(/[" \t]/, "", $2); print $2; want = 0 }
 ' Cargo.toml)
-[ "${#BINS[@]}" -gt 0 ] ||
-    { echo "flash.sh: Cargo.toml 里没有找到 [[bin]] 目标" >&2; exit 1; }
+[ "${#BINS[@]}" -gt 0 ] || fail "Cargo.toml 里没有找到 [[bin]] 目标"
 
-# --- 编译 -------------------------------------------------------------------
-if [ "$DO_BUILD" = 1 ]; then
-    echo "== 编译 ${BINS[*]}（release / $TARGET）"
-    cargo build --release --target "$TARGET" --bins
-else
-    echo "== 跳过编译（-n）"
-fi
-
-OUT="target/$TARGET/release"
-FILES=()
+BIN_FILES=()
 for bin in "${BINS[@]}"; do
-    [ -f "$OUT/$bin" ] ||
-        { echo "flash.sh: 缺少产物 $OUT/$bin（先去掉 -n 编译一次）" >&2; exit 1; }
-    FILES+=("$OUT/$bin")
+    BIN_FILES+=("target/$TARGET/release/$bin")
 done
 
-# --- 板端可达性 -------------------------------------------------------------
-SSH_OPTS=(-o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new)
-ssh_ok() { ssh "${SSH_OPTS[@]}" -o BatchMode=yes "$BOARD" true >/dev/null 2>&1; }
+# 模型（smartcar 自动查找 /root/*.cvimodel）
+MODELS=()
+for f in assets/*.cvimodel; do
+    [ -f "$f" ] && MODELS+=("$f")
+done
+[ "${#MODELS[@]}" -gt 0 ] || fail "assets/ 下没有 .cvimodel 模型文件"
 
-BOARD_HOST=${BOARD#*@}
+# 启动脚本（放 scripts/init.d，部署到 /etc/init.d；全部自包含）
+INIT_FILES=(scripts/init.d/S97uart1mux scripts/init.d/S98apstart scripts/init.d/S99smartcar)
+for f in "${INIT_FILES[@]}"; do
+    [ -f "$f" ] || fail "缺少启动脚本 $f"
+done
 
-# 兜底：板端 eth0 没配 IP 时（README 里的手工步骤），经串口下发一次
-serial_set_ip() {
-    [ -c "$SERIAL" ] || { echo "flash.sh: 串口 $SERIAL 不存在" >&2; return 1; }
-    echo "== 经串口 $SERIAL 下发: ip addr add $BOARD_HOST/24 dev eth0"
-    stty -F "$SERIAL" 115200 raw -echo 2>/dev/null || {
-        echo "flash.sh: 打不开 $SERIAL（权限不足？试 sudo 或加入 uucp 组）" >&2
-        return 1
-    }
-    {
-        printf '\r'
-        sleep 1
-        printf 'ip addr add %s/24 dev eth0\r' "$BOARD_HOST"
-        sleep 2
-    } >"$SERIAL"
-    sleep 2
-}
+# AP 端点配置（部署到 /etc/smartcar-ap.conf）
+AP_CONF=scripts/smartcar-ap.conf
+[ -f "$AP_CONF" ] || fail "缺少 AP 配置 $AP_CONF"
 
-if ! ssh_ok && [ "$SERIAL_IP" = 1 ]; then
-    serial_set_ip || true
-fi
+# --- 编译 ---------------------------------------------------------------------
 
-if ! ssh_ok; then
-    cat >&2 <<EOF
-✗ 无法 SSH 登录板子（$BOARD）
+echo "== 编译 ${BINS[*]}（release / $TARGET）"
+cargo build --release --target "$TARGET" --bins
+
+for f in "${BIN_FILES[@]}"; do
+    [ -f "$f" ] || fail "缺少编译产物 $f"
+done
+
+# --- 板端可达性 ---------------------------------------------------------------
+
+if ! ssh "${SSH_OPTS[@]}" -o BatchMode=yes "$BOARD" true >/dev/null 2>&1; then
+    cat >&2 <<'EOF'
+✗ 无法 SSH 登录板子（root@192.168.1.2）
 
 自查:
-  1) 本机网口（应为 192.168.1.1/24）: ip -brief addr
-  2) 板子是否在线:                    ping -c1 $BOARD_HOST
-  3) 板端 eth0 是否配了 IP，可进串口控制台确认:
-       picocom -b 115200 $SERIAL
-       # 板端 shell 里执行（每次冷启动后可能需要）:
-       ip addr add $BOARD_HOST/24 dev eth0
-     或加 --serial-ip 让本脚本经串口自动下发这一条。
+  1) 本机网口 192.168.1.1/24、网线直连:  ip -brief addr
+  2) 板子在线:                        ping -c1 192.168.1.2
+  3) 本机免密登录:                    ssh-copy-id root@192.168.1.2
 EOF
     exit 1
 fi
 echo "== 板端登录: $BOARD"
 
-# --- 传输：先 scp 到板端临时目录，再（必要时 sudo）原子替换到 DEST ----------
-REMOTE_TMP=$(ssh "${SSH_OPTS[@]}" "$BOARD" 'mktemp -d')
+# --- 传输 ---------------------------------------------------------------------
+
+# 临时目录放在 /root（和 /etc 同一个 ext4 根分区）：最后 mv 是同分区 rename，
+# 覆盖正在运行的 /root/smartcar 时不会踩 ETXTBSY。
+REMOTE_TMP=$(ssh "${SSH_OPTS[@]}" "$BOARD" "mktemp -d '$DEST/.flash.XXXXXX'")
+cleanup() {
+    [ -n "${REMOTE_TMP:-}" ] &&
+        ssh "${SSH_OPTS[@]}" "$BOARD" "rm -rf '$REMOTE_TMP'" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
 echo "== 传输到 $BOARD:$REMOTE_TMP"
-scp -q "${SSH_OPTS[@]}" "${FILES[@]}" "$BOARD:$REMOTE_TMP/"
+scp -q "${SSH_OPTS[@]}" \
+    "${BIN_FILES[@]}" "${MODELS[@]}" "${INIT_FILES[@]}" "$AP_CONF" \
+    "$BOARD:$REMOTE_TMP/"
 
-if [ "$(ssh "${SSH_OPTS[@]}" "$BOARD" 'id -u')" = 0 ]; then
-    SUDO=""
-    TTY_ARGS=()
-else
-    SUDO="sudo"          # 非 root 用户：借一个 tty 让 sudo 能提示密码
-    TTY_ARGS=(-t)
-fi
+# --- 板端安装（先搬到目标目录，再清理临时目录）--------------------------------
 
-# 注意：不要用 printf 多参数拼列表（格式串会循环复用），逐项拼
-CHMOD_LIST=""
+MOVE=""
 for bin in "${BINS[@]}"; do
-    CHMOD_LIST="$CHMOD_LIST'$DEST/$bin' "
+    MOVE+="mv -f '$REMOTE_TMP/$bin' '$DEST/'"$'\n'
+done
+for f in "${MODELS[@]}"; do
+    MOVE+="mv -f '$REMOTE_TMP/$(basename "$f")' '$DEST/'"$'\n'
+done
+for f in "${INIT_FILES[@]}"; do
+    MOVE+="mv -f '$REMOTE_TMP/$(basename "$f")' /etc/init.d/"$'\n'
+done
+MOVE+="mv -f '$REMOTE_TMP/smartcar-ap.conf' /etc/smartcar-ap.conf"$'\n'
+
+CHMOD755=""
+for bin in "${BINS[@]}"; do
+    CHMOD755+="'$DEST/$bin' "
+done
+for f in "${INIT_FILES[@]}"; do
+    CHMOD755+="'/etc/init.d/$(basename "$f")' "
 done
 
-# 先搬到 DEST 再删临时目录：即使后续 chmod 失败也不留垃圾；
-# 顺带补厂商 MMF 库的符号链接（硬件 JPEG：libvenc 按名字依赖 libsys）
-ssh "${SSH_OPTS[@]}" "${TTY_ARGS[@]}" "$BOARD" "
+CHMOD644=""
+for f in "${MODELS[@]}"; do
+    CHMOD644+="'$DEST/$(basename "$f")' "
+done
+CHMOD644+="'/etc/smartcar-ap.conf' "
+
+ssh "${SSH_OPTS[@]}" "$BOARD" "
     set -e
     mkdir -p '$DEST'
-    $SUDO mv -f '$REMOTE_TMP'/* '$DEST'/
+    $MOVE
+    chmod 755 $CHMOD755
+    chmod 644 $CHMOD644
     rm -rf '$REMOTE_TMP'
-    $SUDO chmod 755 $CHMOD_LIST
+
+    # 清理旧版脚本（统一为 /etc/init.d 自包含脚本）
+    rm -f /etc/init.d/S99uart1mux \\
+          /root/scripts/init_ap.sh /root/scripts/pinmux.sh /root/scripts/dhcp-lease.sh
+    rmdir /root/scripts 2>/dev/null || true
+
+    # 厂商 MMF 库的符号链接（硬件 JPEG：libvenc 按名字依赖 libsys）
     for lib in libsys.so libvenc.so; do
         if [ -e \"/mnt/system/usr/lib/\$lib\" ] && [ ! -e \"/usr/lib/\$lib\" ]; then
-            $SUDO ln -sf \"/mnt/system/usr/lib/\$lib\" \"/usr/lib/\$lib\" \
-                && echo \"  已链接 \$lib → /usr/lib（硬件编码用）\"
+            ln -sf \"/mnt/system/usr/lib/\$lib\" \"/usr/lib/\$lib\" && echo \"  已链接 \$lib → /usr/lib（硬件 JPEG 用）\"
         fi
     done
+    true
 "
+REMOTE_TMP=""       # 远程已自行清理，EXIT trap 不用再跑
 
-# --- 校验 -------------------------------------------------------------------
-echo "== 板端 $DEST:"
-ssh "${SSH_OPTS[@]}" "$BOARD" "ls -l $CHMOD_LIST"
+# --- 校验 ---------------------------------------------------------------------
+
+echo "== 板端部署结果:"
+ssh "${SSH_OPTS[@]}" "$BOARD" "ls -l $CHMOD755 $CHMOD644"
 
 cat <<EOF
 
-✅ 部署完成: $BOARD:$DEST → ${BINS[*]}
+✅ 部署完成: $BOARD
 
-板端运行（网口直连，本机 192.168.1.1）:
-    ssh $BOARD
-    ip addr add $BOARD_HOST/24 dev eth0     # 若还没配
-    $DEST/webctl --bind $BOARD_HOST
+开机自启（已安装，重启后按顺序执行）:
+    S97uart1mux  → UART1 → A18/A19（ESP32-C3 串口）
+    S98apstart   → 建 AP 热点（读 /etc/smartcar-ap.conf；Nano-E 自动跳过）
+    S99smartcar  → 启动 /root/smartcar（日志 /root/smartcar.log）
+
+立即生效（不重启）:
+    ssh $BOARD '/etc/init.d/S97uart1mux start'
+    ssh $BOARD '/etc/init.d/S99smartcar start'
+    ssh $BOARD '/etc/init.d/S99smartcar status'
 EOF

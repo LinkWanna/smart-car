@@ -1,0 +1,116 @@
+#!/bin/sh
+# =============================================================================
+# S99smartcar —— 开机启动 smartcar 上位机（视觉追踪 + 网页遥控）
+#
+# 用法:
+#   S99smartcar {start|stop|restart|status}
+#
+# start 顺序:
+#   1. 等 /dev/video0（USB 相机枚举，最多 WAIT_CAM 秒，默认 10）；
+#   2. 后台启动 /root/smartcar（监听 0.0.0.0:80）：
+#        pid → /var/run/smartcar.pid，日志 → /root/smartcar.log（掉电保留）。
+# stop: 先 SIGTERM（应用会滑行停车、干净退出），5s 不退再 SIGKILL。
+#
+# UART1 pinmux 由更早的 /etc/init.d/S97uart1mux 负责；AP 由 S98apstart 负责。
+#
+# /root/smartcar 不存在时（还没 flash 过）打印一行并 exit 0，不影响开机。
+#
+# 部署: flash.sh 会装到 /etc/init.d/S99smartcar（chmod 755）
+# =============================================================================
+set -u
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+BIN=/root/smartcar
+PIDFILE=/var/run/smartcar.pid
+LOGFILE=/root/smartcar.log
+WAIT_CAM=${WAIT_CAM:-10}
+
+log() {
+    echo "[smartcar] $*"
+    command -v logger >/dev/null 2>&1 && logger -t smartcar "$*" 2>/dev/null
+}
+is_alive() { [ -n "${1:-}" ] && kill -0 "$1" 2>/dev/null; }
+is_running() { [ -f "$PIDFILE" ] && is_alive "$(cat "$PIDFILE" 2>/dev/null)"; }
+
+start() {
+    if [ ! -x "$BIN" ]; then
+        log "未找到 $BIN（先跑 flash.sh），跳过"
+        exit 0
+    fi
+    if is_running; then
+        log "已在运行 (pid $(cat "$PIDFILE"))"
+        exit 0
+    fi
+    rm -f "$PIDFILE"
+
+    # USB 相机枚举可能比 init 脚本慢，等一会儿再拉
+    i=0
+    while [ ! -e /dev/video0 ] && [ "$i" -lt "$WAIT_CAM" ]; do
+        [ "$i" -eq 0 ] && log "等待 /dev/video0 ..."
+        sleep 1
+        i=$((i+1))
+    done
+
+    # UART1 复用由 S97uart1mux 在更早的阶段应用（见脚本头部说明）
+
+    log "启动 $BIN（日志: $LOGFILE）"
+    echo "===== $(date '+%F %T') 开机启动 =====" >> "$LOGFILE"
+    nohup "$BIN" >>"$LOGFILE" 2>&1 </dev/null &
+    echo $! > "$PIDFILE"
+
+    sleep 1
+    if is_running; then
+        log "已启动 (pid $(cat "$PIDFILE"))"
+    else
+        rm -f "$PIDFILE"
+        log "启动失败，$LOGFILE 末尾:"
+        tail -n 8 "$LOGFILE" 2>/dev/null | sed 's/^/    /'
+        exit 1
+    fi
+}
+
+stop() {
+    if [ ! -f "$PIDFILE" ]; then
+        log "未在运行"
+        exit 0
+    fi
+    pid=$(cat "$PIDFILE" 2>/dev/null)
+    if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
+        log "进程已不在 (pid ${pid:-?})"
+        rm -f "$PIDFILE"
+        exit 0
+    fi
+    log "停止 (pid $pid) ..."
+    kill "$pid" 2>/dev/null
+    i=0
+    while kill -0 "$pid" 2>/dev/null && [ "$i" -lt 5 ]; do
+        sleep 1
+        i=$((i+1))
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+        log "5s 未退出，SIGKILL"
+        kill -9 "$pid" 2>/dev/null
+        sleep 1
+    fi
+    rm -f "$PIDFILE"
+    log "已停止"
+}
+
+status() {
+    if is_running; then
+        echo "[smartcar] 运行中 (pid $(cat "$PIDFILE"))，日志 $LOGFILE"
+        tail -n 3 "$LOGFILE" 2>/dev/null | sed 's/^/    /'
+    else
+        echo "[smartcar] 未运行"
+    fi
+}
+
+case "${1:-start}" in
+    start)   start ;;
+    stop)    stop ;;
+    restart) stop; start ;;
+    status)  status ;;
+    *)       echo "用法: $0 {start|stop|restart|status}" >&2; exit 2 ;;
+esac
+exit 0

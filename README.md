@@ -41,7 +41,7 @@
 | LicheeRV Nano（SG2002） | 上位机，跑视觉与网页服务 |
 | USB 摄像头 | YUYV 640x480（与模型输入一致） |
 | ESP32-C3 | 下位机，双电机 + 正交编码器 |
-| 接线 | 上位机 UART1（GPIOA18/A19，`sg2002-upper/scripts/pinmux.sh`）↔ ESP32 UART0（115200 8N1） |
+| 接线 | 上位机 UART1（GPIOA18/A19，`sg2002-upper/scripts/init.d/S97uart1mux`）↔ ESP32 UART0（115200 8N1） |
 
 ## 快速开始
 

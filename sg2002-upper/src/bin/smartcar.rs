@@ -280,7 +280,7 @@ fn main() {
     session.spawn();
     if cli.bind == "0.0.0.0" {
         info!(
-            "  页面：http://192.168.4.1{}/   （AP 热点默认地址；本机监听 {addr}）",
+            "  页面：http://192.168.1.2{}/   （AP/网口默认地址；本机监听 {addr}）",
             port_suffix(addr.port())
         );
     } else {

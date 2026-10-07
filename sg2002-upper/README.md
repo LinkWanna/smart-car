@@ -24,6 +24,8 @@ SMARTCAR_LOG=warn,sg2002_upper::vision=debug ./smartcar --bind 192.168.1.2  # �
 网页侧的 JPEG 也不再被客户端心跳卡住：WebSocket 会话每轮跑 90ms 的推送窗口
 （`PUSH_WINDOW`，5ms 粒度查新帧）；**上行（按键/动作/模式）走 HTTP**，由线程池
 即时处理，不受推送窗口与"每轮读一条消息"的限制（WS 每 100ms 的 ping 只当推送时钟）。
+页面侧另有**假死看门狗**：2.5s 收不到任何下行消息（WiFi 半开时 `onclose` 不会触发）
+就强制关闭重连，不会一直停在"已连接"。
 
 实测（640x480 YUYV、`yolov8n_tennis_v3`、同一场景）：
 

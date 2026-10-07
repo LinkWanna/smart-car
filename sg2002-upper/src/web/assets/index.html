@@ -175,6 +175,8 @@
 const $ = (id) => document.getElementById(id);
 const state = {
   ws: null,
+  wsGen: 0,
+  lastMsgAt: 0,
   keys: new Set(),
   maxSpeed: 55,
   maxReverse: 40,
@@ -252,7 +254,15 @@ window.addEventListener("keyup", (e) => {
   setKey(key, false);
 });
 window.addEventListener("blur", clearKeys);
-document.addEventListener("visibilitychange", () => { if (document.hidden) clearKeys(); });
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) {
+    clearKeys();
+  } else {
+    // 回前台：给一次宽限，之后 2.5s 内没消息就由看门狗重连
+    // （后台标签页计时器被浏览器节流，隐藏期间不做假死判定）
+    state.lastMsgAt = performance.now();
+  }
+});
 
 document.querySelectorAll("[data-key]").forEach((el) => {
   const key = el.dataset.key;
@@ -288,17 +298,30 @@ setInterval(() => {
 }, 100);
 
 /* ---------- WebSocket ---------- */
+/* 假死看门狗：WiFi 掉线时 TCP 可能是"半开"——readyState 还是 OPEN、onclose 不
+   触发，页面会一直显示"已连接"但收不到状态/画面。这里按"多久没收到消息"判活：
+   超过 WS_SILENCE_MS 没有任何下行消息就强制关掉重连（重连逻辑在 onclose）。
+   后台标签页的计时器会被浏览器节流，隐藏时不做判定，切回前台再给一次宽限。 */
+const WS_SILENCE_MS = 2500;
+const WS_WATCHDOG_MS = 500;
+
 function connect() {
+  const gen = ++state.wsGen;
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
   const ws = new WebSocket(proto + "//" + location.host + "/api/events");
   ws.binaryType = "blob";
   state.ws = ws;
+  state.lastMsgAt = performance.now();
   ws.onopen = () => {
+    if (gen !== state.wsGen) { ws.close(); return; } // 已被新连接取代
     state.reconnectMs = 500;
+    state.lastMsgAt = performance.now();
     badge("b-ws", "已连接", "ok");
     sendKeys(); // 重连后立刻同步一次按键状态（HTTP）
   };
   ws.onmessage = (ev) => {
+    if (gen !== state.wsGen) return;
+    state.lastMsgAt = performance.now();
     if (typeof ev.data === "string") {
       try { handleMessage(JSON.parse(ev.data)); } catch (_) { /* 忽略坏消息 */ }
     } else {
@@ -306,14 +329,30 @@ function connect() {
     }
   };
   ws.onclose = () => {
+    if (gen !== state.wsGen) return; // 旧连接的关闭事件，忽略
+    state.ws = null;
     badge("b-ws", "重连中…", "warn");
     badge("b-link", "链路 --", "");
     badge("b-sys", "状态 --", "");
     setTimeout(connect, state.reconnectMs);
     state.reconnectMs = Math.min(state.reconnectMs * 1.5, 3000);
   };
-  ws.onerror = () => ws.close();
+  ws.onerror = () => { try { ws.close(); } catch (_) {} };
 }
+
+/* 看门狗：OPEN 但长时间收不到任何消息 → 判定链路假死，强制重连 */
+setInterval(() => {
+  const ws = state.ws;
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  if (document.hidden) return; // 后台不做判定（计时器被节流）
+  if (performance.now() - state.lastMsgAt <= WS_SILENCE_MS) return;
+  const dead = ws;
+  state.wsGen++; // 旧连接的事件回调全部失效
+  state.ws = null;
+  badge("b-ws", "无响应，重连中…", "warn");
+  try { dead.close(); } catch (_) {}
+  setTimeout(connect, 300);
+}, WS_WATCHDOG_MS);
 
 function badge(id, text, cls) {
   const el = $(id);
